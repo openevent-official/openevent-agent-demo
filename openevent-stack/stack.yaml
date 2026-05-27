@@ -1,0 +1,73 @@
+version: v1
+
+runtime:
+  name: openevent-stack
+  root: openevent-stack
+  supervisor:
+    ctl: ./openevent-stack/process.sh
+    programs:
+      openevent: openevent
+      im_syncer: im-p2p-syncer
+      model_proxy: model-proxy
+      agent: im-model-agent
+
+openevent:
+  grpc_addr: 127.0.0.1:9527
+  admin_addr: 127.0.0.1:9528
+  storage:
+    metadata_path: openevent-stack/data/openevent/meta
+  store:
+    rocksdb:
+      path: openevent-stack/data/openevent/messages
+
+view:
+  port: 9999
+
+principals:
+  p_im_worker: 90001
+  p_bot: 90002
+  p_model_proxy: 20001
+  p_user: 10001
+
+# tokens can stay empty. bootstrap.sh --apply creates or adopts usable tokens
+# and writes them to openevent-stack/config/secrets.yaml.
+tokens: {}
+
+im:
+  provider: lark
+  session_type: p2p
+  worker_principal: p_im_worker
+  users:
+    - principal: p_user
+      user_email: user@example.com
+  bot:
+    principal: p_bot
+    app_id: cli_replace_with_lark_app_id
+    app_secret: replace_with_lark_app_secret
+
+model:
+  proxy_principal: p_model_proxy
+  provider_name: kimi
+  # Provider root. Agent/model-proxy request path is /v1/chat/completions.
+  base_url: https://api.moonshot.cn
+  api_key: replace_with_model_api_key
+  model: kimi-k2.6
+
+agent:
+  principal: p_bot
+  name: im-model-agent
+  system_prompt: "You are an assistant that talks with users through IM. Keep replies concise and accurate."
+  freeze_message: "The model service is temporarily unavailable. The session is paused. Send another message to continue."
+
+channels:
+  visibility: private
+
+sessions:
+  - session_id: s1
+    enabled: true
+    user:
+      principal: p_user
+    channels:
+      im: demo.im.s1
+      model: demo.llm.s1
+      wal: demo.wal.s1

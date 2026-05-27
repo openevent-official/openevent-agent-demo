@@ -1,0 +1,8 @@
+build/
+runtime/
+openevent-stack/data/
+openevent-stack/logs/
+openevent-stack/run/
+openevent-stack/config/
+openevent-stack/*.pid
+openevent-stack/*.log
