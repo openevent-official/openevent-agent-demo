@@ -97,22 +97,22 @@ source runtime/venv/bin/activate
 Default public dependency repositories:
 
 ```bash
-https://github.com/openevent2026/openevent.git
-https://github.com/openevent2026/openevent-sdk.git
-https://github.com/openevent2026/openevent-modules-im.git
-https://github.com/openevent2026/openevent-modules-model-proxy.git
-https://github.com/openevent2026/openevent-view.git
+https://github.com/openevent-official/openevent.git
+https://github.com/openevent-official/openevent-sdk.git
+https://github.com/openevent-official/openevent-modules-im.git
+https://github.com/openevent-official/openevent-modules-model-proxy.git
+https://github.com/openevent-official/openevent-view.git
 ```
 
 To override repository URLs, pass environment variables before the script
 command:
 
 ```bash
-OPENEVENT_URL=https://github.com/openevent2026/openevent.git \
-OPENEVENT_SDK_URL=https://github.com/openevent2026/openevent-sdk.git \
-OPENEVENT_MODULES_IM_URL=https://github.com/openevent2026/openevent-modules-im.git \
-OPENEVENT_MODEL_PROXY_URL=https://github.com/openevent2026/openevent-modules-model-proxy.git \
-OPENEVENT_VIEW_URL=https://github.com/openevent2026/openevent-view.git \
+OPENEVENT_URL=https://github.com/openevent-official/openevent.git \
+OPENEVENT_SDK_URL=https://github.com/openevent-official/openevent-sdk.git \
+OPENEVENT_MODULES_IM_URL=https://github.com/openevent-official/openevent-modules-im.git \
+OPENEVENT_MODEL_PROXY_URL=https://github.com/openevent-official/openevent-modules-model-proxy.git \
+OPENEVENT_VIEW_URL=https://github.com/openevent-official/openevent-view.git \
 scripts/bootstrap_ubuntu_venv.sh --workdir runtime
 ```
 

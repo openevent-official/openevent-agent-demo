@@ -17,11 +17,11 @@ Options:
   -h, --help     Show this help.
 
 Environment overrides:
-  OPENEVENT_URL                  default: https://github.com/openevent2026/openevent.git
-  OPENEVENT_SDK_URL              default: https://github.com/openevent2026/openevent-sdk.git
-  OPENEVENT_MODULES_IM_URL       default: https://github.com/openevent2026/openevent-modules-im.git
-  OPENEVENT_MODEL_PROXY_URL      default: https://github.com/openevent2026/openevent-modules-model-proxy.git
-  OPENEVENT_VIEW_URL             default: https://github.com/openevent2026/openevent-view.git
+  OPENEVENT_URL                  default: https://github.com/openevent-official/openevent.git
+  OPENEVENT_SDK_URL              default: https://github.com/openevent-official/openevent-sdk.git
+  OPENEVENT_MODULES_IM_URL       default: https://github.com/openevent-official/openevent-modules-im.git
+  OPENEVENT_MODEL_PROXY_URL      default: https://github.com/openevent-official/openevent-modules-model-proxy.git
+  OPENEVENT_VIEW_URL             default: https://github.com/openevent-official/openevent-view.git
   PYTHON_BIN                     default: python3
   JOBS                           default: nproc result, or 2
 
@@ -227,11 +227,11 @@ while [ "$#" -gt 0 ]; do
 done
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-OPENEVENT_URL="${OPENEVENT_URL:-https://github.com/openevent2026/openevent.git}"
-OPENEVENT_SDK_URL="${OPENEVENT_SDK_URL:-https://github.com/openevent2026/openevent-sdk.git}"
-OPENEVENT_MODULES_IM_URL="${OPENEVENT_MODULES_IM_URL:-https://github.com/openevent2026/openevent-modules-im.git}"
-OPENEVENT_MODEL_PROXY_URL="${OPENEVENT_MODEL_PROXY_URL:-https://github.com/openevent2026/openevent-modules-model-proxy.git}"
-OPENEVENT_VIEW_URL="${OPENEVENT_VIEW_URL:-https://github.com/openevent2026/openevent-view.git}"
+OPENEVENT_URL="${OPENEVENT_URL:-https://github.com/openevent-official/openevent.git}"
+OPENEVENT_SDK_URL="${OPENEVENT_SDK_URL:-https://github.com/openevent-official/openevent-sdk.git}"
+OPENEVENT_MODULES_IM_URL="${OPENEVENT_MODULES_IM_URL:-https://github.com/openevent-official/openevent-modules-im.git}"
+OPENEVENT_MODEL_PROXY_URL="${OPENEVENT_MODEL_PROXY_URL:-https://github.com/openevent-official/openevent-modules-model-proxy.git}"
+OPENEVENT_VIEW_URL="${OPENEVENT_VIEW_URL:-https://github.com/openevent-official/openevent-view.git}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || printf '2')}"
 export PYTHONDONTWRITEBYTECODE=1
 export PIP_NO_COMPILE=1
