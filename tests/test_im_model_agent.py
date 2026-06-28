@@ -27,7 +27,7 @@ class Message:
 class FetchResp:
     messages: list[Message]
     next_seq: int
-    has_more: bool = False
+    last_seq: int
 
 
 @dataclass
@@ -48,6 +48,7 @@ class FakeOpenEvent:
         self.next_seq = 100
         self.published = []
         self.history: list[Message] = []
+        self.fetch_calls = []
         self.channels = {
             11: Channel(
                 protocol="im.v1",
@@ -79,10 +80,17 @@ class FakeOpenEvent:
     def get_channel(self, principal, token, channel_id):
         return SimpleNamespace(channel=self.channels[channel_id])
 
-    def fetch(self, principal, token, from_seq, limit, only_my_recipient=False):
-        messages = [message for message in self.history if message.seq >= from_seq][:limit]
-        next_seq = messages[-1].seq + 1 if messages else max([0, *(message.seq for message in self.history)]) + 1
-        return FetchResp(messages=messages, next_seq=next_seq, has_more=False)
+    def fetch(self, principal, token, from_seq, limit, only_my_recipient=False, channels=()):
+        channels = tuple(channels)
+        self.fetch_calls.append((from_seq, limit, only_my_recipient, channels))
+        matches = [message for message in self.history if message.seq >= from_seq]
+        if channels:
+            requested_channels = {int(channel) for channel in channels}
+            matches = [message for message in matches if int(message.channel_id) in requested_channels]
+        messages = matches[:limit]
+        last_seq = max([0, *(message.seq for message in self.history)])
+        next_seq = messages[-1].seq + 1 if len(matches) > len(messages) else last_seq + 1
+        return FetchResp(messages=messages, next_seq=next_seq, last_seq=last_seq)
 
     def publish_auto_seq(self, principal, token, channel_id, payload, recipients):
         seq = self.next_seq
@@ -382,6 +390,7 @@ class ImModelAgentTests(unittest.TestCase):
         agent = ImModelAgent(_config(), event)
         agent.recover()
 
+        self.assertEqual(event.fetch_calls[0], (1, 1000, False, (11, 12, 13)))
         session = agent.state.sessions_by_id["s1"]
         self.assertEqual(session.in_flight_turn_id, "s1:1")
         self.assertFalse(session.pending)

@@ -80,7 +80,7 @@ or mismatched field types are invalid payloads.
 
 ## 3. OpenEvent principal And recipients
 
-`principal` is a top-level OpenEvent Message field and is not stored inside the
+`principal` is a top-level OpenEvent EventMessage field and is not stored inside the
 `agent.wal.v1` payload.
 
 Rules:

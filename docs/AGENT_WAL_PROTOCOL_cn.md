@@ -70,7 +70,7 @@ protocol = "agent.wal.v1"
 
 ## 3. OpenEvent principal 与 recipients
 
-`principal` 是 OpenEvent Message 的顶层字段，不放入 `agent.wal.v1` payload。
+`principal` 是 OpenEvent EventMessage 的顶层字段，不放入 `agent.wal.v1` payload。
 
 规则：
 

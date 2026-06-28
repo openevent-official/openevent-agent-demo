@@ -59,6 +59,7 @@ class ImModelAgent:
                 from_seq=from_seq,
                 limit=1000,
                 only_my_recipient=False,
+                channels=self._fetch_channels(),
             )
             for message in response.messages:
                 if int(message.seq) <= scan_end_seq:
@@ -66,8 +67,6 @@ class ImModelAgent:
             next_seq = int(response.next_seq)
             if next_seq <= from_seq:
                 raise RuntimeError("Fetch did not advance next_seq during recovery")
-            if not getattr(response, "has_more", False) and next_seq > scan_end_seq:
-                break
             from_seq = next_seq
         self.state.max_seen_seq = scan_end_seq
         self._recover_session_progress()
@@ -119,6 +118,7 @@ class ImModelAgent:
                 from_seq=next_seq,
                 limit=1000,
                 only_my_recipient=self.config.openevent.subscribe.only_my_recipient,
+                channels=self._fetch_channels(),
             )
             if not response.messages:
                 next_seq = int(response.next_seq)
@@ -126,9 +126,15 @@ class ImModelAgent:
                 continue
             for message in response.messages:
                 self.observe_message(message, realtime=True)
-                next_seq = int(message.seq) + 1
                 self.state.max_seen_seq = max(self.state.max_seen_seq, int(message.seq))
+            next_seq = int(response.next_seq)
             self.process_ready_sessions()
+
+    def _fetch_channels(self) -> tuple[int, ...]:
+        channels: list[int] = []
+        for session in self.config.enabled_sessions:
+            channels.extend([session.im_channel_id, session.model_channel_id, session.wal_channel_id])
+        return tuple(dict.fromkeys(channels))
 
     def observe_message(self, message: Any, realtime: bool) -> None:
         channel_id = int(message.channel_id)
