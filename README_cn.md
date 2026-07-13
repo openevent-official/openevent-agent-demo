@@ -4,7 +4,7 @@
 
 OpenEvent Agent Demo 演示如何把 OpenEvent、IM 模块、model-proxy 模块和
 OpenEvent View 组合成一套本地 Agent 运行环境。该 demo 把 P2P IM 会话连接到
-OpenAI-compatible 模型 provider，所有输入、模型请求、模型结果、回复和 Agent WAL
+OpenAI-compatible 模型 provider，所有输入、模型请求、模型结果、命令调用、回复和 Agent WAL
 记录都通过 OpenEvent channel 流转。
 
 ## 快速开始
@@ -33,13 +33,18 @@ source runtime/venv/bin/activate
 
 `openevent-stack/` 是本地运行 OpenEvent Agent demo 全套组件的模板目录。配置模板和脚本都直接放在这个目录下。
 
-组件：
+当前组件：
 
 - `openevent` server
 - `im-p2p-syncer`
 - `model-proxy`
+- `cmd-worker`
 - `im-model-agent`
 - `openevent-view`
+
+本地命令能力依赖 `openevent-modules-cmd`，它提供 `openevent.cmd_sdk` 包和
+`cmd-worker` 进程。stack 会安装并启动 `cmd-worker`，创建或复用每个 session 的
+`cmd.v1` channel，生成 `cmd-worker` 配置，并让 Agent 通过 OpenEvent 调用本地 shell 命令。
 
 应用 stack 前先按本机环境修改：
 
@@ -48,14 +53,14 @@ source runtime/venv/bin/activate
 `scripts/bootstrap_ubuntu_venv.sh` 会把本机路径覆盖配置写到 `openevent-stack/config/env.sh`。
 已跟踪的 `openevent-stack/env.sh` 保持为可移植默认模板。
 
-`bootstrap.sh --apply` 会通过 `scripts/reconcile_runtime.py` 生成四个核心组件的最终配置，启动/重启核心进程，并创建或复用 OpenEvent token/channel。`openevent-view` 是 agent demo 的必须组件，依赖 OpenEvent，只会在核心流程完成后启动。
+`bootstrap.sh --apply` 会通过 `scripts/reconcile_runtime.py` 生成核心组件的最终配置，启动/重启核心进程，并创建或复用 OpenEvent token/channel。`openevent-view` 是 agent demo 的必须组件，依赖 OpenEvent，只会在核心流程完成后启动。
 
 日常只需要用这几个脚本：
 
 | 脚本 | 用途 |
 | --- | --- |
 | `openevent-stack/bootstrap.sh` | 初始化/刷新整套运行配置。`--dry-run` 只校验并打印计划；`--apply` 会启动 OpenEvent、创建/复用 token 和 channel、写出最终配置，启动/重启核心进程，最后在 OpenEvent 已运行时启动 view，并打印进程启动结果。 |
-| `openevent-stack/start.sh` | 按顺序启动已经生成好配置的进程：OpenEvent、model-proxy、IM syncer、Agent，最后启动依赖 OpenEvent 的 view，并打印进程启动结果。不会创建 token/channel。 |
+| `openevent-stack/start.sh` | 按顺序启动已经生成好配置的进程：OpenEvent、model-proxy、cmd-worker、IM syncer、Agent，最后启动依赖 OpenEvent 的 view，并打印进程启动结果。不会创建 token/channel。 |
 | `openevent-stack/stop.sh` | 按反向顺序停止所有本地进程。 |
 | `openevent-stack/status.sh` | 显示所有本地进程状态。 |
 | `openevent-stack/logs.sh` | 不带参数列出日志文件；带进程名时跟随该进程日志，例如 `./openevent-stack/logs.sh model-proxy`。 |
@@ -77,6 +82,12 @@ source runtime/venv/bin/activate
 - `data/`
 - `logs/`
 - `run/`
+- `workdir/`
+
+通过 `openevent-stack/process.sh` 启动的组件会以 `openevent-stack/workdir/`
+作为当前工作目录。Agent 的 `exec` 工具遵循 `cmd.v1` 规则：tool call 未传
+`workdir` 时，命令在 `cmd-worker` 当前工作目录执行，因此默认命令工作目录是
+`openevent-stack/workdir/`。
 
 ## 文档
 
@@ -99,6 +110,7 @@ source runtime/venv/bin/activate
 | IM SDK 与 P2P syncer | `openevent-modules-im` 的 `docs/IM-PROTOCOL-SDK.md`、`docs/IM-P2P-SYNCER.md` |
 | LLM payload 协议 | `openevent-modules-model-proxy` 的 `docs/LLM_PROTOCOL.md` |
 | model-proxy worker 与 SDK | `openevent-modules-model-proxy` 的 `docs/CONFIGURATION.md`、`docs/SDK_USAGE.md` |
+| 命令协议、SDK 与 worker | `openevent-modules-cmd` 的 `docs/CMD_PROTOCOL.md`、`docs/CONFIGURATION.md`、`docs/SDK_USAGE.md` |
 | OpenEvent View | `openevent-view` 的 `README.md` |
 
 ## 测试
@@ -109,7 +121,7 @@ source runtime/venv/bin/activate
 make test
 ```
 
-测试使用当前 Python 环境中已经安装的依赖包。如果缺少依赖包，请先安装到当前环境。
+测试使用当前 Python 环境中已经安装的依赖包，包括 `openevent-modules-cmd`。如果缺少依赖包，请先安装到当前环境。
 
 ## 仓库结构
 

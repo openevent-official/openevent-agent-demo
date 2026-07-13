@@ -4,8 +4,8 @@
 
 Runtime Reconciler is the runtime-environment reconciliation script for the
 Agent demo. It reads a declarative YAML file, generates runtime configuration
-for OpenEvent, the IM P2P syncer, model-proxy, and IM Model Agent, and with
-`--apply` reconciles OpenEvent tokens, channels, and local processes.
+for OpenEvent, the IM P2P syncer, model-proxy, cmd-worker, and IM Model Agent,
+and with `--apply` reconciles OpenEvent tokens, channels, and local processes.
 
 It does not implement IM synchronization, model calls, or Agent business logic.
 Those responsibilities remain in their respective components. Reconciler only
@@ -13,10 +13,14 @@ connects those components with one consistent set of principals, tokens,
 channels, and configuration files.
 
 The `view` section in `openevent-stack/stack.yaml` is consumed by the
-`openevent-stack` scripts. Reconciler itself manages only the four core
+`openevent-stack` scripts. Reconciler itself manages only the core
 components. `openevent-view` is a required component of the Agent demo; it
 depends on OpenEvent and is configured and started by `bootstrap.sh` /
 `start.sh` after OpenEvent is running.
+
+Local command support uses `openevent-modules-cmd` and `cmd-worker`. Reconciler
+generates `cmd-worker` configuration, creates or reuses per-session `cmd.v1`
+channels, and writes resolved cmd channel ids into Agent configuration.
 
 ## CLI
 
@@ -35,7 +39,7 @@ Arguments:
 | `--dry-run` | Parse, fill defaults, generate a preview plan and configuration summary only. Does not write configuration, connect to OpenEvent, create tokens/channels, or restart processes. |
 | `--apply` | Write configuration, start/restart OpenEvent, create or reuse tokens/channels, write final component configuration, and restart downstream components. |
 | `--runtime-root` | Override `runtime.root` from the input YAML. Relative paths are resolved from the repository root. |
-| `--print-config` | Print the dry-run parsed configuration for one component. One of `openevent`, `im_syncer`, `model_proxy`, or `agent`. |
+| `--print-config` | Print the dry-run parsed configuration for one component. One of `openevent`, `im_syncer`, `model_proxy`, `cmd_worker`, or `agent`. |
 
 Exit codes:
 
@@ -67,6 +71,7 @@ runtime:
       openevent: openevent
       im_syncer: im-p2p-syncer
       model_proxy: model-proxy
+      cmd_worker: cmd-worker
       agent: im-model-agent
 
 openevent:
@@ -86,6 +91,7 @@ principals:
   p_im_worker: 90001
   p_bot: 90002
   p_model_proxy: 20001
+  p_cmd_worker: 30001
   p_user: 10001
 
 tokens: {}
@@ -117,6 +123,11 @@ model:
   model: gpt-4o-mini
   timeout_ms: 65000
 
+cmd:
+  worker_principal: p_cmd_worker
+  max_concurrent_tasks: 8
+  default_timeout_ms: 300000
+
 agent:
   principal: p_bot
   name: im-model-agent
@@ -138,6 +149,7 @@ sessions:
       im: openevent-stack.im.s1
       model: openevent-stack.llm.s1
       wal: openevent-stack.wal.s1
+      cmd: openevent-stack.cmd.s1
 ```
 
 ## Input Fields
@@ -153,6 +165,7 @@ sessions:
 | `runtime.supervisor.programs.openevent` | yes | OpenEvent process name. |
 | `runtime.supervisor.programs.im_syncer` | yes | IM P2P syncer process name. |
 | `runtime.supervisor.programs.model_proxy` | yes | model-proxy process name. |
+| `runtime.supervisor.programs.cmd_worker` | yes | cmd-worker process name. |
 | `runtime.supervisor.programs.agent` | yes | IM Model Agent process name. |
 
 ### OpenEvent
@@ -163,7 +176,7 @@ sessions:
 | `openevent.admin_addr` | yes | | Admin gRPC address used by Reconciler to call `ListTokens` and `AddToken`. |
 | `openevent.storage.metadata_path` | yes | | OpenEvent metadata storage path. Relative paths are resolved from the demo repository root. |
 | `openevent.store.rocksdb.path` | yes | | OpenEvent message RocksDB storage path. Relative paths are resolved from the demo repository root. |
-| `openevent.max_payload_bytes` | no | `16777216` | Written to OpenEvent server configuration and model-proxy configuration. |
+| `openevent.max_payload_bytes` | no | `16777216` | Written to OpenEvent server, model-proxy, and cmd-worker configuration. |
 
 ### Principals And Tokens
 
@@ -226,6 +239,19 @@ IM worker, model-proxy, user principal, and bot/agent principal must be distinct
 from each other so one token does not gain unintended channel-operation
 boundaries.
 
+### Command Worker
+
+Command support uses `openevent-modules-cmd`. Reconciler generates
+`cmd-worker` configuration, creates or reuses per-session `cmd.v1` channels, and
+writes the resolved cmd channel ids into Agent configuration.
+
+| Field | Required | Default | Description |
+| --- | --- | --- | --- |
+| `cmd.worker_principal` | yes | | Name from `principals`; used as the cmd-worker principal. |
+| `cmd.output_dir` | no | `<runtime.root>/data/cmd-worker-output` | Local output root for command stdout/stderr files. |
+| `cmd.max_concurrent_tasks` | no | `8` | Maximum number of concurrent local command tasks handled by cmd-worker. |
+| `cmd.default_timeout_ms` | no | `300000` | Default command timeout used when an Agent command request does not specify one. |
+
 #### IM Users
 
 `im.users[]` describes the relationship between Provider user identity and
@@ -280,7 +306,7 @@ is the Agent's internal stable business key.
 | `agent.max_context_messages` | no | `20` | Context limit for prompts maintained by the Agent. |
 | `agent.model_timeout_ms` | no | `60000` | How long the Agent waits for a model result. |
 | `agent.max_model_attempts` | no | `3` | Maximum model attempts for the same turn. |
-| `agent.freeze_message` | no | built-in English text | Freeze message written back to IM after repeated model failures. |
+| `agent.freeze_message` | no | built-in English text | Freeze message written back to IM after repeated model attempt failures. |
 
 ### Channels
 
@@ -288,13 +314,14 @@ is the Agent's internal stable business key.
 | --- | --- | --- | --- |
 | `channels.visibility` | no | `private` | Supports `protected` or `private`. `public` is currently disallowed because `llm.v1` channels cannot be public. |
 
-Each enabled session has three channels:
+Each enabled session has four channels.
 
 | Channel | Protocol | Members |
 | --- | --- | --- |
 | IM | `im.v1` | user, agent bot, IM sync worker |
 | Model | `llm.v1` | agent bot, model-proxy |
 | WAL | `agent.wal.v1` | agent bot |
+| Cmd | `cmd.v1` | agent bot, cmd-worker |
 
 ### Sessions
 
@@ -306,14 +333,16 @@ Each enabled session has three channels:
 | `sessions[].channels.im` | yes | | OpenEvent IM channel name. |
 | `sessions[].channels.model` | no | `<runtime.name>.llm.<session_id>` | Model channel name. |
 | `sessions[].channels.wal` | no | `<runtime.name>.wal.<session_id>` | WAL channel name. |
+| `sessions[].channels.cmd` | no | `<runtime.name>.cmd.<session_id>` | Cmd channel name used by Agent local command calls. |
 | `sessions[].channel_ids.im` | no | | Manually specified existing IM channel id. |
 | `sessions[].channel_ids.model` | no | | Manually specified existing Model channel id. |
 | `sessions[].channel_ids.wal` | no | | Manually specified existing WAL channel id. |
+| `sessions[].channel_ids.cmd` | no | | Manually specified existing Cmd channel id. |
 
-Within one Agent configuration, enabled sessions must have unique `model`
-channel names and unique `wal` channel names. IM channel names must also be
-unique. Each session eventually writes one IM channel id, one Model channel id,
-and one WAL channel id.
+Within one Agent configuration, enabled sessions must have unique `model`,
+`wal`, and `cmd` channel names. IM channel names must also be unique. Each
+enabled session writes one IM channel id, one Model channel id, one WAL channel
+id, and one Cmd channel id.
 
 ## Generated Files
 
@@ -324,6 +353,7 @@ files under `config/` in the runtime root:
 config/openevent-server.yaml
 config/im-p2p-syncer.yaml
 config/model-proxy.yaml
+config/cmd-worker.yaml
 config/im-model-agent.yaml
 config/desired.normalized.yaml
 config/state.yaml
@@ -331,7 +361,7 @@ config/secrets.yaml
 config/plan.yaml
 data/openevent/meta/
 data/openevent/messages/
-data/model-proxy/model_proxy.db
+data/cmd-worker-output/
 ```
 
 File descriptions:
@@ -340,8 +370,9 @@ File descriptions:
 | --- | --- |
 | `config/openevent-server.yaml` | OpenEvent server configuration, including gRPC/admin addresses and data paths from `openevent.storage` / `openevent.store`. |
 | `config/im-p2p-syncer.yaml` | IM syncer configuration, including Feishu/Lark credentials, user/bot mappings, and principal tokens. |
-| `config/model-proxy.yaml` | model-proxy configuration, including provider base URL/API key, OpenEvent token, SQLite idempotency DSN, and response-header filtering switch. |
-| `config/im-model-agent.yaml` | Agent configuration, including Agent token, model name, and IM/Model/WAL channel ids. |
+| `config/model-proxy.yaml` | model-proxy configuration, including provider base URL/API key, OpenEvent token, and response-header filtering switch. |
+| `config/cmd-worker.yaml` | cmd-worker configuration, including OpenEvent token, cmd channel ids, output directory, concurrency, and timeout settings. |
+| `config/im-model-agent.yaml` | Agent configuration, including Agent token, model name, and IM/Model/WAL/Cmd channel ids. |
 | `config/desired.normalized.yaml` | Desired state after defaults are expanded. Sensitive values are redacted. |
 | `config/state.yaml` | Configuration digests, token digests, channel ids, and apply status from the last apply. |
 | `config/secrets.yaml` | Plaintext OpenEvent tokens that were automatically created or adopted. |
@@ -354,7 +385,7 @@ API keys, and must not be committed.
 
 ## Apply Flow
 
-The `--apply` order is fixed:
+The `--apply` order is:
 
 1. Parse input YAML, fill defaults, and validate fields.
 2. Generate and write `config/openevent-server.yaml`.
@@ -362,23 +393,23 @@ The `--apply` order is fixed:
 4. Ensure the OpenEvent process is running and wait for business and admin ports
    to become available.
 5. Resolve or create OpenEvent tokens.
-6. Resolve or create IM, Model, and WAL channels.
-7. Generate IM syncer, model-proxy, and Agent configuration.
+6. Resolve or create IM, Model, Cmd, and WAL channels.
+7. Generate IM syncer, model-proxy, cmd-worker, and Agent configuration.
 8. Write `config/desired.normalized.yaml`, component configuration under
    `config/`, `config/state.yaml`, `config/secrets.yaml`, and
    `config/plan.yaml`.
 9. Restart downstream processes whose configuration changed. If OpenEvent
    configuration changed, downstream processes are force-restarted.
-10. Ensure model-proxy, IM syncer, and Agent processes are in the running state.
+10. Ensure model-proxy, cmd-worker, IM syncer, and Agent processes are in the running state.
 
 Restart order:
 
 ```text
-openevent -> model_proxy -> im_syncer -> agent
+openevent -> model_proxy -> cmd_worker -> im_syncer -> agent
 ```
 
-Agent starts last because it depends on IM syncer and model-proxy channels being
-ready to consume.
+Agent starts last because it depends on IM syncer, model-proxy, and cmd-worker
+channels being ready to consume.
 
 ## Token Reconciliation
 
@@ -396,6 +427,7 @@ Token usage:
 | Principal referenced by `im.worker_principal` | `im-p2p-syncer.yaml.worker.token` |
 | Principal referenced by `agent.principal` / `im.bot.principal` | `im-model-agent.yaml.agent.token`, IM syncer bot principal token, and the operator token Reconciler uses to create/maintain Agent channels |
 | Principal referenced by `model.proxy_principal` | `model-proxy.yaml.token` |
+| Principal referenced by `cmd.worker_principal` | `cmd-worker.yaml.token` |
 | Principal referenced by `im.users[].principal` | IM syncer uses it to publish inbound `sync.record` as the user principal |
 
 ## Channel Reconciliation
@@ -432,12 +464,14 @@ Stable description fields:
 | IM | `version=v1`, `provider`, `session_id`, `session_type`, `metadata.runtime_name`, `metadata.agent_session_id` |
 | Model | `version=v1`, `metadata.runtime_name`, `metadata.agent_session_id`, `metadata.model_proxy_principal` |
 | WAL | `version=v1`, `session_id`, `im_channel_id`, `model_channel_id`, `metadata.runtime_name` |
+| Cmd | `version=v1`, `metadata.runtime_name`, `metadata.agent_session_id`, `metadata.cmd_worker_principal` |
 
 Creation order:
 
 1. IM channel.
 2. Model channel.
-3. WAL channel.
+3. Cmd channel.
+4. WAL channel.
 
 WAL description needs the final IM/Model channel ids, so WAL must be created
 last.
@@ -460,18 +494,27 @@ IM syncer:
 Model proxy:
 
 - `protocol` is fixed to `llm.v1`.
-- `idempotency_dsn` defaults to
-  `sqlite:///<runtime_root>/data/model-proxy/model_proxy.db`.
+- Request idempotency is handled in model-proxy process memory. During startup
+  recovery, model-proxy rebuilds that state by scanning the OpenEvent log.
 - `model.base_url/api_key/timeout_ms` are written to provider configuration.
 - `model.model` is not written to the model-proxy provider configuration; it is
   written to Agent configuration and used by the Agent to construct request
   bodies.
 
+Cmd worker:
+
+- `protocol` is fixed to `cmd.v1`.
+- `principal/token` uses the principal referenced by `cmd.worker_principal`.
+- `channel_ids` contains the resolved cmd channel ids for enabled sessions.
+- `output_dir` defaults to `<runtime_root>/data/cmd-worker-output`.
+- The cmd worker process is a stack component; the Agent does not execute shell
+  commands directly.
+
 Agent:
 
 - `agent.principal/token` uses the principal referenced by `agent.principal`.
 - Each enabled session writes the final resolved `im_channel_id`,
-  `model_channel_id`, and `wal_channel_id`.
+  `model_channel_id`, `wal_channel_id`, and `cmd_channel_id`.
 - Agent configuration does not contain `from_seq`; the Agent restores state from
   OpenEvent history itself, then continues consuming live messages.
 
@@ -488,6 +531,9 @@ Agent:
 - Reconciler can prevent this configuration from generating multiple
   model-proxy consumers for the same Model channel, but it cannot enforce global
   mutual exclusion at the OpenEvent layer.
+- Reconciler prevents this configuration from generating multiple cmd-worker
+  consumers for the same Cmd channel, but it cannot enforce global mutual
+  exclusion at the OpenEvent layer.
 - `--dry-run` uses preview token/channel ids and does not represent real
   OpenEvent state.
 - Generated configuration contains secrets; the runtime root should not be
@@ -501,6 +547,7 @@ Common checks:
 python3 scripts/reconcile_runtime.py --spec openevent-stack/stack.yaml --dry-run
 python3 scripts/reconcile_runtime.py --spec openevent-stack/stack.yaml --print-config im_syncer
 python3 scripts/reconcile_runtime.py --spec openevent-stack/stack.yaml --print-config model_proxy
+python3 scripts/reconcile_runtime.py --spec openevent-stack/stack.yaml --print-config cmd_worker
 python3 scripts/reconcile_runtime.py --spec openevent-stack/stack.yaml --print-config agent
 ```
 
@@ -511,6 +558,7 @@ The local `openevent-stack` runtime directory also provides:
 ./openevent-stack/bootstrap.sh --apply
 ./openevent-stack/status.sh
 ./openevent-stack/logs.sh model-proxy
+./openevent-stack/logs.sh cmd-worker
 ```
 
 Troubleshooting files:
@@ -522,6 +570,7 @@ Troubleshooting files:
 | `config/secrets.yaml` | OpenEvent tokens that were automatically created or adopted. Keep it secret. |
 | `config/*.yaml` component configuration | Final real configuration passed to each component. |
 | `logs/*.log` | Logs for components started by local `openevent-stack/process.sh`. |
+| `workdir/` | Current working directory for processes started by `openevent-stack/process.sh`; also the default command working directory for Agent `exec` calls when `workdir` is omitted. |
 
 Common errors:
 
@@ -544,6 +593,10 @@ Common errors:
   `openevent-modules-im/docs/IM-P2P-SYNCER.md`.
 - model-proxy configuration is defined by
   `openevent-modules-model-proxy/docs/CONFIGURATION.md`.
+- Cmd protocol, worker configuration, and SDK behavior are defined by
+  `openevent-modules-cmd/docs/CMD_PROTOCOL.md`,
+  `openevent-modules-cmd/docs/CONFIGURATION.md`, and
+  `openevent-modules-cmd/docs/SDK_USAGE.md`.
 - Agent behavior is defined by [IM_MODEL_AGENT.md](IM_MODEL_AGENT.md).
 - Agent WAL payload is defined by
   [AGENT_WAL_PROTOCOL.md](AGENT_WAL_PROTOCOL.md).

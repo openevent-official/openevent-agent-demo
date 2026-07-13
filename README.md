@@ -5,8 +5,8 @@
 OpenEvent Agent Demo shows how to compose OpenEvent, the IM module, the
 model-proxy module, and OpenEvent View into one local Agent runtime. The demo
 connects a P2P IM conversation to an OpenAI-compatible model provider while all
-inputs, model requests, model results, replies, and Agent WAL records flow
-through OpenEvent channels.
+inputs, model requests, model results, command calls, replies, and Agent WAL
+records flow through OpenEvent channels.
 
 ## Quick Start
 
@@ -36,13 +36,20 @@ failures, see [docs/UBUNTU_ENVIRONMENT.md](docs/UBUNTU_ENVIRONMENT.md).
 demo stack. Configuration templates and scripts live directly in that
 directory.
 
-Components:
+Current components:
 
 - `openevent` server
 - `im-p2p-syncer`
 - `model-proxy`
+- `cmd-worker`
 - `im-model-agent`
 - `openevent-view`
+
+Local command support depends on `openevent-modules-cmd`, which provides the
+`openevent.cmd_sdk` package and the `cmd-worker` process. The stack installs and
+starts `cmd-worker`, creates or reuses per-session `cmd.v1` channels, generates
+`cmd-worker` configuration, and lets the Agent call local shell commands through
+OpenEvent.
 
 Adjust these files for the local environment before applying the stack:
 
@@ -53,7 +60,7 @@ Adjust these files for the local environment before applying the stack:
 portable default template.
 
 `bootstrap.sh --apply` uses `scripts/reconcile_runtime.py` to generate final
-configuration for the four core components, start or restart core processes, and
+configuration for the core components, start or restart core processes, and
 create or reuse OpenEvent tokens/channels. `openevent-view` is a required
 component of the Agent demo. It depends on OpenEvent and starts only after the
 core flow has completed.
@@ -63,7 +70,7 @@ Daily operation usually needs only these scripts:
 | Script | Purpose |
 | --- | --- |
 | `openevent-stack/bootstrap.sh` | Initialize or refresh the full runtime configuration. `--dry-run` validates and prints the plan. `--apply` starts OpenEvent, creates or reuses tokens and channels, writes final configuration, starts or restarts core processes, then starts view after OpenEvent is running and prints process status. |
-| `openevent-stack/start.sh` | Start processes from already generated configuration in order: OpenEvent, model-proxy, IM syncer, Agent, then view after OpenEvent. Prints process status. Does not create tokens or channels. |
+| `openevent-stack/start.sh` | Start processes from already generated configuration in order: OpenEvent, model-proxy, cmd-worker, IM syncer, Agent, then view after OpenEvent. Prints process status. Does not create tokens or channels. |
 | `openevent-stack/stop.sh` | Stop all local processes in reverse order. |
 | `openevent-stack/status.sh` | Show all local process status. |
 | `openevent-stack/logs.sh` | Without arguments, list log files. With a process name, follow that process log, for example `./openevent-stack/logs.sh model-proxy`. |
@@ -87,6 +94,13 @@ Other runtime artifacts are written under `openevent-stack/` by default:
 - `data/`
 - `logs/`
 - `run/`
+- `workdir/`
+
+Processes started by `openevent-stack/process.sh` run with
+`openevent-stack/workdir/` as their current working directory. The Agent `exec`
+tool follows the `cmd.v1` rule: when a tool call omits `workdir`, the command
+runs in the `cmd-worker` current working directory, so the default command
+working directory is `openevent-stack/workdir/`.
 
 ## Documentation
 
@@ -109,6 +123,7 @@ Related project documentation:
 | IM SDK and P2P syncer | `openevent-modules-im` `docs/IM-PROTOCOL-SDK.md`, `docs/IM-P2P-SYNCER.md` |
 | LLM payload protocol | `openevent-modules-model-proxy` `docs/LLM_PROTOCOL.md` |
 | model-proxy worker and SDK | `openevent-modules-model-proxy` `docs/CONFIGURATION.md`, `docs/SDK_USAGE.md` |
+| Command protocol, SDK, and worker | `openevent-modules-cmd` `docs/CMD_PROTOCOL.md`, `docs/CONFIGURATION.md`, `docs/SDK_USAGE.md` |
 | OpenEvent View | `openevent-view` `README.md` |
 
 ## Test
@@ -119,8 +134,9 @@ Use the repository test entry point:
 make test
 ```
 
-Tests use packages installed in the current Python environment. If a dependency
-package is missing, install it in that environment first.
+Tests use packages installed in the current Python environment, including
+`openevent-modules-cmd`. If a dependency package is missing, install it in that
+environment first.
 
 ## Repository Layout
 

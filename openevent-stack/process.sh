@@ -6,7 +6,7 @@ set -euo pipefail
 # shellcheck source=common.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
-programs=(openevent im-p2p-syncer model-proxy im-model-agent openevent-view)
+programs=(openevent model-proxy cmd-worker im-p2p-syncer im-model-agent openevent-view)
 
 pid_file() {
   printf '%s/%s.pid' "$RUN_DIR" "$1"
@@ -45,6 +45,9 @@ command_for() {
     model-proxy)
       printf '%s\0' "$PYTHON_BIN" "-m" "openevent.model_proxy.cli" "--config" "$CONFIG_DIR/model-proxy.yaml"
       ;;
+    cmd-worker)
+      printf '%s\0' "$PYTHON_BIN" "-m" "openevent.cmd_worker.cli" "--config" "$CONFIG_DIR/cmd-worker.yaml"
+      ;;
     im-model-agent)
       printf '%s\0' "$PYTHON_BIN" "-m" "im_model_agent.cli" "--config" "$CONFIG_DIR/im-model-agent.yaml"
       ;;
@@ -63,6 +66,7 @@ config_path_for() {
     openevent) printf '%s\n' "$CONFIG_DIR/openevent-server.yaml" ;;
     im-p2p-syncer) printf '%s\n' "$CONFIG_DIR/im-p2p-syncer.yaml" ;;
     model-proxy) printf '%s\n' "$CONFIG_DIR/model-proxy.yaml" ;;
+    cmd-worker) printf '%s\n' "$CONFIG_DIR/cmd-worker.yaml" ;;
     im-model-agent) printf '%s\n' "$CONFIG_DIR/im-model-agent.yaml" ;;
     openevent-view) printf '%s\n' "$CONFIG_DIR/openevent-view.yaml" ;;
     *) return 2 ;;
@@ -92,6 +96,11 @@ matching_pids() {
       model-proxy)
         case "$cmdline" in
           *"openevent.model_proxy.cli"*"--config $config_path"*) printf '%s\n' "$pid" ;;
+        esac
+        ;;
+      cmd-worker)
+        case "$cmdline" in
+          *"openevent.cmd_worker.cli"*"--config $config_path"*) printf '%s\n' "$pid" ;;
         esac
         ;;
       im-model-agent)
@@ -197,7 +206,7 @@ start_one() {
   fi
 
   (
-    cd "$DEMO_ROOT"
+    cd "$WORK_DIR"
     exec setsid nohup "${cmd[@]}"
   ) </dev/null >>"$(log_file "$program")" 2>&1 &
   printf '%s\n' "$!" >"$(pid_file "$program")"

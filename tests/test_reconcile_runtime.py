@@ -38,6 +38,7 @@ def _spec(root: str | None = None) -> dict:
                     "openevent": "openevent",
                     "im_syncer": "im-p2p-syncer",
                     "model_proxy": "model-proxy",
+                    "cmd_worker": "cmd-worker",
                     "agent": "im-model-agent",
                 }
             },
@@ -52,6 +53,7 @@ def _spec(root: str | None = None) -> dict:
             "p_worker": 90001,
             "p_bot": 90002,
             "p_model": 20001,
+            "p_cmd_worker": 30001,
             "p_user": 10001,
         },
         "im": {
@@ -66,6 +68,7 @@ def _spec(root: str | None = None) -> dict:
             "api_key": "sk-test",
             "model": "gpt-test",
         },
+        "cmd": {"worker_principal": "p_cmd_worker"},
         "agent": {"principal": "p_bot", "system_prompt": "be useful"},
         "sessions": [
             {
@@ -188,6 +191,8 @@ class ReconcileRuntimeTests(unittest.TestCase):
             self.assertEqual(normalized["im"]["bot"]["api_base_url"], "https://open.larksuite.com")
             self.assertEqual(normalized["model"]["proxy_principal"], "p_model")
             self.assertEqual(normalized["model"]["resolved_proxy_principal"], 20001)
+            self.assertEqual(normalized["cmd"]["worker_principal"], "p_cmd_worker")
+            self.assertEqual(normalized["cmd"]["resolved_worker_principal"], 30001)
             self.assertEqual(normalized["agent"]["principal"], "p_bot")
             self.assertEqual(normalized["agent"]["resolved_principal"], 90002)
             self.assertEqual(normalized["sessions"][0]["user"]["principal"], "p_user")
@@ -215,6 +220,8 @@ class ReconcileRuntimeTests(unittest.TestCase):
             self.assertTrue(im_config["mappings"][0]["external_user_id"].startswith("dry-open-id-"))
             self.assertEqual(agent_config["sessions"][0]["session_id"], "s1")
             self.assertEqual(agent_config["sessions"][0]["im_channel_id"], 10001)
+            self.assertEqual(agent_config["sessions"][0]["cmd_channel_id"], 40001)
+            self.assertEqual(agent_config["cmd_worker"]["principal"], 30001)
             self.assertNotIn("from_seq", agent_config["openevent"]["subscribe"])
 
     def test_user_phone_dry_run_uses_placeholder_external_id(self):
@@ -519,12 +526,14 @@ class ReconcileRuntimeTests(unittest.TestCase):
             self.assertEqual(channels["s1"].im, 100)
             self.assertEqual(channels["s1"].model, 101)
             self.assertEqual(channels["s1"].wal, 102)
+            self.assertEqual(channels["s1"].cmd, 103)
             self.assertEqual(runtime.channels[0].creator, spec.agent_principal)
             self.assertIn(spec.agent_principal, runtime.channels[0].members)
             self.assertIn(spec.im_worker_principal, runtime.channels[0].members)
             self.assertIn(10001, runtime.channels[0].members)
             self.assertEqual(json.loads(runtime.channels[2].description)["im_channel_id"], 100)
             self.assertEqual(json.loads(runtime.channels[2].description)["model_channel_id"], 101)
+            self.assertEqual(json.loads(runtime.channels[3].description)["metadata"]["cmd_worker_principal"], 30001)
 
     def test_existing_channel_must_be_agent_bot_owned(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -566,15 +575,22 @@ class ReconcileRuntimeTests(unittest.TestCase):
                 reconcile.subprocess.run = fake_run
                 reconcile.restart_changed(
                     spec,
-                    {"configs": {"model_proxy": {"changed": False}, "im_syncer": {"changed": True}, "agent": {"changed": False}}},
-                    force={"model_proxy", "agent"},
+                    {
+                        "configs": {
+                            "model_proxy": {"changed": False},
+                            "cmd_worker": {"changed": False},
+                            "im_syncer": {"changed": True},
+                            "agent": {"changed": False},
+                        }
+                    },
+                    force={"model_proxy", "cmd_worker", "agent"},
                 )
             finally:
                 reconcile.subprocess.run = original
 
             self.assertEqual(
                 [call[-1] for call in calls],
-                ["model-proxy", "im-p2p-syncer", "im-model-agent"],
+                ["model-proxy", "cmd-worker", "im-p2p-syncer", "im-model-agent"],
             )
 
     def test_ensure_program_running_starts_stopped_program(self):

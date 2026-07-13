@@ -48,12 +48,16 @@ class StackScriptTests(unittest.TestCase):
 
     def test_process_manager_detaches_and_cleans_stale_processes(self):
         repo_root = Path(__file__).resolve().parents[1]
+        common = (repo_root / "openevent-stack/common.sh").read_text(encoding="utf-8")
         process = (repo_root / "openevent-stack/process.sh").read_text(encoding="utf-8")
 
+        self.assertIn('WORK_DIR="$STACK_DIR/workdir"', common)
+        self.assertIn("PYTHONDONTWRITEBYTECODE=1", common)
         self.assertIn("matching_pids()", process)
         self.assertIn("DUPLICATE pids", process)
         self.assertIn("ORPHANED pids", process)
         self.assertIn("cleaned stale pid", process)
+        self.assertIn('cd "$WORK_DIR"', process)
         self.assertIn("exec setsid nohup", process)
         self.assertIn("</dev/null", process)
 

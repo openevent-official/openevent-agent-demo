@@ -28,6 +28,7 @@ DEFAULT_FREEZE_MESSAGE = "The model service is temporarily unavailable. The sess
 PROTOCOL_IM = "im.v1"
 PROTOCOL_MODEL = "llm.v1"
 PROTOCOL_WAL = "agent.wal.v1"
+PROTOCOL_CMD = "cmd.v1"
 VISIBILITY_VALUES = {"public": 0, "protected": 1, "private": 2}
 IM_PROVIDERS = {"feishu", "lark"}
 IM_PROVIDER_API_BASE_URLS = {
@@ -93,9 +94,11 @@ class SessionSpec:
     im_channel_name: str
     model_name: str
     wal_name: str
+    cmd_name: str
     im_channel_id: int | None = None
     model_channel_id: int | None = None
     wal_channel_id: int | None = None
+    cmd_channel_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -130,6 +133,11 @@ class DesiredSpec:
     model_api_key: str
     model_model: str
     model_timeout_ms: int
+    cmd_worker_principal_ref: str
+    cmd_worker_principal: int
+    cmd_output_dir: Path
+    cmd_max_concurrent_tasks: int
+    cmd_default_timeout_ms: int
     agent_principal_ref: str
     agent_principal: int
     agent_name: str
@@ -198,6 +206,13 @@ class DesiredSpec:
                 "model": self.model_model,
                 "timeout_ms": self.model_timeout_ms,
             },
+            "cmd": {
+                "worker_principal": self.cmd_worker_principal_ref,
+                "resolved_worker_principal": self.cmd_worker_principal,
+                "output_dir": str(self.cmd_output_dir),
+                "max_concurrent_tasks": self.cmd_max_concurrent_tasks,
+                "default_timeout_ms": self.cmd_default_timeout_ms,
+            },
             "agent": {
                 "name": self.agent_name,
                 "principal": self.agent_principal_ref,
@@ -221,11 +236,13 @@ class DesiredSpec:
                         "im": session.im_channel_name,
                         "model": session.model_name,
                         "wal": session.wal_name,
+                        "cmd": session.cmd_name,
                     },
                     "channel_ids": {
                         "im": session.im_channel_id,
                         "model": session.model_channel_id,
                         "wal": session.wal_channel_id,
+                        "cmd": session.cmd_channel_id,
                     },
                 }
                 for session in self.sessions
@@ -238,6 +255,7 @@ class ChannelIds:
     im: int
     model: int
     wal: int
+    cmd: int
 
 
 @dataclass
@@ -265,7 +283,7 @@ def parse_spec(path: Path, repo_root: Path, runtime_root_override: str | None = 
         runtime_root = repo_root / runtime_root
     supervisor = _obj(runtime.get("supervisor"), "runtime.supervisor")
     programs = _obj(supervisor.get("programs"), "runtime.supervisor.programs")
-    for key in ("openevent", "im_syncer", "model_proxy", "agent"):
+    for key in ("openevent", "im_syncer", "model_proxy", "cmd_worker", "agent"):
         _str(programs.get(key), f"runtime.supervisor.programs.{key}")
 
     openevent = _obj(raw.get("openevent"), "openevent")
@@ -306,6 +324,12 @@ def parse_spec(path: Path, repo_root: Path, runtime_root_override: str | None = 
         "model.proxy_principal",
         principal_values,
     )
+    cmd = _obj(raw.get("cmd"), "cmd")
+    cmd_worker_principal_ref, cmd_worker_principal = _principal_ref(
+        cmd.get("worker_principal"),
+        "cmd.worker_principal",
+        principal_values,
+    )
     agent = _obj(raw.get("agent"), "agent")
     agent_principal_ref, agent_principal = _principal_ref(
         agent.get("principal"),
@@ -338,13 +362,14 @@ def parse_spec(path: Path, repo_root: Path, runtime_root_override: str | None = 
     _validate_unique([session.im_channel_name for session in sessions if session.enabled], "sessions[].channels.im")
     _validate_unique([session.model_name for session in sessions if session.enabled], "sessions[].channels.model")
     _validate_unique([session.wal_name for session in sessions if session.enabled], "sessions[].channels.wal")
+    _validate_unique([session.cmd_name for session in sessions if session.enabled], "sessions[].channels.cmd")
 
     spec = DesiredSpec(
         raw=raw,
         runtime_name=runtime_name,
         paths=RuntimePaths(repo_root=repo_root, runtime_root=runtime_root),
         supervisor_ctl=_str(supervisor.get("ctl", "supervisorctl"), "runtime.supervisor.ctl"),
-        supervisor_programs={key: str(programs[key]) for key in ("openevent", "im_syncer", "model_proxy", "agent")},
+        supervisor_programs={key: str(programs[key]) for key in ("openevent", "im_syncer", "model_proxy", "cmd_worker", "agent")},
         openevent_grpc_addr=_str(openevent.get("grpc_addr"), "openevent.grpc_addr"),
         openevent_admin_addr=_str(openevent.get("admin_addr"), "openevent.admin_addr"),
         openevent_max_payload_bytes=_positive_int(
@@ -391,6 +416,11 @@ def parse_spec(path: Path, repo_root: Path, runtime_root_override: str | None = 
         model_api_key=_str(model.get("api_key"), "model.api_key"),
         model_model=_str(model.get("model"), "model.model"),
         model_timeout_ms=_positive_int(model.get("timeout_ms", DEFAULT_MODEL_TIMEOUT_MS), "model.timeout_ms"),
+        cmd_worker_principal_ref=cmd_worker_principal_ref,
+        cmd_worker_principal=cmd_worker_principal,
+        cmd_output_dir=_path_str(cmd.get("output_dir", str(runtime_root / "data/cmd-worker-output")), "cmd.output_dir", repo_root),
+        cmd_max_concurrent_tasks=_positive_int(cmd.get("max_concurrent_tasks", 8), "cmd.max_concurrent_tasks"),
+        cmd_default_timeout_ms=_positive_int(cmd.get("default_timeout_ms", 300000), "cmd.default_timeout_ms"),
         agent_principal_ref=agent_principal_ref,
         agent_principal=agent_principal,
         agent_name=_str(agent.get("name", "im-model-agent"), "agent.name"),
@@ -417,6 +447,7 @@ def render_configs(spec: DesiredSpec, resolved: ResolvedRuntime) -> dict[str, di
         },
         "im_syncer": {"path": "im-p2p-syncer.yaml", "data": _render_im_syncer(spec, resolved)},
         "model_proxy": {"path": "model-proxy.yaml", "data": _render_model_proxy(spec, resolved)},
+        "cmd_worker": {"path": "cmd-worker.yaml", "data": _render_cmd_worker(spec, resolved)},
         "agent": {"path": "im-model-agent.yaml", "data": _render_agent(spec, resolved)},
     }
 
@@ -494,7 +525,6 @@ def _render_model_proxy(spec: DesiredSpec, resolved: ResolvedRuntime) -> dict[st
         "open_event": {"addr": spec.openevent_grpc_addr},
         "principal": spec.model_proxy_principal,
         "token": resolved.tokens[spec.model_proxy_principal_ref],
-        "idempotency_dsn": f"sqlite:///{spec.paths.runtime_root / 'data/model-proxy/model_proxy.db'}",
         "max_payload_bytes": spec.openevent_max_payload_bytes,
         "filter_response_headers": True,
         "default_provider": spec.model_provider_name,
@@ -506,6 +536,26 @@ def _render_model_proxy(spec: DesiredSpec, resolved: ResolvedRuntime) -> dict[st
                 "timeout": {"total_ms": spec.model_timeout_ms},
             }
         },
+    }
+
+
+def _render_cmd_worker(spec: DesiredSpec, resolved: ResolvedRuntime) -> dict[str, Any]:
+    return {
+        "protocol": PROTOCOL_CMD,
+        "open_event": {
+            "addr": spec.openevent_grpc_addr,
+            "max_payload_bytes": spec.openevent_max_payload_bytes,
+        },
+        "principal": spec.cmd_worker_principal,
+        "token": resolved.tokens[spec.cmd_worker_principal_ref],
+        "channel_ids": [
+            resolved.channels[session.session_id].cmd
+            for session in spec.sessions
+            if session.enabled
+        ],
+        "output_dir": str(spec.cmd_output_dir),
+        "max_concurrent_tasks": spec.cmd_max_concurrent_tasks,
+        "default_timeout_ms": spec.cmd_default_timeout_ms,
     }
 
 
@@ -525,6 +575,7 @@ def _render_agent(spec: DesiredSpec, resolved: ResolvedRuntime) -> dict[str, Any
         },
         "openevent": {"target": spec.openevent_grpc_addr, "subscribe": {"only_my_recipient": False}},
         "model_proxy": {"principal": spec.model_proxy_principal},
+        "cmd_worker": {"principal": spec.cmd_worker_principal},
         "im_sync_worker": {"principal": spec.im_worker_principal},
         "sessions": [
             {
@@ -532,6 +583,7 @@ def _render_agent(spec: DesiredSpec, resolved: ResolvedRuntime) -> dict[str, Any
                 "im_channel_id": resolved.channels[session.session_id].im,
                 "model_channel_id": resolved.channels[session.session_id].model,
                 "wal_channel_id": resolved.channels[session.session_id].wal,
+                "cmd_channel_id": resolved.channels[session.session_id].cmd,
                 "user_principal": session.user_principal,
                 "agent_bot_principal": spec.agent_principal,
                 "enabled": session.enabled,
@@ -646,6 +698,7 @@ def dry_resolve(spec: DesiredSpec, previous: dict[str, Any] | None = None) -> Re
                 im=session.im_channel_id or ids.get("im") or 10000 + index,
                 model=session.model_channel_id or ids.get("model") or 20000 + index,
                 wal=session.wal_channel_id or ids.get("wal") or 30000 + index,
+                cmd=session.cmd_channel_id or ids.get("cmd") or 40000 + index,
             )
     im_provider_session_ids, im_provider_session_id_sources = _resolve_im_provider_session_ids(
         spec,
@@ -755,7 +808,6 @@ def write_runtime_files(
     spec.paths.config_dir.mkdir(parents=True, exist_ok=True)
     spec.openevent_metadata_path.mkdir(parents=True, exist_ok=True)
     spec.openevent_message_store_path.mkdir(parents=True, exist_ok=True)
-    (spec.paths.runtime_root / "data/model-proxy").mkdir(parents=True, exist_ok=True)
     _atomic_write(spec.paths.desired_path, _dump_yaml(spec.normalized()), 0o600)
     for name, item in configs.items():
         if openevent_config is not None and name == "openevent":
@@ -780,6 +832,7 @@ def write_runtime_files(
                     "im": {"channel_id": ids.im},
                     "model": {"channel_id": ids.model},
                     "wal": {"channel_id": ids.wal},
+                    "cmd": {"channel_id": ids.cmd},
                 }
                 for session_id, ids in resolved.channels.items()
             }
@@ -811,11 +864,13 @@ def validate_configs(configs: dict[str, dict[str, Any]]) -> None:
     _validate_openevent_config(configs["openevent"]["data"])
     _ensure_project_path()
     from im_model_agent.config import parse_config as parse_agent_config
+    from openevent.cmd_worker.config import parse_config as parse_cmd_config
     from openevent.im_p2p_syncer.config import parse_config as parse_im_config
     from openevent.model_proxy.config import parse_config as parse_model_config
 
     parse_im_config(configs["im_syncer"]["data"])
     parse_model_config(configs["model_proxy"]["data"])
+    parse_cmd_config(configs["cmd_worker"]["data"])
     parse_agent_config(configs["agent"]["data"])
 
 
@@ -832,7 +887,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--runtime-root")
-    parser.add_argument("--print-config", choices=["openevent", "im_syncer", "model_proxy", "agent"])
+    parser.add_argument("--print-config", choices=["openevent", "im_syncer", "model_proxy", "cmd_worker", "agent"])
     args = parser.parse_args(argv)
     mode_count = int(args.dry_run) + int(args.apply) + int(args.print_config is not None)
     if mode_count != 1:
@@ -855,15 +910,15 @@ def main(argv: list[str] | None = None) -> int:
     plan = write_runtime_files(spec, resolved, dry_run=args.dry_run, openevent_config=openevent_config)
     print(_dump_yaml(plan), end="")
     if args.apply:
-        force_restart = {"model_proxy", "im_syncer", "agent"} if openevent_config and openevent_config.get("changed") else set()
+        force_restart = {"model_proxy", "cmd_worker", "im_syncer", "agent"} if openevent_config and openevent_config.get("changed") else set()
         restart_changed(spec, plan, skip={"openevent"}, force=force_restart)
-        for logical in ("model_proxy", "im_syncer", "agent"):
+        for logical in ("model_proxy", "cmd_worker", "im_syncer", "agent"):
             ensure_program_running(spec, logical)
     return 0
 
 
 def ensure_program_running(spec: DesiredSpec, logical: str) -> None:
-    program_key = {"openevent": "openevent", "im_syncer": "im_syncer", "model_proxy": "model_proxy", "agent": "agent"}[logical]
+    program_key = _program_key(logical)
     program = spec.supervisor_programs[program_key]
     status = subprocess.run([spec.supervisor_ctl, "status", program], check=False, capture_output=True, text=True)
     output = f"{status.stdout}\n{status.stderr}"
@@ -883,17 +938,27 @@ def restart_changed(
     skip = skip or set()
     force = force or set()
     configs = plan.get("configs", {})
-    for logical in ("openevent", "model_proxy", "im_syncer", "agent"):
+    for logical in ("openevent", "model_proxy", "cmd_worker", "im_syncer", "agent"):
         if logical in skip:
             continue
         config = configs.get(logical, {})
         if logical not in force and not config.get("changed"):
             continue
-        program_key = {"openevent": "openevent", "im_syncer": "im_syncer", "model_proxy": "model_proxy", "agent": "agent"}[logical]
+        program_key = _program_key(logical)
         program = spec.supervisor_programs[program_key]
         result = subprocess.run([spec.supervisor_ctl, "restart", program], check=False)
         if result.returncode != 0:
             raise ApplyError(f"supervisor restart failed for {program}")
+
+
+def _program_key(logical: str) -> str:
+    return {
+        "openevent": "openevent",
+        "im_syncer": "im_syncer",
+        "model_proxy": "model_proxy",
+        "cmd_worker": "cmd_worker",
+        "agent": "agent",
+    }[logical]
 
 
 def _parse_im_user(raw: Any, index: int, principals: dict[str, int]) -> ImUserSpec:
@@ -980,9 +1045,11 @@ def _parse_session(
         im_channel_name=im_channel_name,
         model_name=_str(channels.get("model", f"{runtime_name}.llm.{session_id}"), f"sessions[{index}].channels.model"),
         wal_name=_str(channels.get("wal", f"{runtime_name}.wal.{session_id}"), f"sessions[{index}].channels.wal"),
+        cmd_name=_str(channels.get("cmd", f"{runtime_name}.cmd.{session_id}"), f"sessions[{index}].channels.cmd"),
         im_channel_id=_optional_positive_int(ids.get("im"), f"sessions[{index}].channel_ids.im"),
         model_channel_id=_optional_positive_int(ids.get("model"), f"sessions[{index}].channel_ids.model"),
         wal_channel_id=_optional_positive_int(ids.get("wal"), f"sessions[{index}].channel_ids.wal"),
+        cmd_channel_id=_optional_positive_int(ids.get("cmd"), f"sessions[{index}].channel_ids.cmd"),
     )
 
 
@@ -991,7 +1058,7 @@ def _state_channel_ids(state: dict[str, Any] | None, session_id: str) -> dict[st
         return {}
     raw = (((state.get("channels") or {}).get("sessions") or {}).get(session_id) or {})
     result = {}
-    for key in ("im", "model", "wal"):
+    for key in ("im", "model", "wal", "cmd"):
         value = (raw.get(key) or {}).get("channel_id")
         if isinstance(value, int) and value > 0:
             result[key] = value
@@ -1010,6 +1077,7 @@ def _required_principal_refs(spec: DesiredSpec) -> tuple[str, ...]:
         spec.im_worker_principal_ref,
         spec.im_bot_principal_ref,
         spec.model_proxy_principal_ref,
+        spec.cmd_worker_principal_ref,
         spec.agent_principal_ref,
     ]
     refs.extend(user.principal_ref for user in spec.im_users)
@@ -1425,7 +1493,27 @@ def _resolve_channels(
             match=lambda desc: _matches_wal_description(desc, spec, session, im_id, model_id),
             actions=actions,
         )
-        result[session.session_id] = ChannelIds(im=im_id, model=model_id, wal=wal_id)
+        cmd_id = _resolve_channel(
+            spec=spec,
+            runtime=runtime,
+            visible_channels=visible_channels,
+            operator_principal=agent_bot_principal,
+            operator_token=agent_bot_token,
+            principal_tokens=principal_tokens,
+            previous_id=state_ids.get("cmd"),
+            explicit_id=session.cmd_channel_id,
+            name=session.cmd_name,
+            protocol=PROTOCOL_CMD,
+            visibility=visibility,
+            description=_cmd_description(spec, session),
+            required_members=[
+                spec.agent_principal,
+                spec.cmd_worker_principal,
+            ],
+            match=lambda desc: _matches_cmd_description(desc, spec, session),
+            actions=actions,
+        )
+        result[session.session_id] = ChannelIds(im=im_id, model=model_id, wal=wal_id, cmd=cmd_id)
     return result
 
 
@@ -1592,6 +1680,17 @@ def _wal_description(spec: DesiredSpec, session: SessionSpec, im_channel_id: int
     }
 
 
+def _cmd_description(spec: DesiredSpec, session: SessionSpec) -> dict[str, Any]:
+    return {
+        "version": "v1",
+        "metadata": {
+            "runtime_name": spec.runtime_name,
+            "agent_session_id": session.session_id,
+            "cmd_worker_principal": spec.cmd_worker_principal,
+        },
+    }
+
+
 def _matches_im_description(
     desc: dict[str, Any],
     spec: DesiredSpec,
@@ -1636,6 +1735,17 @@ def _matches_wal_description(
         and desc.get("model_channel_id") == model_channel_id
         and isinstance(metadata, dict)
         and metadata.get("runtime_name") == spec.runtime_name
+    )
+
+
+def _matches_cmd_description(desc: dict[str, Any], spec: DesiredSpec, session: SessionSpec) -> bool:
+    metadata = desc.get("metadata")
+    return (
+        desc.get("version") == "v1"
+        and isinstance(metadata, dict)
+        and metadata.get("runtime_name") == spec.runtime_name
+        and metadata.get("agent_session_id") == session.session_id
+        and metadata.get("cmd_worker_principal") == spec.cmd_worker_principal
     )
 
 
@@ -1734,7 +1844,7 @@ def _validate_spec(spec: DesiredSpec) -> None:
             continue
         explicit_ids.extend(
             value
-            for value in (session.im_channel_id, session.model_channel_id, session.wal_channel_id)
+            for value in (session.im_channel_id, session.model_channel_id, session.wal_channel_id, session.cmd_channel_id)
             if value is not None
         )
     _validate_unique(explicit_ids, "channel ids")
@@ -1746,6 +1856,12 @@ def _validate_spec(spec: DesiredSpec) -> None:
         raise SpecError("model.proxy_principal must not equal agent.principal")
     if spec.model_proxy_principal == spec.im_worker_principal:
         raise SpecError("model.proxy_principal must not equal im.worker_principal")
+    if spec.cmd_worker_principal == spec.agent_principal:
+        raise SpecError("cmd.worker_principal must not equal agent.principal")
+    if spec.cmd_worker_principal == spec.im_worker_principal:
+        raise SpecError("cmd.worker_principal must not equal im.worker_principal")
+    if spec.cmd_worker_principal == spec.model_proxy_principal:
+        raise SpecError("cmd.worker_principal must not equal model.proxy_principal")
     for user in spec.im_users:
         if user.principal == spec.im_bot_principal:
             raise SpecError("im.users[].principal must not equal im.bot.principal")
@@ -1753,6 +1869,8 @@ def _validate_spec(spec: DesiredSpec) -> None:
             raise SpecError("im.users[].principal must not equal im.worker_principal")
         if user.principal == spec.model_proxy_principal:
             raise SpecError("im.users[].principal must not equal model.proxy_principal")
+        if user.principal == spec.cmd_worker_principal:
+            raise SpecError("im.users[].principal must not equal cmd.worker_principal")
 
 
 def _validate_resolved(
@@ -1774,6 +1892,7 @@ def _validate_resolved(
     _validate_unique([channels[session.session_id].im for session in enabled_sessions], "resolved im_channel_id")
     _validate_unique([channels[session.session_id].model for session in enabled_sessions], "resolved model_channel_id")
     _validate_unique([channels[session.session_id].wal for session in enabled_sessions], "resolved wal_channel_id")
+    _validate_unique([channels[session.session_id].cmd for session in enabled_sessions], "resolved cmd_channel_id")
     _validate_unique([im_provider_session_ids[session.session_id] for session in enabled_sessions], "resolved IM provider session_id")
 
 

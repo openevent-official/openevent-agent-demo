@@ -51,11 +51,17 @@ class PrincipalConfig:
 
 
 @dataclass(frozen=True)
+class CmdWorkerConfig:
+    principal: int
+
+
+@dataclass(frozen=True)
 class SessionConfig:
     session_id: str
     im_channel_id: int
     model_channel_id: int
     wal_channel_id: int
+    cmd_channel_id: int
     user_principal: int
     agent_bot_principal: int
     enabled: bool
@@ -67,6 +73,7 @@ class AgentRuntimeConfig:
     agent: AgentConfig
     openevent: OpenEventConfig
     model_proxy: PrincipalConfig
+    cmd_worker: CmdWorkerConfig
     im_sync_worker: PrincipalConfig
     sessions: tuple[SessionConfig, ...]
 
@@ -137,6 +144,9 @@ def parse_config(raw: Any) -> AgentRuntimeConfig:
     model_proxy = PrincipalConfig(
         principal=_positive_int(_obj(data.get("model_proxy"), "model_proxy").get("principal"), "model_proxy.principal")
     )
+    cmd_worker = CmdWorkerConfig(
+        principal=_positive_int(_obj(data.get("cmd_worker"), "cmd_worker").get("principal"), "cmd_worker.principal")
+    )
     im_sync_worker = PrincipalConfig(
         principal=_positive_int(
             _obj(data.get("im_sync_worker"), "im_sync_worker").get("principal"),
@@ -150,6 +160,7 @@ def parse_config(raw: Any) -> AgentRuntimeConfig:
     _validate_unique(sessions, "im_channel_id", lambda item: item.im_channel_id)
     _validate_unique(sessions, "model_channel_id", lambda item: item.model_channel_id)
     _validate_unique(sessions, "wal_channel_id", lambda item: item.wal_channel_id)
+    _validate_unique(sessions, "cmd_channel_id", lambda item: item.cmd_channel_id)
     for session in sessions:
         if session.agent_bot_principal != agent.principal:
             raise ConfigError("sessions[].agent_bot_principal must equal agent.principal")
@@ -161,6 +172,7 @@ def parse_config(raw: Any) -> AgentRuntimeConfig:
         agent=agent,
         openevent=openevent,
         model_proxy=model_proxy,
+        cmd_worker=cmd_worker,
         im_sync_worker=im_sync_worker,
         sessions=sessions,
     )
@@ -173,6 +185,7 @@ def _parse_session(raw: Any, index: int) -> SessionConfig:
         im_channel_id=_positive_int(data.get("im_channel_id"), f"sessions[{index}].im_channel_id"),
         model_channel_id=_positive_int(data.get("model_channel_id"), f"sessions[{index}].model_channel_id"),
         wal_channel_id=_positive_int(data.get("wal_channel_id"), f"sessions[{index}].wal_channel_id"),
+        cmd_channel_id=_positive_int(data.get("cmd_channel_id"), f"sessions[{index}].cmd_channel_id"),
         user_principal=_positive_int(data.get("user_principal"), f"sessions[{index}].user_principal"),
         agent_bot_principal=_positive_int(
             data.get("agent_bot_principal"),

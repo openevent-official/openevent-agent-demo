@@ -9,7 +9,7 @@
 
 完成后本地会得到：
 
-- `runtime/src/`：从 GitHub 拉取的 OpenEvent、SDK、IM、model-proxy 和 view 源码。
+- `runtime/src/`：从 GitHub 拉取的 OpenEvent、SDK、IM、model-proxy、cmd 和 view 源码。
 - `runtime/venv/`：Agent Demo 使用的 Python venv。
 - `runtime/src/openevent/build/openevent_server`：本地构建出的 OpenEvent server。
 - `openevent-stack/config/env.sh`：指向上述 venv 和 server 二进制的本机路径覆盖配置。
@@ -82,17 +82,18 @@ source runtime/venv/bin/activate
 3. 初始化 OpenEvent server 的 Git submodule。
 4. 创建 `runtime/venv`。
 5. 构建 OpenEvent server。
-6. 通过各子项目的 `make install` 把 SDK、IM、model-proxy 和 view 安装到同一个 venv。
+6. 通过各子项目的 `make install` 把 SDK、IM、model-proxy、cmd 和 view 安装到同一个 venv。
 7. 生成 `openevent-stack/config/env.sh`。
 8. 验证 venv 中可以 import 运行所需模块。
 
-默认依赖公开仓库：
+bootstrap 依赖公开仓库：
 
 ```bash
 https://github.com/openevent-official/openevent.git
 https://github.com/openevent-official/openevent-sdk.git
 https://github.com/openevent-official/openevent-modules-im.git
 https://github.com/openevent-official/openevent-modules-model-proxy.git
+https://github.com/openevent-official/openevent-modules-cmd.git
 https://github.com/openevent-official/openevent-view.git
 ```
 
@@ -103,6 +104,7 @@ OPENEVENT_URL=https://github.com/openevent-official/openevent.git \
 OPENEVENT_SDK_URL=https://github.com/openevent-official/openevent-sdk.git \
 OPENEVENT_MODULES_IM_URL=https://github.com/openevent-official/openevent-modules-im.git \
 OPENEVENT_MODEL_PROXY_URL=https://github.com/openevent-official/openevent-modules-model-proxy.git \
+OPENEVENT_MODULES_CMD_URL=https://github.com/openevent-official/openevent-modules-cmd.git \
 OPENEVENT_VIEW_URL=https://github.com/openevent-official/openevent-view.git \
 scripts/bootstrap_ubuntu_venv.sh --workdir runtime
 ```

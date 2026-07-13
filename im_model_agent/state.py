@@ -1,14 +1,26 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
 from openevent.im_sdk import ParsedMessage as ImMessage
 from openevent.model_proxy_sdk import InferRequest, InferResult, ParsedMessage as LlmMessage
+from openevent.cmd_sdk.model import (
+    CmdOutputReadRequest,
+    CmdOutputReadResult,
+    CmdRunRequest,
+    CmdRunResult,
+    ParsedMessage as CmdMessage,
+)
 
 from .config import SessionConfig
 from .prompt import UserPromptMessage
 from .wal import WalPrepare, parse_model_request_id, turn_id
+
+CMD_REQUEST_ID_RE = re.compile(
+    r"^cmd:(?P<model_request_id>agent:[A-Za-z0-9._:-]+:wal:[1-9][0-9]*):(?P<tool_call_index>[0-9]+)$"
+)
 
 
 class AgentStateError(RuntimeError):
@@ -40,6 +52,23 @@ class AttemptState:
 
 
 @dataclass
+class CommandState:
+    turn_id: str
+    model_request_id: str
+    tool_call_index: int
+    tool_name: str
+    arguments: dict[str, Any]
+    request_seq: int | None = None
+    request: CmdRunRequest | CmdOutputReadRequest | None = None
+    result_seq: int | None = None
+    result: CmdRunResult | CmdOutputReadResult | None = None
+
+    @property
+    def request_id(self) -> str:
+        return f"cmd:{self.model_request_id}:{self.tool_call_index}"
+
+
+@dataclass
 class SessionState:
     config: SessionConfig
     pending: list[UserPromptMessage] = field(default_factory=list)
@@ -50,6 +79,8 @@ class SessionState:
     send_results_by_prev_seq: dict[int, ImMessage] = field(default_factory=dict)
     agent_send_request_by_seq: dict[int, ImMessage] = field(default_factory=dict)
     send_result_by_provider_message_id: dict[str, ImMessage] = field(default_factory=dict)
+    commands_by_request_id: dict[str, CommandState] = field(default_factory=dict)
+    commands_by_seq: dict[int, CommandState] = field(default_factory=dict)
     frozen: bool = False
     in_flight_turn_id: str | None = None
 
@@ -76,6 +107,7 @@ class AgentRuntimeState:
         self.sessions_by_im = {session.im_channel_id: self.sessions_by_id[session.session_id] for session in enabled}
         self.sessions_by_model = {session.model_channel_id: self.sessions_by_id[session.session_id] for session in enabled}
         self.sessions_by_wal = {session.wal_channel_id: self.sessions_by_id[session.session_id] for session in enabled}
+        self.sessions_by_cmd = {session.cmd_channel_id: self.sessions_by_id[session.session_id] for session in enabled}
         self.user_messages: dict[int, UserPromptMessage] = {}
         self.wal_records: dict[int, WalRecord] = {}
         self.max_seen_seq = 0
@@ -122,7 +154,58 @@ class AgentRuntimeState:
             attempt.result = message.payload
             session = self.sessions_by_model.get(message.channel_id)
             if session is not None and session.in_flight_turn_id == attempt.wal.turn_id:
-                session.in_flight_turn_id = None
+                latest = max(
+                    (item for item in session.attempts.values() if item.wal.turn_id == attempt.wal.turn_id),
+                    key=lambda item: item.wal.seq,
+                )
+                if latest.wal.seq == attempt.wal.seq:
+                    session.in_flight_turn_id = None
+
+    def observe_cmd_message(self, message: CmdMessage) -> CommandState | None:
+        session = self.sessions_by_cmd.get(message.channel_id)
+        if session is None:
+            return None
+        if isinstance(message.payload, (CmdRunRequest, CmdOutputReadRequest)):
+            parsed = parse_cmd_request_id(message.payload.request_id)
+            if parsed is None:
+                return None
+            model_request_id, tool_call_index = parsed
+            model_parsed = parse_model_request_id(model_request_id)
+            if model_parsed is None:
+                return None
+            session_id, wal_seq = model_parsed
+            mapped_session = self.sessions_by_id.get(session_id)
+            if mapped_session is None or mapped_session is not session:
+                raise AgentStateError(f"cmd request {message.seq} maps to wrong session/channel")
+            attempt = mapped_session.attempts.get(wal_seq)
+            if attempt is None:
+                raise AgentStateError(f"cmd request {message.seq} references missing WAL {wal_seq}")
+            command = session.commands_by_request_id.get(message.payload.request_id)
+            if command is None:
+                command = CommandState(
+                    turn_id=attempt.wal.turn_id,
+                    model_request_id=model_request_id,
+                    tool_call_index=tool_call_index,
+                    tool_name=_cmd_tool_name(message.payload),
+                    arguments=_cmd_arguments(message.payload),
+                )
+                session.commands_by_request_id[message.payload.request_id] = command
+            elif command.request_seq is not None and command.request_seq != message.seq:
+                raise AgentStateError(f"duplicate cmd request_id {message.payload.request_id}")
+            command.request_seq = message.seq
+            command.request = message.payload
+            session.commands_by_seq[message.seq] = command
+            if command.result is None and command.turn_id not in session.terminal_send_by_turn:
+                session.in_flight_turn_id = command.turn_id
+            return command
+        if isinstance(message.payload, (CmdRunResult, CmdOutputReadResult)):
+            command = session.commands_by_seq.get(message.payload.prev_seq)
+            if command is None:
+                return None
+            command.result_seq = message.seq
+            command.result = message.payload
+            return command
+        return None
 
     def observe_im_send_request(self, session: SessionState, message: ImMessage) -> None:
         session.agent_send_request_by_seq[message.seq] = message
@@ -181,3 +264,29 @@ def turn_from_im_request_id(request_id: str, wal_records: dict[int, WalRecord]) 
     if record is None:
         return None
     return record.turn_id
+
+
+def parse_cmd_request_id(request_id: str | None) -> tuple[str, int] | None:
+    if not isinstance(request_id, str):
+        return None
+    match = CMD_REQUEST_ID_RE.fullmatch(request_id)
+    if match is None:
+        return None
+    return match.group("model_request_id"), int(match.group("tool_call_index"))
+
+
+def _cmd_tool_name(payload: CmdRunRequest | CmdOutputReadRequest) -> str:
+    if isinstance(payload, CmdRunRequest):
+        return "exec"
+    return "read_stdout" if payload.stream == "stdout" else "read_stderr"
+
+
+def _cmd_arguments(payload: CmdRunRequest | CmdOutputReadRequest) -> dict[str, Any]:
+    if isinstance(payload, CmdRunRequest):
+        data: dict[str, Any] = {"command": payload.command}
+        if payload.workdir is not None:
+            data["workdir"] = payload.workdir
+        if payload.timeout_ms is not None:
+            data["timeout_ms"] = payload.timeout_ms
+        return data
+    return {"exec_id": payload.target_seq}

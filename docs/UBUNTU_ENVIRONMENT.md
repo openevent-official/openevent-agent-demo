@@ -9,8 +9,8 @@ fresh Ubuntu environment. It currently covers Ubuntu only.
 
 After preparation, the local checkout will contain:
 
-- `runtime/src/`: OpenEvent, SDK, IM, model-proxy, and view source checkouts
-  cloned from GitHub.
+- `runtime/src/`: OpenEvent, SDK, IM, model-proxy, cmd, and view source
+  checkouts cloned from GitHub.
 - `runtime/venv/`: the Python venv used by Agent Demo.
 - `runtime/src/openevent/build/openevent_server`: the locally built OpenEvent
   server binary.
@@ -89,18 +89,19 @@ source runtime/venv/bin/activate
 3. Initialize the OpenEvent server Git submodule.
 4. Create `runtime/venv`.
 5. Build the OpenEvent server.
-6. Install SDK, IM, model-proxy, and view into the same venv through each
+6. Install SDK, IM, model-proxy, cmd, and view into the same venv through each
    subproject's `make install`.
 7. Generate `openevent-stack/config/env.sh`.
 8. Verify that required runtime modules can be imported from the venv.
 
-Default public dependency repositories:
+Bootstrap dependency repositories:
 
 ```bash
 https://github.com/openevent-official/openevent.git
 https://github.com/openevent-official/openevent-sdk.git
 https://github.com/openevent-official/openevent-modules-im.git
 https://github.com/openevent-official/openevent-modules-model-proxy.git
+https://github.com/openevent-official/openevent-modules-cmd.git
 https://github.com/openevent-official/openevent-view.git
 ```
 
@@ -112,6 +113,7 @@ OPENEVENT_URL=https://github.com/openevent-official/openevent.git \
 OPENEVENT_SDK_URL=https://github.com/openevent-official/openevent-sdk.git \
 OPENEVENT_MODULES_IM_URL=https://github.com/openevent-official/openevent-modules-im.git \
 OPENEVENT_MODEL_PROXY_URL=https://github.com/openevent-official/openevent-modules-model-proxy.git \
+OPENEVENT_MODULES_CMD_URL=https://github.com/openevent-official/openevent-modules-cmd.git \
 OPENEVENT_VIEW_URL=https://github.com/openevent-official/openevent-view.git \
 scripts/bootstrap_ubuntu_venv.sh --workdir runtime
 ```

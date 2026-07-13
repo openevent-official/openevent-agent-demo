@@ -3,15 +3,19 @@
 [English version](RUNTIME_RECONCILER.md)
 
 Runtime Reconciler 是 Agent demo 的运行环境协调脚本。它读取一个声明式 YAML，生成
-OpenEvent、IM P2P syncer、model-proxy 和 IM Model Agent 的运行配置，并在 `--apply`
-时协调 OpenEvent token、channel 和本地进程。
+OpenEvent、IM P2P syncer、model-proxy、cmd-worker 和 IM Model Agent 的运行配置，并在
+`--apply` 时协调 OpenEvent token、channel 和本地进程。
 
 它不实现 IM 同步、模型调用或 Agent 业务逻辑；这些逻辑仍由各组件负责。Reconciler
 只负责把这些组件按同一套 principal、token、channel 和配置文件连起来。
 
 `openevent-stack/stack.yaml` 中的 `view` 段由 `openevent-stack` 脚本消费。
-Reconciler 本身只管理四个核心组件；`openevent-view` 是 agent demo 的必须组件，
+Reconciler 本身只管理核心组件；`openevent-view` 是 agent demo 的必须组件，
 依赖 OpenEvent，由 `bootstrap.sh`/`start.sh` 在 OpenEvent 已运行后生成配置并启动。
+
+本地命令能力使用 `openevent-modules-cmd` 和 `cmd-worker`。Reconciler 会生成
+`cmd-worker` 配置，创建或复用每个 session 的 `cmd.v1` channel，并把解析出的 cmd channel id
+写入 Agent 配置。
 
 ## CLI
 
@@ -30,7 +34,7 @@ python3 scripts/reconcile_runtime.py --spec runtime.yaml --print-config agent
 | `--dry-run` | 只解析、填默认值、生成预览 plan 和配置摘要；不写配置、不连 OpenEvent、不创建 token/channel、不重启进程。 |
 | `--apply` | 写配置、启动/重启 OpenEvent、创建或复用 token/channel、写最终组件配置、重启下游组件。 |
 | `--runtime-root` | 覆盖输入 YAML 中的 `runtime.root`。相对路径按仓库根目录解析。 |
-| `--print-config` | 打印 dry-run 解析后的单个组件配置，可选 `openevent`、`im_syncer`、`model_proxy`、`agent`。 |
+| `--print-config` | 打印 dry-run 解析后的单个组件配置，可选 `openevent`、`im_syncer`、`model_proxy`、`cmd_worker`、`agent`。 |
 
 退出码：
 
@@ -61,6 +65,7 @@ runtime:
       openevent: openevent
       im_syncer: im-p2p-syncer
       model_proxy: model-proxy
+      cmd_worker: cmd-worker
       agent: im-model-agent
 
 openevent:
@@ -80,6 +85,7 @@ principals:
   p_im_worker: 90001
   p_bot: 90002
   p_model_proxy: 20001
+  p_cmd_worker: 30001
   p_user: 10001
 
 tokens: {}
@@ -111,6 +117,11 @@ model:
   model: gpt-4o-mini
   timeout_ms: 65000
 
+cmd:
+  worker_principal: p_cmd_worker
+  max_concurrent_tasks: 8
+  default_timeout_ms: 300000
+
 agent:
   principal: p_bot
   name: im-model-agent
@@ -132,6 +143,7 @@ sessions:
       im: openevent-stack.im.s1
       model: openevent-stack.llm.s1
       wal: openevent-stack.wal.s1
+      cmd: openevent-stack.cmd.s1
 ```
 
 ## 输入字段
@@ -147,6 +159,7 @@ sessions:
 | `runtime.supervisor.programs.openevent` | 是 | OpenEvent 进程名。 |
 | `runtime.supervisor.programs.im_syncer` | 是 | IM P2P syncer 进程名。 |
 | `runtime.supervisor.programs.model_proxy` | 是 | model-proxy 进程名。 |
+| `runtime.supervisor.programs.cmd_worker` | 是 | cmd-worker 进程名。 |
 | `runtime.supervisor.programs.agent` | 是 | IM Model Agent 进程名。 |
 
 ### OpenEvent
@@ -157,7 +170,7 @@ sessions:
 | `openevent.admin_addr` | 是 | | 管理 gRPC 地址，Reconciler 用它调用 `ListTokens` 和 `AddToken`。 |
 | `openevent.storage.metadata_path` | 是 | | OpenEvent metadata 存储路径。相对路径按 demo 仓库根目录解析。 |
 | `openevent.store.rocksdb.path` | 是 | | OpenEvent 消息 RocksDB 存储路径。相对路径按 demo 仓库根目录解析。 |
-| `openevent.max_payload_bytes` | 否 | `16777216` | 写入 OpenEvent server 配置，也写入 model-proxy 配置。 |
+| `openevent.max_payload_bytes` | 否 | `16777216` | 写入 OpenEvent server、model-proxy 和 cmd-worker 配置。 |
 
 ### Principals And Tokens
 
@@ -208,6 +221,18 @@ Feishu/Lark bot 消息按应用身份映射。Reconciler 使用 `im.bot.app_id`
 `agent.principal` 必须和 `im.bot.principal` 解析到同一个 principal。IM worker、
 model-proxy、用户 principal 和 bot/agent principal 必须彼此区分，避免一个 token 获得不该有的 channel 操作边界。
 
+### Command Worker
+
+命令能力使用 `openevent-modules-cmd`。Reconciler 会生成 `cmd-worker` 配置，
+创建或复用每个 session 的 `cmd.v1` channel，并把解析出的 cmd channel id 写入 Agent 配置。
+
+| 字段 | 必填 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `cmd.worker_principal` | 是 | | 引用 `principals` 中的名字，作为 cmd-worker principal。 |
+| `cmd.output_dir` | 否 | `<runtime.root>/data/cmd-worker-output` | 本地 stdout/stderr 输出根目录。 |
+| `cmd.max_concurrent_tasks` | 否 | `8` | cmd-worker 同时处理的本地命令任务上限。 |
+| `cmd.default_timeout_ms` | 否 | `300000` | Agent 命令请求未指定 timeout 时使用的默认命令超时。 |
+
 #### IM Users
 
 `im.users[]` 描述 Provider 用户身份和 OpenEvent principal 的关系。
@@ -256,7 +281,7 @@ Reconciler 不暴露 Provider `chat_id`。它会根据 enabled session 的 `user
 | `agent.max_context_messages` | 否 | `20` | Agent 自维护 prompt 的上下文上限。 |
 | `agent.model_timeout_ms` | 否 | `60000` | Agent 等待模型结果的超时时间。 |
 | `agent.max_model_attempts` | 否 | `3` | 同一 turn 的最大模型尝试次数。 |
-| `agent.freeze_message` | 否 | 内置英文文案 | 模型多次失败后写回 IM 的冻结提示。 |
+| `agent.freeze_message` | 否 | 内置英文文案 | 模型 attempt 多次失败后写回 IM 的冻结提示。 |
 
 ### Channels
 
@@ -264,13 +289,14 @@ Reconciler 不暴露 Provider `chat_id`。它会根据 enabled session 的 `user
 | --- | --- | --- | --- |
 | `channels.visibility` | 否 | `private` | 支持 `protected` 或 `private`。当前不允许 `public`，因为 `llm.v1` channel 不能公开。 |
 
-每个 enabled session 会有三个 channel：
+每个 enabled session 有四个 channel。
 
 | Channel | Protocol | 成员 |
 | --- | --- | --- |
 | IM | `im.v1` | user、agent bot、IM sync worker |
 | Model | `llm.v1` | agent bot、model-proxy |
 | WAL | `agent.wal.v1` | agent bot |
+| Cmd | `cmd.v1` | agent bot、cmd-worker |
 
 ### Sessions
 
@@ -282,13 +308,15 @@ Reconciler 不暴露 Provider `chat_id`。它会根据 enabled session 的 `user
 | `sessions[].channels.im` | 是 | | OpenEvent IM channel 名称。 |
 | `sessions[].channels.model` | 否 | `<runtime.name>.llm.<session_id>` | Model channel 名称。 |
 | `sessions[].channels.wal` | 否 | `<runtime.name>.wal.<session_id>` | WAL channel 名称。 |
+| `sessions[].channels.cmd` | 否 | `<runtime.name>.cmd.<session_id>` | Agent 本地命令调用使用的 Cmd channel 名称。 |
 | `sessions[].channel_ids.im` | 否 | | 人工指定已有 IM channel id。 |
 | `sessions[].channel_ids.model` | 否 | | 人工指定已有 Model channel id。 |
 | `sessions[].channel_ids.wal` | 否 | | 人工指定已有 WAL channel id。 |
+| `sessions[].channel_ids.cmd` | 否 | | 人工指定已有 Cmd channel id。 |
 
-同一份 Agent 配置中，enabled session 的 `model` channel name 和 `wal` channel name 必须唯一。
-IM channel name 也必须唯一。每个 session 最终会写入一个 IM channel id、一个 Model channel id
-和一个 WAL channel id。
+同一份 Agent 配置中，enabled session 的 `model`、`wal` 和 `cmd` channel name 必须唯一。
+IM channel name 也必须唯一。每个 enabled session 最终会写入一个 IM channel id、
+一个 Model channel id、一个 WAL channel id 和一个 Cmd channel id。
 
 ## 生成文件
 
@@ -298,6 +326,7 @@ IM channel name 也必须唯一。每个 session 最终会写入一个 IM channe
 config/openevent-server.yaml
 config/im-p2p-syncer.yaml
 config/model-proxy.yaml
+config/cmd-worker.yaml
 config/im-model-agent.yaml
 config/desired.normalized.yaml
 config/state.yaml
@@ -305,7 +334,7 @@ config/secrets.yaml
 config/plan.yaml
 data/openevent/meta/
 data/openevent/messages/
-data/model-proxy/model_proxy.db
+data/cmd-worker-output/
 ```
 
 文件说明：
@@ -314,8 +343,9 @@ data/model-proxy/model_proxy.db
 | --- | --- |
 | `config/openevent-server.yaml` | OpenEvent server 配置，包含 gRPC/admin 地址和 `openevent.storage`/`openevent.store` 指定的数据路径。 |
 | `config/im-p2p-syncer.yaml` | IM syncer 配置，包含 Feishu/Lark 凭据、用户/bot mappings、principal tokens。 |
-| `config/model-proxy.yaml` | model-proxy 配置，包含 provider base URL/API key、OpenEvent token、SQLite idempotency DSN、响应 header 过滤开关。 |
-| `config/im-model-agent.yaml` | Agent 配置，包含 Agent token、模型名、IM/Model/WAL channel ids。 |
+| `config/model-proxy.yaml` | model-proxy 配置，包含 provider base URL/API key、OpenEvent token、响应 header 过滤开关。 |
+| `config/cmd-worker.yaml` | cmd-worker 配置，包含 OpenEvent token、cmd channel ids、输出目录、并发和超时设置。 |
+| `config/im-model-agent.yaml` | Agent 配置，包含 Agent token、模型名、IM/Model/WAL/Cmd channel ids。 |
 | `config/desired.normalized.yaml` | 展开默认值后的目标状态。敏感值会被 redacted。 |
 | `config/state.yaml` | 上次 apply 的配置摘要、token 摘要、channel id 和 apply 状态。 |
 | `config/secrets.yaml` | 自动创建或采用的 OpenEvent 明文 token。 |
@@ -326,26 +356,26 @@ data/model-proxy/model_proxy.db
 
 ## Apply 流程
 
-`--apply` 的顺序是固定的：
+`--apply` 顺序是：
 
 1. 解析输入 YAML，填默认值，校验字段。
 2. 生成并写入 `config/openevent-server.yaml`。
 3. 如果 OpenEvent 配置变化，重启 OpenEvent。
 4. 确保 OpenEvent 进程已运行，并等待业务端口和管理端口可用。
 5. 解析或创建 OpenEvent token。
-6. 解析或创建 IM、Model、WAL channel。
-7. 生成 IM syncer、model-proxy、Agent 配置。
+6. 解析或创建 IM、Model、Cmd、WAL channel。
+7. 生成 IM syncer、model-proxy、cmd-worker 和 Agent 配置。
 8. 写入 `config/desired.normalized.yaml`、`config/` 下的组件配置、`config/state.yaml`、`config/secrets.yaml`、`config/plan.yaml`。
 9. 对配置变化的下游进程执行 restart；如果 OpenEvent 配置变化，会强制重启下游进程。
-10. 确保 model-proxy、IM syncer 和 Agent 进程处于 running 状态。
+10. 确保 model-proxy、cmd-worker、IM syncer 和 Agent 进程处于 running 状态。
 
 重启顺序：
 
 ```text
-openevent -> model_proxy -> im_syncer -> agent
+openevent -> model_proxy -> cmd_worker -> im_syncer -> agent
 ```
 
-Agent 最后启动，因为它依赖 IM syncer 和 model-proxy 的 channel 已经可消费。
+Agent 最后启动，因为它依赖 IM syncer、model-proxy 和 cmd-worker 的 channel 已经可消费。
 
 ## Token 协调
 
@@ -362,6 +392,7 @@ token 使用位置：
 | `im.worker_principal` 引用的 principal | `im-p2p-syncer.yaml.worker.token` |
 | `agent.principal` / `im.bot.principal` 引用的 principal | `im-model-agent.yaml.agent.token`、IM syncer bot principal token，以及 Reconciler 创建/维护该 Agent channel 的 operator token |
 | `model.proxy_principal` 引用的 principal | `model-proxy.yaml.token` |
+| `cmd.worker_principal` 引用的 principal | `cmd-worker.yaml.token` |
 | `im.users[].principal` 引用的 principal | IM syncer 用它以用户 principal 发布入站 `sync.record` |
 
 ## Channel 协调
@@ -394,12 +425,14 @@ description 稳定字段：
 | IM | `version=v1`、`provider`、`session_id`、`session_type`、`metadata.runtime_name`、`metadata.agent_session_id` |
 | Model | `version=v1`、`metadata.runtime_name`、`metadata.agent_session_id`、`metadata.model_proxy_principal` |
 | WAL | `version=v1`、`session_id`、`im_channel_id`、`model_channel_id`、`metadata.runtime_name` |
+| Cmd | `version=v1`、`metadata.runtime_name`、`metadata.agent_session_id`、`metadata.cmd_worker_principal` |
 
 创建顺序：
 
 1. IM channel。
 2. Model channel。
-3. WAL channel。
+3. Cmd channel。
+4. WAL channel。
 
 WAL description 需要最终 IM/Model channel id，所以 WAL 必须最后创建。
 
@@ -418,14 +451,23 @@ IM syncer：
 Model proxy：
 
 - `protocol` 固定为 `llm.v1`。
-- `idempotency_dsn` 默认写到 `sqlite:///<runtime_root>/data/model-proxy/model_proxy.db`。
+- 请求幂等由 model-proxy 进程内内存处理；启动恢复时，model-proxy 通过扫描 OpenEvent 日志重建该状态。
 - `model.base_url/api_key/timeout_ms` 写入 provider 配置。
 - `model.model` 不写入 model-proxy provider；它写入 Agent 配置，由 Agent 构造请求 body。
+
+Cmd worker：
+
+- `protocol` 固定为 `cmd.v1`。
+- `principal/token` 使用 `cmd.worker_principal` 引用的 principal。
+- `channel_ids` 包含 enabled sessions 最终解析出的 cmd channel ids。
+- `output_dir` 默认写到 `<runtime_root>/data/cmd-worker-output`。
+- cmd worker 是 stack 组件；Agent 不直接执行 shell 命令。
 
 Agent：
 
 - `agent.principal/token` 使用 `agent.principal` 引用的 principal。
-- 每个 enabled session 写入最终解析出的 `im_channel_id`、`model_channel_id`、`wal_channel_id`。
+- 每个 enabled session 写入最终解析出的 `im_channel_id`、`model_channel_id` 和
+  `wal_channel_id`、`cmd_channel_id`。
 - Agent 配置不包含 `from_seq`；Agent 自己从 OpenEvent 历史恢复状态，再继续实时消费。
 
 ## 限制和边界
@@ -436,6 +478,7 @@ Agent：
 - Reconciler 不删除 token、channel 或历史事件。
 - Reconciler 不更新已有 channel 的 immutable metadata；metadata 漂移时创建新 channel。
 - Reconciler 只能防止本配置生成多个 model-proxy 消费同一个 Model channel；不能从 OpenEvent 层强制全局互斥。
+- Reconciler 会防止本配置生成多个 cmd-worker 消费同一个 Cmd channel；但不能从 OpenEvent 层强制全局互斥。
 - `--dry-run` 使用预览 token/channel id，不代表真实 OpenEvent 状态。
 - 生成配置包含密钥；runtime root 不应该提交到 git。
 
@@ -447,6 +490,7 @@ Agent：
 python3 scripts/reconcile_runtime.py --spec openevent-stack/stack.yaml --dry-run
 python3 scripts/reconcile_runtime.py --spec openevent-stack/stack.yaml --print-config im_syncer
 python3 scripts/reconcile_runtime.py --spec openevent-stack/stack.yaml --print-config model_proxy
+python3 scripts/reconcile_runtime.py --spec openevent-stack/stack.yaml --print-config cmd_worker
 python3 scripts/reconcile_runtime.py --spec openevent-stack/stack.yaml --print-config agent
 ```
 
@@ -457,6 +501,7 @@ python3 scripts/reconcile_runtime.py --spec openevent-stack/stack.yaml --print-c
 ./openevent-stack/bootstrap.sh --apply
 ./openevent-stack/status.sh
 ./openevent-stack/logs.sh model-proxy
+./openevent-stack/logs.sh cmd-worker
 ```
 
 排错文件：
@@ -468,6 +513,7 @@ python3 scripts/reconcile_runtime.py --spec openevent-stack/stack.yaml --print-c
 | `config/secrets.yaml` | 自动创建或采用的 OpenEvent token。注意保密。 |
 | `config/*.yaml` 组件配置 | 最终传给各组件的真实配置。 |
 | `logs/*.log` | 本地 `openevent-stack/process.sh` 启动的组件日志。 |
+| `workdir/` | 本地 `openevent-stack/process.sh` 启动组件时使用的当前工作目录；Agent `exec` tool call 未传 `workdir` 时也默认在这里执行命令。 |
 
 常见错误：
 
@@ -487,5 +533,8 @@ python3 scripts/reconcile_runtime.py --spec openevent-stack/stack.yaml --print-c
 - OpenEvent server 配置以 `openevent/docs/CONFIG.md` 为准。
 - IM P2P syncer 配置以 `openevent-modules-im/docs/IM-P2P-SYNCER.md` 为准。
 - model-proxy 配置以 `openevent-modules-model-proxy/docs/CONFIGURATION.md` 为准。
+- Cmd 协议、worker 配置和 SDK 行为以 `openevent-modules-cmd/docs/CMD_PROTOCOL.md`、
+  `openevent-modules-cmd/docs/CONFIGURATION.md` 和
+  `openevent-modules-cmd/docs/SDK_USAGE.md` 为准。
 - Agent 行为以 [IM_MODEL_AGENT_cn.md](IM_MODEL_AGENT_cn.md) 为准。
 - Agent WAL payload 以 [AGENT_WAL_PROTOCOL_cn.md](AGENT_WAL_PROTOCOL_cn.md) 为准。

@@ -127,9 +127,10 @@ Rules:
 - After writing the WAL record, the corresponding `llm.v1
   infer.request.request_id` MUST be generated from the OpenEvent `seq` of that
   WAL message, using the format `agent:{session_id}:wal:{wal_seq}`.
-- A new WAL record MUST be written before every new `infer.request` attempt. A
-  timeout retry is also a new `infer.request`, so it also requires a new WAL
-  record.
+- A new WAL record MUST be written before every new `infer.request` attempt.
+  Any retry caused by a failed model attempt also requires a new WAL record.
+  Failed attempts include timeout without a matching result, non-2xx
+  `infer.result`, unparsable model output, and invalid tool calls.
 
 ## 5. Correlation Chain
 
@@ -149,6 +150,13 @@ im send.result.request_id == im send.request.request_id
 im send.result.prev_seq -> im send.request.seq
 ```
 
+If the turn reaches the model-attempt limit before an acceptable model result,
+the Agent writes a freeze `send.request` instead of a normal model reply:
+
+```text
+im send.request.request_id == "freeze:{turn_id}"
+```
+
 Meaning:
 
 - WAL records the user message seq list prepared for this LLM request and the
@@ -157,9 +165,18 @@ Meaning:
   from the `wal_seq` embedded in `request_id`.
 - `send.request` does not set `prev_seq`; it is associated with the selected
   model request through `request_id="im:{model_request_id}"`.
+- A freeze `send.request` is also a terminal reply for the same `turn_id`, but
+  it is an Agent-generated pause message rather than a model result. It uses
+  `request_id="freeze:{turn_id}"` and does not set `prev_seq`.
 - `infer.result.prev_seq` and `send.result.prev_seq` remain required by their
   respective protocols and only express that a result points to a request in the
   same protocol.
+- Command calls are correlated outside the WAL payload through
+  `cmd.run.request.request_id="cmd:{model_request_id}:{tool_call_index}"`.
+  Command results are mapped into later model input as `exec_result` events.
+  Output-read results are mapped as `read_stdout_result` or
+  `read_stderr_result` events. WAL still stores only `pre_llm_seq` and
+  `user_message_seqs`.
 
 ## 6. Recovery Semantics
 
@@ -175,6 +192,9 @@ When the Agent scans the WAL channel after restart:
   `request_id == "agent:{session_id}:wal:{wal_seq}"` already exists, the Agent
   MUST continue recovery based on that model request state and MUST NOT create a
   new WAL record for the same attempt.
+- If that model request has a failed attempt result, recovery MUST apply the
+  same retry/freeze rules as live processing. It does not write a normal IM
+  failure reply and does not advance prompt state from that failed attempt.
 - If a WAL record's `user_message_seqs` have already been covered by a later
   completed turn and there is no isolated side effect that needs compensation,
   the WAL record can be treated as history and does not trigger republishing.
@@ -200,11 +220,15 @@ within these boundaries:
 - If recovery cannot rebuild the prompt or user message batch from full
   OpenEvent history, the Agent MUST NOT guess the request body. It must enter an
   error state and exit for manual handling.
+- If the attempt count for a turn has reached `max_model_attempts` and the last
+  unaccepted attempt has failed, the Agent restores that session as frozen. A
+  later user `sync.record` unfreezes the session and starts a new turn.
 
 ## 7. Versioning
 
-- `agent.wal.v1` only receives backward-compatible additions.
-- Breaking changes use a new channel protocol, such as `agent.wal.v2`.
-- The first version defines only `llm.request.prepare`. Future versions may add
-  other `kind` values, but must not change the semantics of already defined
-  fields.
+- `agent.wal.v1` is a strict schema. Unknown payload fields are invalid and
+  MUST be rejected.
+- The first version defines only `llm.request.prepare`; other `kind` values are
+  invalid in `agent.wal.v1`.
+- Adding payload fields, adding `kind` values, or changing already defined field
+  semantics requires a new channel protocol, such as `agent.wal.v2`.

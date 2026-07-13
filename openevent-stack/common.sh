@@ -16,9 +16,12 @@ fi
 DATA_DIR="$STACK_DIR/data"
 LOG_DIR="$STACK_DIR/logs"
 RUN_DIR="$STACK_DIR/run"
+WORK_DIR="$STACK_DIR/workdir"
 SPEC_PATH="$STACK_DIR/stack.yaml"
 
-mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$LOG_DIR" "$RUN_DIR"
+mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$LOG_DIR" "$RUN_DIR" "$WORK_DIR"
+
+export PYTHONDONTWRITEBYTECODE=1
 
 join_by_colon() {
   local result=""

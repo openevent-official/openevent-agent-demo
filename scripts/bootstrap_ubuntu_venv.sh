@@ -21,6 +21,7 @@ Environment overrides:
   OPENEVENT_SDK_URL              default: https://github.com/openevent-official/openevent-sdk.git
   OPENEVENT_MODULES_IM_URL       default: https://github.com/openevent-official/openevent-modules-im.git
   OPENEVENT_MODEL_PROXY_URL      default: https://github.com/openevent-official/openevent-modules-model-proxy.git
+  OPENEVENT_MODULES_CMD_URL      default: https://github.com/openevent-official/openevent-modules-cmd.git
   OPENEVENT_VIEW_URL             default: https://github.com/openevent-official/openevent-view.git
   PYTHON_BIN                     default: python3
   JOBS                           default: nproc result, or 2
@@ -185,6 +186,8 @@ modules = [
     "openevent.im_p2p_syncer",
     "openevent.model_proxy",
     "openevent.model_proxy_sdk",
+    "openevent.cmd_sdk",
+    "openevent.cmd_worker",
     "openevent.view",
     "im_model_agent",
     "yaml",
@@ -197,6 +200,10 @@ for module in modules:
         missing.append(f"{module}: {exc}")
 if missing:
     raise SystemExit("Python runtime import check failed:\n" + "\n".join(missing))
+
+from im_model_agent.dependencies import validate_runtime_dependencies
+
+validate_runtime_dependencies()
 PY
 }
 
@@ -231,6 +238,7 @@ OPENEVENT_URL="${OPENEVENT_URL:-https://github.com/openevent-official/openevent.
 OPENEVENT_SDK_URL="${OPENEVENT_SDK_URL:-https://github.com/openevent-official/openevent-sdk.git}"
 OPENEVENT_MODULES_IM_URL="${OPENEVENT_MODULES_IM_URL:-https://github.com/openevent-official/openevent-modules-im.git}"
 OPENEVENT_MODEL_PROXY_URL="${OPENEVENT_MODEL_PROXY_URL:-https://github.com/openevent-official/openevent-modules-model-proxy.git}"
+OPENEVENT_MODULES_CMD_URL="${OPENEVENT_MODULES_CMD_URL:-https://github.com/openevent-official/openevent-modules-cmd.git}"
 OPENEVENT_VIEW_URL="${OPENEVENT_VIEW_URL:-https://github.com/openevent-official/openevent-view.git}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || printf '2')}"
 export PYTHONDONTWRITEBYTECODE=1
@@ -259,6 +267,7 @@ clone_or_update "OPENEVENT" "$OPENEVENT_URL" "$SRC_DIR/openevent"
 clone_or_update "OPENEVENT_SDK" "$OPENEVENT_SDK_URL" "$SRC_DIR/openevent-sdk"
 clone_or_update "OPENEVENT_MODULES_IM" "$OPENEVENT_MODULES_IM_URL" "$SRC_DIR/openevent-modules-im"
 clone_or_update "OPENEVENT_MODEL_PROXY" "$OPENEVENT_MODEL_PROXY_URL" "$SRC_DIR/openevent-modules-model-proxy"
+clone_or_update "OPENEVENT_MODULES_CMD" "$OPENEVENT_MODULES_CMD_URL" "$SRC_DIR/openevent-modules-cmd"
 clone_or_update "OPENEVENT_VIEW" "$OPENEVENT_VIEW_URL" "$SRC_DIR/openevent-view"
 
 log "initializing OpenEvent server submodules"
@@ -278,6 +287,7 @@ SERVER_BIN="$SRC_DIR/openevent/build/openevent_server"
 run make -C "$SRC_DIR/openevent-sdk" PYTHON="$VENV_PYTHON" INSTALL_ARGS="--no-compile" install
 run make -C "$SRC_DIR/openevent-modules-im" PYTHON="$VENV_PYTHON" INSTALL_ARGS="--no-compile" install
 run make -C "$SRC_DIR/openevent-modules-model-proxy" PYTHON="$VENV_PYTHON" INSTALL_ARGS="--no-compile" install
+run make -C "$SRC_DIR/openevent-modules-cmd" PYTHON="$VENV_PYTHON" INSTALL_ARGS="--no-compile" install
 run make -C "$SRC_DIR/openevent-view" PYTHON="$VENV_PYTHON" INSTALL_ARGS="--no-compile" install
 
 AGENT_DIR="$DEMO_SOURCE"
