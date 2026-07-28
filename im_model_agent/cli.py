@@ -2,11 +2,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-from pathlib import Path
-
-from ._paths import ensure_project_path
-
-ensure_project_path()
 
 
 def main(argv: list[str] | None = None) -> int:

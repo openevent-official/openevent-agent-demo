@@ -12,7 +12,7 @@ KIND_PREPARE = "llm.request.prepare"
 KIND_CMD_TIMEOUT = "cmd.request.timeout"
 PROTOCOL = "agent.wal.v1"
 MODEL_REQUEST_RE = re.compile(
-    r"^agent:(?P<session_id>[A-Za-z0-9._:-]+):wal:(?P<wal_seq>[1-9][0-9]*):retry:(?P<retry>[1-9][0-9]*)$"
+    r"^agent:(?P<session_id>.+):wal:(?P<wal_seq>[1-9][0-9]*):retry:(?P<retry>[1-9][0-9]*)$"
 )
 
 

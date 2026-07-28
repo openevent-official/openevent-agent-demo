@@ -85,6 +85,11 @@ every non-empty string `content` is sent. Null, empty, and JSON-whitespace-only
 strings are not sent; other types are invalid. Tool calls do not change that
 rule; the WAL protocol defines which result is accepted.
 
+The fixed system prompt requires every assistant response to use non-empty
+`content` to give the user current progress or a useful result. For provider
+compatibility, the Agent still accepts empty `content`, but logs a warning,
+sends no IM text, and continues processing valid tool calls in the same response.
+
 Model text uses the stable ID defined by the WAL protocol, preventing duplicate
 delivery when a result is observed again during recovery.
 

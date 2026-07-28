@@ -15,7 +15,7 @@ from im_model_agent.prompt import (
     visible_content,
 )
 from im_model_agent.state import AgentStateError, CommandState
-from im_model_agent.wal import InputRef, encode_prepare, model_request_id, parse_prepare
+from im_model_agent.wal import InputRef, encode_prepare, model_request_id, parse_model_request_id, parse_prepare
 from im_model_agent.worker import ImModelAgent, _result_from_command
 from openevent.cmd_sdk.codec import dumps_payload as cmd_dumps_payload
 from openevent.cmd_sdk.codec import run_result_input_to_dict
@@ -165,12 +165,20 @@ class AgentDesignTests(unittest.TestCase):
         self.assertEqual(parsed.user_message_seqs, (2,))
         self.assertEqual(parsed.input_event_refs, (InputRef("exec_result", 8),))
         self.assertEqual(model_request_id("s1", 11, 3), "agent:s1:wal:11:retry:3")
+        self.assertEqual(
+            parse_model_request_id(model_request_id("session/a b:wal:part", 11, 3)),
+            ("session/a b:wal:part", 11, 3),
+        )
 
     def test_assistant_tool_calls_require_openai_shape_and_unique_ids(self):
         valid = parse_assistant_message(
-            {"choices": [{"message": {"role": "assistant", "content": "working", "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "exec", "arguments": "{\"command\":\"pwd\"}"}}]}}]}
+            {"choices": [{"message": {"role": "assistant", "content": "working", "tool_calls": [{"index": 0, "id": "call_1", "type": "function", "function": {"name": "exec", "arguments": "{\"command\":\"pwd\"}", "provider_metadata": "ignored"}}]}}]}
         )
         self.assertIsNotNone(valid)
+        self.assertEqual(
+            valid.raw["tool_calls"],
+            [{"id": "call_1", "type": "function", "function": {"name": "exec", "arguments": "{\"command\":\"pwd\"}"}}],
+        )
         invalid = parse_assistant_message(
             {"choices": [{"message": {"role": "assistant", "content": "", "tool_calls": [{"id": "x", "type": "function", "function": {"name": "exec", "arguments": "{\"command\":\"pwd\"}"}}, {"id": "x", "type": "function", "function": {"name": "exec", "arguments": "{\"command\":\"ls\"}"}}]}}]}
         )
@@ -181,6 +189,7 @@ class AgentDesignTests(unittest.TestCase):
         self.assertTrue(prompt.startswith("be useful\n\n"))
         self.assertIn("Tool results arrive as role=tool messages", prompt)
         self.assertIn("error_code=timeout", prompt)
+        self.assertIn("Every assistant response must include non-empty content", prompt)
 
     def test_cmd_result_wait_timeout_has_structured_error_code(self):
         tool_call = ToolCall("call_1", "exec", {"command": "sleep 1"}, {})
@@ -306,9 +315,11 @@ class AgentDesignTests(unittest.TestCase):
         agent.observe_message(sync(1, "hello"), realtime=True)
         agent.process_ready_sessions()
         request = published_json(event, 1)
-        agent.observe_message(model_result(event, request, {"content": ""}), realtime=True)
+        with self.assertLogs("im_model_agent.worker", level="WARNING") as logs:
+            agent.observe_message(model_result(event, request, {"content": ""}), realtime=True)
         self.assertEqual([item["channel_id"] for item in event.published], [13, 12])
         self.assertTrue(agent.state.sessions_by_id["s1"].wal_by_seq[100].latest_attempt.accepted)
+        self.assertIn("accepted model result has empty content", logs.output[0])
 
     def test_failure_retries_same_wal_then_blocks_without_freeze_message(self):
         event = FakeOpenEvent()
@@ -370,8 +381,9 @@ class AgentDesignTests(unittest.TestCase):
         )
 
         session = agent.state.sessions_by_id["s1"]
-        self.assertEqual(session.model_request_aliases, {duplicate_request_seq: request["_seq"]})
-        self.assertEqual(session.model_result_aliases, {result.seq + 1: result.seq})
+        attempt = session.wal_by_seq[100].latest_attempt
+        self.assertEqual(attempt.request_seq, request["_seq"])
+        self.assertEqual(attempt.result_seq, result.seq)
 
     def test_conflicting_model_stable_ids_fail(self):
         event = FakeOpenEvent()
@@ -490,6 +502,7 @@ class AgentDesignTests(unittest.TestCase):
                 "content": "",
                 "tool_calls": [
                     {
+                        "index": 0,
                         "id": "call_exec",
                         "type": "function",
                         "function": {"name": "exec", "arguments": "{\"command\":\"ls\"}"},
@@ -497,7 +510,8 @@ class AgentDesignTests(unittest.TestCase):
                 ],
             },
         )
-        agent.observe_message(result_message, realtime=True)
+        with self.assertLogs("im_model_agent.worker", level="WARNING"):
+            agent.observe_message(result_message, realtime=True)
         cmd_request = published_json(event, 2)
         cmd_result = run_result_input_to_dict(
             CmdRunResultInput(
@@ -527,7 +541,8 @@ class AgentDesignTests(unittest.TestCase):
         recovered_event.next_seq = max(message.seq for message in recovered_event.history) + 1
         recovered = ImModelAgent(config(), recovered_event)
 
-        recovered.recover()
+        with self.assertLogs("im_model_agent.worker", level="WARNING"):
+            recovered.recover()
 
         session = recovered.state.sessions_by_id["s1"]
         command = session.commands_by_seq[cmd_request["_seq"]]

@@ -51,11 +51,6 @@ class PrincipalConfig:
 
 
 @dataclass(frozen=True)
-class CmdWorkerConfig:
-    principal: int
-
-
-@dataclass(frozen=True)
 class SessionConfig:
     session_id: str
     im_channel_id: int
@@ -72,7 +67,7 @@ class AgentRuntimeConfig:
     agent: AgentConfig
     openevent: OpenEventConfig
     model_proxy: PrincipalConfig
-    cmd_worker: CmdWorkerConfig
+    cmd_worker: PrincipalConfig
     im_sync_worker: PrincipalConfig
     sessions: tuple[SessionConfig, ...]
 
@@ -143,7 +138,7 @@ def parse_config(raw: Any) -> AgentRuntimeConfig:
     model_proxy = PrincipalConfig(
         principal=_positive_int(_obj(data.get("model_proxy"), "model_proxy").get("principal"), "model_proxy.principal")
     )
-    cmd_worker = CmdWorkerConfig(
+    cmd_worker = PrincipalConfig(
         principal=_positive_int(_obj(data.get("cmd_worker"), "cmd_worker").get("principal"), "cmd_worker.principal")
     )
     im_sync_worker = PrincipalConfig(

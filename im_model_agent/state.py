@@ -89,12 +89,8 @@ class SessionState:
     commands_by_id: dict[str, CommandState] = field(default_factory=dict)
     commands_by_seq: dict[int, CommandState] = field(default_factory=dict)
     timeouts_by_id: dict[str, tuple[int, CmdTimeout]] = field(default_factory=dict)
-    timeout_aliases: dict[int, int] = field(default_factory=dict)
     im_requests_by_id: dict[str, ImRequestState] = field(default_factory=dict)
     im_requests_by_seq: dict[int, ImRequestState] = field(default_factory=dict)
-    model_request_aliases: dict[int, int] = field(default_factory=dict)
-    model_result_aliases: dict[int, int] = field(default_factory=dict)
-    im_request_aliases: dict[int, int] = field(default_factory=dict)
     im_results_by_prev_seq: dict[int, ImMessage] = field(default_factory=dict)
     im_results_by_provider_id: dict[str, ImMessage] = field(default_factory=dict)
     last_llm_request_seq: int = 0
@@ -131,7 +127,6 @@ class AgentRuntimeState:
         self.sessions_by_cmd = {config.cmd_channel_id: self.sessions_by_id[config.session_id] for config in enabled}
         self.user_messages: dict[int, UserPromptMessage] = {}
         self.user_sessions_by_seq: dict[int, SessionState] = {}
-        self.max_seen_seq = 0
 
     def observe_user(self, session: SessionState, message: UserPromptMessage) -> None:
         owner = self.user_sessions_by_seq.get(message.seq)
@@ -219,8 +214,6 @@ class AgentRuntimeState:
                 raise AgentStateError(
                     f"model request duplicate {seq} arrived before canonical seq {attempt.request_seq}"
                 )
-            if seq != attempt.request_seq:
-                session.model_request_aliases[seq] = attempt.request_seq
             return attempt
         attempt.request_seq, attempt.request = seq, request
         session.last_llm_request_seq = max(session.last_llm_request_seq, seq)
@@ -244,8 +237,6 @@ class AgentRuntimeState:
                 raise AgentStateError(
                     f"model result duplicate {seq} arrived before canonical seq {attempt.result_seq}"
                 )
-            if seq != attempt.result_seq:
-                session.model_result_aliases[seq] = attempt.result_seq
             return attempt
         attempt.result_seq, attempt.result = seq, result
         attempt.stale = retry != wal.latest_retry
@@ -259,7 +250,6 @@ class AgentRuntimeState:
                 raise AgentStateError(f"conflicting timeout_id {timeout.timeout_id}")
             if seq < existing_seq:
                 raise AgentStateError(f"timeout duplicate {seq} arrived before canonical seq {existing_seq}")
-            session.timeout_aliases[seq] = existing_seq
             return session.commands_by_id.get(timeout.cmd_request_id)
         command = session.commands_by_id.get(timeout.cmd_request_id)
         if command is None:
@@ -297,8 +287,6 @@ class AgentRuntimeState:
                 raise AgentStateError(
                     f"IM request duplicate {request.seq} arrived before canonical seq {existing.seq}"
                 )
-            if request.seq != existing.seq:
-                session.im_request_aliases[request.seq] = existing.seq
             return
         session.im_requests_by_id[request.request_id] = request
         session.im_requests_by_seq[request.seq] = request

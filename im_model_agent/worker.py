@@ -63,15 +63,11 @@ class ImModelAgent:
         self.model_client = create_model_client(openevent_client, config.agent.token)
         self.cmd_client = create_cmd_client(openevent_client)
         self.state = AgentRuntimeState(config.sessions)
-        self.stopped = False
 
     def start(self) -> None:
         scan_end = self.recover()
         self.process_ready_sessions()
         self.consume(scan_end + 1)
-
-    def stop(self) -> None:
-        self.stopped = True
 
     def recover(self) -> int:
         self.validate_channels()
@@ -93,7 +89,6 @@ class ImModelAgent:
             if advanced <= next_seq:
                 raise RuntimeError("Fetch did not advance during recovery")
             next_seq = advanced
-        self.state.max_seen_seq = scan_end
         self._rebuild_sessions()
         return scan_end
 
@@ -133,7 +128,7 @@ class ImModelAgent:
 
     def consume(self, from_seq: int) -> None:
         next_seq = from_seq
-        while not self.stopped:
+        while True:
             response = self.openevent_client.fetch(
                 self.config.agent.principal,
                 self.config.agent.token,
@@ -144,7 +139,6 @@ class ImModelAgent:
             )
             for message in response.messages:
                 self.observe_message(message, realtime=True)
-                self.state.max_seen_seq = max(self.state.max_seen_seq, int(message.seq))
             next_seq = int(response.next_seq)
             self.process_ready_sessions()
             if not response.messages:
@@ -383,6 +377,16 @@ class ImModelAgent:
         content = visible_content(assistant.content)
         if content is not None:
             self._ensure_im_content(session, result.request_id, content)
+        else:
+            LOG.warning(
+                "accepted model result has empty content",
+                extra={
+                    "session_id": session.config.session_id,
+                    "model_request_id": result.request_id,
+                    "wal_seq": attempt.wal.seq,
+                    "retry_index": attempt.retry_index,
+                },
+            )
         if assistant.tool_calls and not recovery:
             self._advance_tools(session, attempt)
 
