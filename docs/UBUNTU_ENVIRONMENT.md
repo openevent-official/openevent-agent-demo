@@ -9,8 +9,8 @@ fresh Ubuntu environment. It currently covers Ubuntu only.
 
 After preparation, the local checkout will contain:
 
-- `runtime/src/`: OpenEvent, SDK, IM, model-proxy, cmd, and view source
-  checkouts cloned from GitHub.
+- `runtime/src/`: OpenEvent, IM, model-proxy, cmd, and view source checkouts
+  cloned from GitHub and pinned to explicit commits.
 - `runtime/venv/`: the Python venv used by Agent Demo.
 - `runtime/src/openevent/build/openevent_server`: the locally built OpenEvent
   server binary.
@@ -85,12 +85,14 @@ source runtime/venv/bin/activate
 `scripts/bootstrap_ubuntu_venv.sh --workdir runtime` runs these steps in order:
 
 1. Install Ubuntu system dependencies.
-2. Clone dependency projects from public GitHub repositories into `runtime/src/`.
-3. Initialize the OpenEvent server Git submodule.
+2. Clone dependency projects from public GitHub repositories and check out the
+   commits declared by the script.
+3. Initialize the OpenEvent server Git submodules. The Python SDK comes from its
+   pinned `openevent-sdk` submodule.
 4. Create `runtime/venv`.
 5. Build the OpenEvent server.
-6. Install SDK, IM, model-proxy, cmd, and view into the same venv through each
-   subproject's `make install`.
+6. Install OpenEvent's SDK, IM, model-proxy, cmd, and view into the same venv
+   through each subproject's `make install`.
 7. Generate `openevent-stack/config/env.sh`.
 8. Verify that required runtime modules can be imported from the venv.
 
@@ -98,25 +100,32 @@ Bootstrap dependency repositories:
 
 ```bash
 https://github.com/openevent-official/openevent.git
-https://github.com/openevent-official/openevent-sdk.git
 https://github.com/openevent-official/openevent-modules-im.git
 https://github.com/openevent-official/openevent-modules-model-proxy.git
 https://github.com/openevent-official/openevent-modules-cmd.git
 https://github.com/openevent-official/openevent-view.git
 ```
 
-To override repository URLs, pass environment variables before the script
-command:
+The `*_REF` defaults in the script are commits validated as one combination.
+Repository URLs and their commit/tag refs can be overridden together:
 
 ```bash
 OPENEVENT_URL=https://github.com/openevent-official/openevent.git \
-OPENEVENT_SDK_URL=https://github.com/openevent-official/openevent-sdk.git \
+OPENEVENT_REF=a1d2d97d0870dd5fc61af329bf0cb94cd124aafa \
 OPENEVENT_MODULES_IM_URL=https://github.com/openevent-official/openevent-modules-im.git \
+OPENEVENT_MODULES_IM_REF=8aebcb35506d7e60384b548800830273bc1781f7 \
 OPENEVENT_MODEL_PROXY_URL=https://github.com/openevent-official/openevent-modules-model-proxy.git \
+OPENEVENT_MODEL_PROXY_REF=60fe36fe30fa5b92b1dffa535082686ea28e75ef \
 OPENEVENT_MODULES_CMD_URL=https://github.com/openevent-official/openevent-modules-cmd.git \
+OPENEVENT_MODULES_CMD_REF=bc92ef9c4b46295e098021d5a637c8c7b09dc9b0 \
 OPENEVENT_VIEW_URL=https://github.com/openevent-official/openevent-view.git \
+OPENEVENT_VIEW_REF=9127056bf0a88f7091c3d1b21e4186ea60180706 \
 scripts/bootstrap_ubuntu_venv.sh --workdir runtime
 ```
+
+After overriding `*_REF`, the refs must still form a protocol- and
+configuration-compatible set. Only the default combination is validated by the
+project.
 
 ## Common Failures
 

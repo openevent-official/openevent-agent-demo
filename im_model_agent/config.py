@@ -11,7 +11,7 @@ DEFAULT_AGENT_NAME = "im-model-agent"
 DEFAULT_CONTEXT_MESSAGES = 20
 DEFAULT_MODEL_TIMEOUT_MS = 60000
 DEFAULT_MAX_MODEL_ATTEMPTS = 3
-DEFAULT_FREEZE_MESSAGE = "The model service is temporarily unavailable. The session is paused. Send another message to continue."
+DEFAULT_CMD_RESULT_TIMEOUT_MS = 330000
 DEFAULT_NON_TEXT_PLACEHOLDER = "[non-text message]"
 
 
@@ -29,7 +29,7 @@ class AgentConfig:
     model: str
     model_timeout_ms: int
     max_model_attempts: int
-    freeze_message: str
+    cmd_result_timeout_ms: int
     non_text_placeholder: str
 
 
@@ -63,7 +63,6 @@ class SessionConfig:
     wal_channel_id: int
     cmd_channel_id: int
     user_principal: int
-    agent_bot_principal: int
     enabled: bool
 
 
@@ -113,9 +112,9 @@ def parse_config(raw: Any) -> AgentRuntimeConfig:
             agent_raw.get("max_model_attempts", DEFAULT_MAX_MODEL_ATTEMPTS),
             "agent.max_model_attempts",
         ),
-        freeze_message=_str(
-            agent_raw.get("freeze_message", DEFAULT_FREEZE_MESSAGE),
-            "agent.freeze_message",
+        cmd_result_timeout_ms=_positive_int(
+            agent_raw.get("cmd_result_timeout_ms", DEFAULT_CMD_RESULT_TIMEOUT_MS),
+            "agent.cmd_result_timeout_ms",
         ),
         non_text_placeholder=_str(
             agent_raw.get("non_text_placeholder", DEFAULT_NON_TEXT_PLACEHOLDER),
@@ -162,8 +161,6 @@ def parse_config(raw: Any) -> AgentRuntimeConfig:
     _validate_unique(sessions, "wal_channel_id", lambda item: item.wal_channel_id)
     _validate_unique(sessions, "cmd_channel_id", lambda item: item.cmd_channel_id)
     for session in sessions:
-        if session.agent_bot_principal != agent.principal:
-            raise ConfigError("sessions[].agent_bot_principal must equal agent.principal")
         if session.user_principal == agent.principal:
             raise ConfigError("sessions[].user_principal must not equal agent.principal")
 
@@ -187,10 +184,6 @@ def _parse_session(raw: Any, index: int) -> SessionConfig:
         wal_channel_id=_positive_int(data.get("wal_channel_id"), f"sessions[{index}].wal_channel_id"),
         cmd_channel_id=_positive_int(data.get("cmd_channel_id"), f"sessions[{index}].cmd_channel_id"),
         user_principal=_positive_int(data.get("user_principal"), f"sessions[{index}].user_principal"),
-        agent_bot_principal=_positive_int(
-            data.get("agent_bot_principal"),
-            f"sessions[{index}].agent_bot_principal",
-        ),
         enabled=_bool(data.get("enabled", True), f"sessions[{index}].enabled"),
     )
 

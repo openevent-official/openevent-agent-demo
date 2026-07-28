@@ -5,20 +5,24 @@ import unittest
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
-from im_model_agent.config import ConfigError, parse_config
-from im_model_agent.dependencies import validate_runtime_dependencies
-from im_model_agent.prompt import UserPromptMessage, user_messages_content
-from im_model_agent.wal import WalError, parse_prepare
-from im_model_agent.worker import ImModelAgent
-from openevent.im_sdk.codec import encode_send_request, encode_sync_record
-from openevent.im_sdk.model import SendRequestInput, SyncRecordInput
-from openevent.model_proxy_sdk.codec import dumps_payload, request_input_to_dict, result_input_to_dict
-from openevent.cmd_sdk.codec import (
-    dumps_payload as cmd_dumps_payload,
-    output_read_result_input_to_dict,
-    run_result_input_to_dict,
+from grpc import RpcError, StatusCode
+from im_model_agent.config import parse_config
+from im_model_agent.prompt import (
+    ToolCall,
+    parse_assistant_message,
+    system_prompt_content,
+    trim_messages,
+    visible_content,
 )
-from openevent.cmd_sdk.model import CmdOutput, CmdOutputReadResultInput, CmdRunResultInput
+from im_model_agent.state import AgentStateError, CommandState
+from im_model_agent.wal import InputRef, encode_prepare, model_request_id, parse_prepare
+from im_model_agent.worker import ImModelAgent, _result_from_command
+from openevent.cmd_sdk.codec import dumps_payload as cmd_dumps_payload
+from openevent.cmd_sdk.codec import run_result_input_to_dict
+from openevent.cmd_sdk.model import CmdOutput, CmdRunRequest, CmdRunResult, CmdRunResultInput
+from openevent.im_sdk.codec import encode_send_result, encode_sync_record
+from openevent.im_sdk.model import SendResultInput, SyncRecordInput
+from openevent.model_proxy_sdk.codec import dumps_payload, result_input_to_dict
 
 
 @dataclass
@@ -28,18 +32,6 @@ class Message:
     principal: int
     payload: bytes
     recipients: list[int] = field(default_factory=list)
-
-
-@dataclass
-class FetchResp:
-    messages: list[Message]
-    next_seq: int
-    last_seq: int
-
-
-@dataclass
-class PublishResp:
-    seq: int
 
 
 @dataclass
@@ -53,37 +45,18 @@ class Channel:
 class FakeOpenEvent:
     def __init__(self):
         self.next_seq = 100
-        self.published = []
+        self.published: list[dict] = []
         self.history: list[Message] = []
-        self.fetch_calls = []
+        self.fetch_calls = 0
         self.channels = {
-            11: Channel(
-                protocol="im.v1",
-                description=json.dumps({"version": "v1", "session_type": "p2p"}),
-                members=[10001, 90002, 90001],
-            ),
-            12: Channel(
-                protocol="llm.v1",
-                description=json.dumps({"version": "v1"}),
-                members=[90002, 20001],
-            ),
+            11: Channel("im.v1", json.dumps({"version": "v1", "session_type": "p2p"}), [10001, 90002, 90001]),
+            12: Channel("llm.v1", json.dumps({"version": "v1"}), [90002, 20001]),
             13: Channel(
-                protocol="agent.wal.v1",
-                description=json.dumps(
-                    {
-                        "version": "v1",
-                        "session_id": "s1",
-                        "im_channel_id": 11,
-                        "model_channel_id": 12,
-                    }
-                ),
-                members=[90002],
+                "agent.wal.v1",
+                json.dumps({"version": "v1", "session_id": "s1", "im_channel_id": 11, "model_channel_id": 12}),
+                [90002],
             ),
-            14: Channel(
-                protocol="cmd.v1",
-                description=json.dumps({"version": "v1"}),
-                members=[90002, 30001],
-            ),
+            14: Channel("cmd.v1", json.dumps({"version": "v1"}), [90002, 30001]),
         }
 
     def get_status(self, principal, token):
@@ -93,42 +66,28 @@ class FakeOpenEvent:
         return SimpleNamespace(channel=self.channels[channel_id])
 
     def fetch(self, principal, token, from_seq, limit, only_my_recipient=False, channels=()):
-        channels = tuple(channels)
-        self.fetch_calls.append((from_seq, limit, only_my_recipient, channels))
-        matches = [message for message in self.history if message.seq >= from_seq]
-        if channels:
-            requested_channels = {int(channel) for channel in channels}
-            matches = [message for message in matches if int(message.channel_id) in requested_channels]
-        messages = matches[:limit]
+        self.fetch_calls += 1
+        selected = [message for message in self.history if message.seq >= from_seq and (not channels or message.channel_id in channels)]
+        messages = selected[:limit]
         last_seq = max([0, *(message.seq for message in self.history)])
-        next_seq = messages[-1].seq + 1 if len(matches) > len(messages) else last_seq + 1
-        return FetchResp(messages=messages, next_seq=next_seq, last_seq=last_seq)
+        next_seq = messages[-1].seq + 1 if len(selected) > len(messages) else last_seq + 1
+        return SimpleNamespace(messages=messages, next_seq=next_seq, last_seq=last_seq)
 
     def publish_auto_seq(self, principal, token, channel_id, payload, recipients):
         seq = self.next_seq
         self.next_seq += 1
-        self.published.append(
-            {
-                "seq": seq,
-                "principal": principal,
-                "token": token,
-                "channel_id": channel_id,
-                "payload": payload,
-                "recipients": tuple(recipients),
-            }
-        )
-        return PublishResp(seq=seq)
+        self.published.append({"seq": seq, "principal": principal, "channel_id": channel_id, "payload": payload, "recipients": tuple(recipients)})
+        return SimpleNamespace(seq=seq)
 
 
-def _config(agent_overrides: dict | None = None):
+def config(overrides: dict | None = None):
     agent = {
         "principal": 90002,
-        "token": "tok-agent",
+        "token": "agent-token",
         "system_prompt": "be useful",
         "model": "gpt-test",
     }
-    if agent_overrides:
-        agent.update(agent_overrides)
+    agent.update(overrides or {})
     return parse_config(
         {
             "version": "v1",
@@ -137,884 +96,444 @@ def _config(agent_overrides: dict | None = None):
             "model_proxy": {"principal": 20001},
             "cmd_worker": {"principal": 30001},
             "im_sync_worker": {"principal": 90001},
-            "sessions": [
-                {
-                    "session_id": "s1",
-                    "im_channel_id": 11,
-                    "model_channel_id": 12,
-                    "wal_channel_id": 13,
-                    "cmd_channel_id": 14,
-                    "user_principal": 10001,
-                    "agent_bot_principal": 90002,
-                }
-            ],
+            "sessions": [{"session_id": "s1", "im_channel_id": 11, "model_channel_id": 12, "wal_channel_id": 13, "cmd_channel_id": 14, "user_principal": 10001}],
         }
     )
 
 
-def _sync(seq: int, text: str, event_ms: int) -> Message:
-    return Message(
-        seq=seq,
-        channel_id=11,
-        principal=10001,
-        payload=encode_sync_record(
-            SyncRecordInput(
-                provider_message_id=f"msg-{seq}",
-                msg_type="text",
-                content_raw={"text": text},
-                text=text,
-                event_ms=event_ms,
-                ingested_ms=event_ms + 1,
-            )
+def sync(seq: int, text: str) -> Message:
+    payload = encode_sync_record(
+        SyncRecordInput(
+            provider_message_id=f"user-{seq}",
+            msg_type="text",
+            content_raw={"text": text},
+            text=text,
+            event_ms=1710000000000 + seq,
+            ingested_ms=1710000000000 + seq,
+        )
+    )
+    return Message(seq, 11, 10001, payload)
+
+
+def model_result(event: FakeOpenEvent, request: dict, message: dict, status: int = 200) -> Message:
+    seq = event.next_seq
+    event.next_seq += 1
+    payload = result_input_to_dict(
+        SimpleNamespace(
+            request_id=request["request_id"],
+            prev_seq=request["_seq"],
+            status_code=status,
+            headers=[],
+            body={"choices": [{"message": {"role": "assistant", **message}}]},
         ),
+        ts_ms=1710000001000 + seq,
+    )
+    return Message(seq, 12, 20001, dumps_payload(payload), [90002])
+
+
+def published_json(event: FakeOpenEvent, index: int) -> dict:
+    data = json.loads(event.published[index]["payload"].decode("utf-8"))
+    data["_seq"] = event.published[index]["seq"]
+    return data
+
+
+def published_message(item: dict) -> Message:
+    return Message(
+        seq=item["seq"],
+        channel_id=item["channel_id"],
+        principal=item["principal"],
+        payload=item["payload"],
+        recipients=list(item["recipients"]),
     )
 
 
-def _send_request(seq: int, request_id: str, text: str, event_ms: int) -> Message:
-    return Message(
-        seq=seq,
-        channel_id=11,
-        principal=90002,
-        payload=encode_send_request(
-            SendRequestInput(
-                request_id=request_id,
-                msg_type="text",
-                content={"text": text},
-                event_ms=event_ms,
-            )
-        ),
-    )
+class AgentDesignTests(unittest.TestCase):
+    def test_config_uses_cmd_timeout_and_has_no_freeze(self):
+        parsed = config()
+        self.assertEqual(parsed.agent.cmd_result_timeout_ms, 330000)
+        self.assertFalse(hasattr(parsed.agent, "freeze_message"))
 
-
-def _event_content(message: dict) -> list[dict]:
-    content = json.loads(message["content"])
-    return content["events"]
-
-
-class ImModelAgentTests(unittest.TestCase):
-    def test_runtime_dependencies_support_cmd_request_ids(self):
-        validate_runtime_dependencies()
-
-    def test_config_requires_agent_section(self):
-        with self.assertRaises(ConfigError):
-            parse_config({"version": "v1"})
-
-    def test_config_rejects_subscribe_from_seq(self):
-        data = {
-            "version": "v1",
-            "agent": {
-                "principal": 90002,
-                "token": "tok-agent",
-                "system_prompt": "be useful",
-                "model": "gpt-test",
-            },
-            "openevent": {"target": "127.0.0.1:9527", "subscribe": {"from_seq": 0}},
-            "model_proxy": {"principal": 20001},
-            "cmd_worker": {"principal": 30001},
-            "im_sync_worker": {"principal": 90001},
-            "sessions": [
-                {
-                    "session_id": "s1",
-                    "im_channel_id": 11,
-                    "model_channel_id": 12,
-                    "wal_channel_id": 13,
-                    "cmd_channel_id": 14,
-                    "user_principal": 10001,
-                    "agent_bot_principal": 90002,
-                }
-            ],
-        }
-
-        with self.assertRaisesRegex(ConfigError, "from_seq"):
-            parse_config(data)
-
-    def test_user_messages_content_is_events_object_with_time_and_text_only(self):
-        content = user_messages_content(
-            [
-                UserPromptMessage(seq=2, event_ms=1710000001500, text="one more sentence"),
-                UserPromptMessage(seq=1, event_ms=1710000000000, text="hello"),
-            ]
+    def test_wal_supports_users_and_tool_results(self):
+        payload = encode_prepare(
+            prepare_id="prepare:one",
+            pre_llm_seq=9,
+            user_message_seqs=[2],
+            input_event_refs=[InputRef("exec_result", 8)],
+            ts_ms=10,
         )
+        parsed = parse_prepare(payload)
+        self.assertEqual(parsed.user_message_seqs, (2,))
+        self.assertEqual(parsed.input_event_refs, (InputRef("exec_result", 8),))
+        self.assertEqual(model_request_id("s1", 11, 3), "agent:s1:wal:11:retry:3")
 
-        self.assertEqual(
-            json.loads(content),
-            {
-                "events": [
-                    {"type": "user", "time": "2024-03-09T16:00:00.000Z", "text": "hello"},
-                    {"type": "user", "time": "2024-03-09T16:00:01.500Z", "text": "one more sentence"},
-                ]
-            },
+    def test_assistant_tool_calls_require_openai_shape_and_unique_ids(self):
+        valid = parse_assistant_message(
+            {"choices": [{"message": {"role": "assistant", "content": "working", "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "exec", "arguments": "{\"command\":\"pwd\"}"}}]}}]}
         )
-        self.assertNotIn("seq", content)
-        self.assertNotIn("principal", content)
-
-    def test_wal_rejects_unknown_payload_fields(self):
-        payload = json.dumps(
-            {
-                "kind": "llm.request.prepare",
-                "ts_ms": 1710000000000,
-                "pre_llm_seq": 0,
-                "user_message_seqs": [1],
-                "future_field": "must not be ignored",
-            }
-        ).encode("utf-8")
-
-        with self.assertRaisesRegex(WalError, "unknown fields"):
-            parse_prepare(payload)
-
-    def test_agent_publishes_wal_then_model_request_for_user_message(self):
-        event = FakeOpenEvent()
-        agent = ImModelAgent(_config(), event)
-
-        agent.validate_channels()
-        agent.observe_message(_sync(1, "hello", 1710000000000), realtime=True)
-        agent.process_ready_sessions()
-
-        self.assertEqual([item["channel_id"] for item in event.published], [13, 12])
-        wal = parse_prepare(event.published[0]["payload"])
-        self.assertEqual(wal.pre_llm_seq, 0)
-        self.assertEqual(wal.user_message_seqs, (1,))
-        request = json.loads(event.published[1]["payload"].decode("utf-8"))
-        self.assertEqual(request["kind"], "infer.request")
-        self.assertEqual(request["request_id"], "agent:s1:wal:100")
-        self.assertEqual(request["body"]["model"], "gpt-test")
-        self.assertEqual(request["body"]["messages"][0], {"role": "system", "content": "be useful"})
-        user_content = json.loads(request["body"]["messages"][1]["content"])
-        self.assertEqual(user_content, {"events": [{"type": "user", "time": "2024-03-09T16:00:00.000Z", "text": "hello"}]})
-
-    def test_realtime_batch_merges_pending_user_messages_into_one_prompt_message(self):
-        event = FakeOpenEvent()
-        agent = ImModelAgent(_config(), event)
-
-        agent.validate_channels()
-        agent.observe_message(_sync(1, "hello", 1710000000000), realtime=True)
-        agent.observe_message(_sync(2, "one more sentence", 1710000001500), realtime=True)
-        agent.process_ready_sessions()
-
-        self.assertEqual([item["channel_id"] for item in event.published], [13, 12])
-        wal = parse_prepare(event.published[0]["payload"])
-        self.assertEqual(wal.user_message_seqs, (1, 2))
-        request = json.loads(event.published[1]["payload"].decode("utf-8"))
-        self.assertEqual(len(request["body"]["messages"]), 2)
-        self.assertEqual(request["body"]["messages"][1]["role"], "user")
-        self.assertEqual(
-            json.loads(request["body"]["messages"][1]["content"]),
-            {
-                "events": [
-                    {"type": "user", "time": "2024-03-09T16:00:00.000Z", "text": "hello"},
-                    {"type": "user", "time": "2024-03-09T16:00:01.500Z", "text": "one more sentence"},
-                ]
-            },
+        self.assertIsNotNone(valid)
+        invalid = parse_assistant_message(
+            {"choices": [{"message": {"role": "assistant", "content": "", "tool_calls": [{"id": "x", "type": "function", "function": {"name": "exec", "arguments": "{\"command\":\"pwd\"}"}}, {"id": "x", "type": "function", "function": {"name": "exec", "arguments": "{\"command\":\"ls\"}"}}]}}]}
         )
+        self.assertIsNone(invalid)
 
-    def test_non_2xx_model_result_retries_same_turn_without_advancing_prompt(self):
-        event = FakeOpenEvent()
-        agent = ImModelAgent(_config(), event)
+    def test_system_prompt_includes_business_and_protocol_rules(self):
+        prompt = system_prompt_content("be useful")
+        self.assertTrue(prompt.startswith("be useful\n\n"))
+        self.assertIn("Tool results arrive as role=tool messages", prompt)
+        self.assertIn("error_code=timeout", prompt)
 
-        agent.validate_channels()
-        agent.observe_message(_sync(1, "bad auth turn", 1710000000000), realtime=True)
-        agent.process_ready_sessions()
-        first_request = json.loads(event.published[1]["payload"].decode("utf-8"))
-        result_payload = result_input_to_dict(
-            SimpleNamespace(
-                request_id=first_request["request_id"],
-                prev_seq=event.published[1]["seq"],
-                status_code=401,
-                headers=[],
-                body={"error": {"message": "unauthorized"}},
+    def test_cmd_result_wait_timeout_has_structured_error_code(self):
+        tool_call = ToolCall("call_1", "exec", {"command": "sleep 1"}, {})
+        command = CommandState("model-1", 0, tool_call)
+        command.timeout = SimpleNamespace()
+
+        result = _result_from_command(command)
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["error_code"], "timeout")
+        self.assertNotIn("exec_id", result)
+
+    def test_cmd_worker_execution_timeout_has_structured_error_code_and_exec_id(self):
+        tool_call = ToolCall("call_1", "exec", {"command": "sleep 1"}, {})
+        command = CommandState(
+            "model-1",
+            0,
+            tool_call,
+            request_seq=42,
+            request=CmdRunRequest(command="sleep 1", ts_ms=1),
+            result_seq=43,
+            result=CmdRunResult(
+                prev_seq=42,
+                ts_ms=2,
+                status="TIMEOUT",
+                stdout=CmdOutput(file="42.stdout", bytes=0, content_encoding="utf-8", content=""),
+                stderr=CmdOutput(file="42.stderr", bytes=0, content_encoding="utf-8", content=""),
+                finished_at_ms=2,
             ),
-            ts_ms=1710000000500,
-        )
-        with self.assertLogs("im_model_agent.worker", level="WARNING"):
-            agent.observe_message(
-                Message(seq=102, channel_id=12, principal=20001, payload=dumps_payload(result_payload), recipients=[90002]),
-                realtime=True,
-            )
-        event.next_seq = 103
-
-        self.assertEqual(agent.state.sessions_by_id["s1"].prompt_messages, [])
-
-        wal = parse_prepare(event.published[2]["payload"])
-        self.assertEqual(wal.user_message_seqs, (1,))
-        self.assertEqual(wal.pre_llm_seq, event.published[1]["seq"])
-        second_request = json.loads(event.published[3]["payload"].decode("utf-8"))
-        self.assertEqual(second_request["request_id"], "agent:s1:wal:102")
-        self.assertEqual([item["role"] for item in second_request["body"]["messages"]], ["system", "user"])
-        self.assertEqual(
-            json.loads(second_request["body"]["messages"][1]["content"]),
-            {"events": [{"type": "user", "time": "2024-03-09T16:00:00.000Z", "text": "bad auth turn"}]},
         )
 
-    def test_non_2xx_model_result_freezes_after_attempt_limit(self):
-        event = FakeOpenEvent()
-        agent = ImModelAgent(
-            _config({"max_model_attempts": 1, "freeze_message": "frozen"}),
-            event,
-        )
+        result = _result_from_command(command)
 
-        agent.validate_channels()
-        agent.observe_message(_sync(1, "bad auth turn", 1710000000000), realtime=True)
-        agent.process_ready_sessions()
-        first_request = json.loads(event.published[1]["payload"].decode("utf-8"))
-        result_payload = result_input_to_dict(
-            SimpleNamespace(
-                request_id=first_request["request_id"],
-                prev_seq=event.published[1]["seq"],
-                status_code=401,
-                headers=[],
-                body={"error": {"message": "unauthorized"}},
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["error_code"], "timeout")
+        self.assertEqual(result["exec_id"], 42)
+        self.assertEqual(result["error_message"], "command execution timed out")
+
+    def test_content_empty_rule(self):
+        self.assertIsNone(visible_content(None))
+        self.assertIsNone(visible_content(" \t\r\n"))
+        self.assertEqual(visible_content("  answer  "), "  answer  ")
+
+    def test_legacy_failed_im_result_does_not_stop_agent_or_mark_echo(self):
+        agent = ImModelAgent(config(), FakeOpenEvent())
+        message = Message(
+            seq=2,
+            channel_id=11,
+            principal=90001,
+            recipients=[90002],
+            payload=encode_send_result(
+                SendResultInput(
+                    request_id="legacy-failed",
+                    prev_seq=1,
+                    status="FAILED",
+                    error_code="PROVIDER_SEND_FAILED",
+                    error_message="legacy failure",
+                    event_ms=1710000000000,
+                )
             ),
-            ts_ms=1710000000500,
         )
 
-        with self.assertLogs("im_model_agent.worker", level="WARNING"):
-            agent.observe_message(
-                Message(seq=102, channel_id=12, principal=20001, payload=dumps_payload(result_payload), recipients=[90002]),
-                realtime=True,
-            )
+        agent.observe_message(message, realtime=False)
 
-        self.assertEqual([item["channel_id"] for item in event.published], [13, 12, 11])
-        send = json.loads(event.published[2]["payload"].decode("utf-8"))
-        self.assertEqual(send["kind"], "send.request")
-        self.assertEqual(send["request_id"], "freeze:s1:1")
-        self.assertEqual(send["data"]["content"]["text"], "frozen")
         session = agent.state.sessions_by_id["s1"]
-        self.assertTrue(session.frozen)
-        self.assertIsNone(session.in_flight_turn_id)
-        self.assertEqual(session.prompt_messages, [])
+        self.assertEqual(session.im_results_by_prev_seq, {})
+        self.assertEqual(session.im_results_by_provider_id, {})
 
-    def test_exec_tool_call_publishes_cmd_request_and_feeds_result_to_model(self):
+    def test_context_trimming_keeps_assistant_tool_group_atomic(self):
+        messages = [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "a"}, {"id": "b"}]},
+            {"role": "tool", "tool_call_id": "a", "content": "{}"},
+            {"role": "tool", "tool_call_id": "b", "content": "{}"},
+        ]
+        trimmed = trim_messages(messages, 3)
+        self.assertEqual([item["role"] for item in trimmed], ["system", "assistant", "tool", "tool"])
+
+    def test_content_and_tools_are_independent_and_tool_result_is_native(self):
         event = FakeOpenEvent()
-        agent = ImModelAgent(_config(), event)
-
+        agent = ImModelAgent(config(), event)
         agent.validate_channels()
-        agent.observe_message(_sync(1, "run local command", 1710000000000), realtime=True)
+        agent.observe_message(sync(1, "list files"), realtime=True)
         agent.process_ready_sessions()
-        first_request = json.loads(event.published[1]["payload"].decode("utf-8"))
-        result_payload = result_input_to_dict(
-            SimpleNamespace(
-                request_id=first_request["request_id"],
-                prev_seq=event.published[1]["seq"],
-                status_code=200,
-                headers=[],
-                body={
-                    "choices": [
-                        {
-                            "message": {
-                                "content": "checking",
-                                "tool_calls": [
-                                    {
-                                        "type": "function",
-                                        "function": {"name": "exec", "arguments": "{\"command\":\"pwd\"}"},
-                                    }
-                                ],
-                            }
-                        }
-                    ]
-                },
-            ),
-            ts_ms=1710000000500,
-        )
+        request = published_json(event, 1)
+        self.assertEqual(request["request_id"], "agent:s1:wal:100:retry:1")
 
-        agent.observe_message(
-            Message(seq=102, channel_id=12, principal=20001, payload=dumps_payload(result_payload), recipients=[90002]),
-            realtime=True,
-        )
+        assistant = {
+            "content": "I will inspect it.",
+            "tool_calls": [{"id": "call_exec", "type": "function", "function": {"name": "exec", "arguments": "{\"command\":\"ls\"}"}}],
+        }
+        agent.observe_message(model_result(event, request, assistant), realtime=True)
+        self.assertEqual([item["channel_id"] for item in event.published], [13, 12, 11, 14])
+        send = published_json(event, 2)
+        self.assertEqual(send["request_id"], f"model-content:{request['request_id']}")
+        agent.observe_message(published_message(event.published[2]), realtime=True)
 
-        self.assertEqual([item["channel_id"] for item in event.published], [13, 12, 14])
-        cmd_request = json.loads(event.published[2]["payload"].decode("utf-8"))
-        self.assertEqual(cmd_request["kind"], "cmd.run.request")
-        self.assertEqual(cmd_request["request_id"], "cmd:agent:s1:wal:100:0")
-        self.assertEqual(cmd_request["command"], "pwd")
-        self.assertEqual(event.published[2]["recipients"], ())
-
-        cmd_result_payload = run_result_input_to_dict(
+        cmd_request = published_json(event, 3)
+        self.assertNotIn("request_id", cmd_request)
+        result = run_result_input_to_dict(
             CmdRunResultInput(
-                prev_seq=event.published[2]["seq"],
+                prev_seq=cmd_request["_seq"],
                 status="SUCCESS",
                 timeout_ms=300000,
-                finished_at_ms=1710000000600,
+                started_at_ms=1710000000000,
+                finished_at_ms=1710000000100,
                 exit_code=0,
-                stdout=CmdOutput(file="14/102.stdout", bytes=16, content_encoding="utf-8", content="/workspace/demo\n"),
-                stderr=CmdOutput(file="14/102.stderr", bytes=0, content_encoding="utf-8", content=""),
+                stdout=CmdOutput(file="14/103.stdout", bytes=10, content_encoding="utf-8", content="README.md\n"),
+                stderr=CmdOutput(file="14/103.stderr", bytes=0, content_encoding="utf-8", content=""),
             )
         )
-        agent.observe_message(
-            Message(seq=103, channel_id=14, principal=30001, payload=cmd_dumps_payload(cmd_result_payload), recipients=[90002]),
-            realtime=True,
-        )
+        result_message = Message(event.next_seq, 14, 30001, cmd_dumps_payload(result), [90002])
+        event.next_seq += 1
+        agent.observe_message(result_message, realtime=True)
+        followup = published_json(event, 5)
+        self.assertEqual([item["role"] for item in followup["body"]["messages"]], ["system", "user", "assistant", "tool"])
+        self.assertEqual(followup["body"]["messages"][-1]["tool_call_id"], "call_exec")
 
-        self.assertEqual([item["channel_id"] for item in event.published], [13, 12, 14, 13, 12])
-        followup = json.loads(event.published[4]["payload"].decode("utf-8"))
-        self.assertEqual(followup["kind"], "infer.request")
-        events = _event_content(followup["body"]["messages"][-1])
-        self.assertEqual(
-            events,
-            [
-                {
-                    "type": "exec_result",
-                    "command": "pwd",
-                    "status": "ok",
-                    "exec_id": event.published[2]["seq"],
-                    "stdout": "/workspace/demo\n",
-                    "stderr": "",
-                }
-            ],
-        )
-
-    def test_read_stdout_tool_call_publishes_output_read_and_feeds_result_to_model(self):
+    def test_empty_model_output_is_accepted_without_im(self):
         event = FakeOpenEvent()
-        agent = ImModelAgent(_config(), event)
-
-        agent.validate_channels()
-        agent.observe_message(_sync(1, "inspect big output", 1710000000000), realtime=True)
+        agent = ImModelAgent(config(), event)
+        agent.observe_message(sync(1, "hello"), realtime=True)
         agent.process_ready_sessions()
-        first_request = json.loads(event.published[1]["payload"].decode("utf-8"))
-        result_payload = result_input_to_dict(
-            SimpleNamespace(
-                request_id=first_request["request_id"],
-                prev_seq=event.published[1]["seq"],
-                status_code=200,
-                headers=[],
-                body={
-                    "choices": [
-                        {
-                            "message": {
-                                "content": "",
-                                "tool_calls": [
-                                    {
-                                        "type": "function",
-                                        "function": {"name": "read_stdout", "arguments": "{\"exec_id\":777}"},
-                                    }
-                                ],
-                            }
-                        }
-                    ]
-                },
-            ),
-            ts_ms=1710000000500,
-        )
-        agent.observe_message(
-            Message(seq=102, channel_id=12, principal=20001, payload=dumps_payload(result_payload), recipients=[90002]),
-            realtime=True,
-        )
+        request = published_json(event, 1)
+        agent.observe_message(model_result(event, request, {"content": ""}), realtime=True)
+        self.assertEqual([item["channel_id"] for item in event.published], [13, 12])
+        self.assertTrue(agent.state.sessions_by_id["s1"].wal_by_seq[100].latest_attempt.accepted)
 
-        self.assertEqual([item["channel_id"] for item in event.published], [13, 12, 14])
-        read_request = json.loads(event.published[2]["payload"].decode("utf-8"))
-        self.assertEqual(read_request["kind"], "cmd.output.read.request")
-        self.assertEqual(read_request["request_id"], "cmd:agent:s1:wal:100:0")
-        self.assertEqual(read_request["target_seq"], 777)
-        self.assertEqual(read_request["stream"], "stdout")
-
-        read_result_payload = output_read_result_input_to_dict(
-            CmdOutputReadResultInput(
-                prev_seq=event.published[2]["seq"],
-                status="SUCCESS",
-                target_seq=777,
-                stream="stdout",
-                offset=0,
-                nbytes=65536,
-                bytes=12,
-                eof=True,
-                content_encoding="utf-8",
-                content="hello world\n",
-            )
-        )
-        agent.observe_message(
-            Message(seq=103, channel_id=14, principal=30001, payload=cmd_dumps_payload(read_result_payload), recipients=[90002]),
-            realtime=True,
-        )
-
-        self.assertEqual([item["channel_id"] for item in event.published], [13, 12, 14, 13, 12])
-        followup = json.loads(event.published[4]["payload"].decode("utf-8"))
-        self.assertEqual(
-            _event_content(followup["body"]["messages"][-1]),
-            [{"type": "read_stdout_result", "exec_id": 777, "status": "ok", "stdout": "hello world\n"}],
-        )
-
-    def test_output_read_not_found_feeds_error_message_to_model(self):
+    def test_failure_retries_same_wal_then_blocks_without_freeze_message(self):
         event = FakeOpenEvent()
-        agent = ImModelAgent(_config(), event)
-
-        agent.validate_channels()
-        agent.observe_message(_sync(1, "inspect missing output", 1710000000000), realtime=True)
+        agent = ImModelAgent(config({"max_model_attempts": 2}), event)
+        agent.observe_message(sync(1, "hello"), realtime=True)
         agent.process_ready_sessions()
-        first_request = json.loads(event.published[1]["payload"].decode("utf-8"))
-        result_payload = result_input_to_dict(
-            SimpleNamespace(
-                request_id=first_request["request_id"],
-                prev_seq=event.published[1]["seq"],
-                status_code=200,
-                headers=[],
-                body={
-                    "choices": [
-                        {
-                            "message": {
-                                "content": "",
-                                "tool_calls": [
-                                    {
-                                        "type": "function",
-                                        "function": {"name": "read_stdout", "arguments": "{\"exec_id\":777}"},
-                                    }
-                                ],
-                            }
-                        }
-                    ]
-                },
-            ),
-            ts_ms=1710000000500,
-        )
-        agent.observe_message(
-            Message(seq=102, channel_id=12, principal=20001, payload=dumps_payload(result_payload), recipients=[90002]),
-            realtime=True,
-        )
+        first = published_json(event, 1)
+        agent.observe_message(model_result(event, first, {"content": None}, status=500), realtime=True)
+        second = published_json(event, 2)
+        self.assertEqual(second["request_id"], "agent:s1:wal:100:retry:2")
+        agent.observe_message(model_result(event, second, {"content": None}, status=500), realtime=True)
+        wal = agent.state.sessions_by_id["s1"].wal_by_seq[100]
+        self.assertTrue(wal.blocked)
+        self.assertEqual([item["channel_id"] for item in event.published], [13, 12, 12])
 
-        read_result_payload = output_read_result_input_to_dict(
-            CmdOutputReadResultInput(
-                prev_seq=event.published[2]["seq"],
-                status="NOT_FOUND",
-                target_seq=777,
-                stream="stdout",
-                offset=0,
-                nbytes=65536,
-                bytes=0,
-                eof=True,
-                content_encoding="utf-8",
-                content="",
-            )
-        )
-        agent.observe_message(
-            Message(seq=103, channel_id=14, principal=30001, payload=cmd_dumps_payload(read_result_payload), recipients=[90002]),
-            realtime=True,
-        )
-
-        followup = json.loads(event.published[4]["payload"].decode("utf-8"))
-        self.assertEqual(
-            _event_content(followup["body"]["messages"][-1]),
-            [{"type": "read_stdout_result", "exec_id": 777, "status": "error", "error_message": "command output not found"}],
-        )
-
-    def test_missing_assistant_text_is_attempt_failure(self):
+    def test_duplicate_prepare_uses_smallest_seq(self):
         event = FakeOpenEvent()
-        agent = ImModelAgent(
-            _config({"max_model_attempts": 1, "freeze_message": "empty frozen"}),
+        agent = ImModelAgent(config(), event)
+        agent.observe_message(sync(1, "hello"), realtime=False)
+        payload = encode_prepare(
+            prepare_id="prepare:duplicate",
+            pre_llm_seq=0,
+            user_message_seqs=[1],
+            ts_ms=10,
+        )
+
+        agent.observe_message(Message(10, 13, 90002, payload), realtime=False)
+        agent.observe_message(Message(11, 13, 90002, payload), realtime=False)
+
+        session = agent.state.sessions_by_id["s1"]
+        self.assertEqual(tuple(session.wal_by_seq), (10,))
+        self.assertEqual(session.wal_aliases, {11: 10})
+
+    def test_duplicate_model_request_and_result_use_canonical_seq(self):
+        event = FakeOpenEvent()
+        agent = ImModelAgent(config(), event)
+        agent.observe_message(sync(1, "hello"), realtime=False)
+        agent.process_ready_sessions()
+        request_item = event.published[1]
+        duplicate_request_seq = event.next_seq
+        event.next_seq += 1
+        agent.observe_message(
+            Message(
+                duplicate_request_seq,
+                12,
+                90002,
+                request_item["payload"],
+                list(request_item["recipients"]),
+            ),
+            realtime=False,
+        )
+
+        request = published_json(event, 1)
+        result = model_result(event, request, {"content": "answer"})
+        agent.observe_message(result, realtime=False)
+        agent.observe_message(
+            Message(result.seq + 1, result.channel_id, result.principal, result.payload, result.recipients),
+            realtime=False,
+        )
+
+        session = agent.state.sessions_by_id["s1"]
+        self.assertEqual(session.model_request_aliases, {duplicate_request_seq: request["_seq"]})
+        self.assertEqual(session.model_result_aliases, {result.seq + 1: result.seq})
+
+    def test_conflicting_model_stable_ids_fail(self):
+        event = FakeOpenEvent()
+        agent = ImModelAgent(config(), event)
+        agent.observe_message(sync(1, "hello"), realtime=False)
+        agent.process_ready_sessions()
+        request = published_json(event, 1)
+        conflicting_request = {key: value for key, value in request.items() if key != "_seq"}
+        conflicting_request["path"] = "/v1/responses"
+        conflicting_seq = event.next_seq
+        event.next_seq += 1
+
+        with self.assertRaisesRegex(AgentStateError, "conflicting model request ID"):
+            agent.observe_message(
+                Message(conflicting_seq, 12, 90002, dumps_payload(conflicting_request)),
+                realtime=False,
+            )
+
+        first_result = model_result(event, request, {"content": "first"})
+        agent.observe_message(first_result, realtime=False)
+        conflicting_result = model_result(event, request, {"content": "second"})
+        with self.assertRaisesRegex(AgentStateError, "conflicting model result"):
+            agent.observe_message(conflicting_result, realtime=False)
+
+    def test_publish_parameter_error_does_not_reconcile_or_retry(self):
+        event = FakeOpenEvent()
+        agent = ImModelAgent(config(), event)
+        calls = 0
+
+        def publish():
+            nonlocal calls
+            calls += 1
+            raise ValueError("invalid request")
+
+        with self.assertRaisesRegex(ValueError, "invalid request"):
+            agent._reliable_publish(
+                channel_id=13,
+                stable_id="stable",
+                expected={"id": "stable"},
+                publish=publish,
+                decode=lambda message: None,
+            )
+
+        self.assertEqual(calls, 1)
+        self.assertEqual(event.fetch_calls, 0)
+
+    def test_uncertain_publish_reconciles_committed_message(self):
+        class Unavailable(RpcError):
+            def code(self):
+                return StatusCode.UNAVAILABLE
+
+        event = FakeOpenEvent()
+        agent = ImModelAgent(config(), event)
+        payload = {"id": "stable"}
+        calls = 0
+
+        def publish():
+            nonlocal calls
+            calls += 1
+            event.history.append(Message(1, 13, 90002, json.dumps(payload).encode("utf-8")))
+            raise Unavailable()
+
+        seq = agent._reliable_publish(
+            channel_id=13,
+            stable_id="stable",
+            expected=payload,
+            publish=publish,
+            decode=lambda message: ("stable", json.loads(message.payload.decode("utf-8"))),
+        )
+
+        self.assertEqual(seq, 1)
+        self.assertEqual(calls, 1)
+        self.assertEqual(event.fetch_calls, 1)
+
+    def test_prepare_rejects_missing_or_reused_inputs(self):
+        event = FakeOpenEvent()
+        agent = ImModelAgent(config(), event)
+        agent.observe_message(sync(1, "hello"), realtime=False)
+        first = encode_prepare(
+            prepare_id="prepare:first",
+            pre_llm_seq=0,
+            user_message_seqs=[1],
+            ts_ms=10,
+        )
+        agent.observe_message(Message(10, 13, 90002, first), realtime=False)
+
+        reused = encode_prepare(
+            prepare_id="prepare:second",
+            pre_llm_seq=0,
+            user_message_seqs=[1],
+            ts_ms=11,
+        )
+        with self.assertRaisesRegex(AgentStateError, "reuses user reference"):
+            agent.observe_message(Message(11, 13, 90002, reused), realtime=False)
+
+        missing = encode_prepare(
+            prepare_id="prepare:missing",
+            pre_llm_seq=0,
+            user_message_seqs=[2],
+            ts_ms=12,
+        )
+        with self.assertRaisesRegex(AgentStateError, "does not belong to this session"):
+            agent.observe_message(Message(12, 13, 90002, missing), realtime=False)
+
+    def test_recovery_matches_cmd_v1_request_by_order_and_payload(self):
+        event = FakeOpenEvent()
+        agent = ImModelAgent(config(), event)
+        user = sync(1, "list files")
+        agent.observe_message(user, realtime=True)
+        agent.process_ready_sessions()
+        request = published_json(event, 1)
+        result_message = model_result(
             event,
+            request,
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_exec",
+                        "type": "function",
+                        "function": {"name": "exec", "arguments": "{\"command\":\"ls\"}"},
+                    }
+                ],
+            },
         )
-
-        agent.validate_channels()
-        agent.observe_message(_sync(1, "empty answer turn", 1710000000000), realtime=True)
-        agent.process_ready_sessions()
-        first_request = json.loads(event.published[1]["payload"].decode("utf-8"))
-        result_payload = result_input_to_dict(
-            SimpleNamespace(
-                request_id=first_request["request_id"],
-                prev_seq=event.published[1]["seq"],
-                status_code=200,
-                headers=[],
-                body={"choices": [{"message": {"content": ""}}]},
-            ),
-            ts_ms=1710000000500,
-        )
-
-        with self.assertLogs("im_model_agent.worker", level="WARNING"):
-            agent.observe_message(
-                Message(seq=102, channel_id=12, principal=20001, payload=dumps_payload(result_payload), recipients=[90002]),
-                realtime=True,
+        agent.observe_message(result_message, realtime=True)
+        cmd_request = published_json(event, 2)
+        cmd_result = run_result_input_to_dict(
+            CmdRunResultInput(
+                prev_seq=cmd_request["_seq"],
+                status="SUCCESS",
+                timeout_ms=300000,
+                finished_at_ms=1710000000200,
+                exit_code=0,
+                stdout=CmdOutput(file="14/103.stdout", bytes=0, content_encoding="utf-8", content=""),
+                stderr=CmdOutput(file="14/103.stderr", bytes=0, content_encoding="utf-8", content=""),
             )
-
-        self.assertEqual([item["channel_id"] for item in event.published], [13, 12, 11])
-        send = json.loads(event.published[2]["payload"].decode("utf-8"))
-        self.assertEqual(send["request_id"], "freeze:s1:1")
-        self.assertEqual(send["data"]["content"]["text"], "empty frozen")
-
-    def test_stale_failed_result_does_not_retry_or_clear_in_flight_new_attempt(self):
-        event = FakeOpenEvent()
-        agent = ImModelAgent(_config(), event)
-
-        agent.validate_channels()
-        agent.observe_message(_sync(1, "stale attempt turn", 1710000000000), realtime=True)
-        agent.process_ready_sessions()
-        first_request = json.loads(event.published[1]["payload"].decode("utf-8"))
-        first_attempt = agent.state.sessions_by_id["s1"].latest_attempt()
-        agent._handle_attempt_failure(agent.state.sessions_by_id["s1"], first_attempt, "test_timeout")
-        retry_request = json.loads(event.published[3]["payload"].decode("utf-8"))
-        stale_result = result_input_to_dict(
-            SimpleNamespace(
-                request_id=first_request["request_id"],
-                prev_seq=event.published[1]["seq"],
-                status_code=500,
-                headers=[],
-                body={"error": {"message": "late failure"}},
-            ),
-            ts_ms=1710000000500,
         )
+        cmd_result_message = Message(event.next_seq, 14, 30001, cmd_dumps_payload(cmd_result), [90002])
+        event.next_seq += 1
+        agent.observe_message(cmd_result_message, realtime=True)
 
-        agent.observe_message(
-            Message(seq=104, channel_id=12, principal=20001, payload=dumps_payload(stale_result), recipients=[90002]),
-            realtime=True,
-        )
-
-        self.assertEqual(len(event.published), 4)
-        session = agent.state.sessions_by_id["s1"]
-        self.assertEqual(session.in_flight_turn_id, "s1:1")
-        self.assertEqual(session.latest_attempt().request.request_id, retry_request["request_id"])
-        self.assertFalse(session.frozen)
-
-    def test_next_turn_uses_last_successful_request_and_reply_as_base(self):
-        event = FakeOpenEvent()
-        agent = ImModelAgent(_config(), event)
-
-        agent.validate_channels()
-        agent.observe_message(_sync(1, "first ok", 1710000000000), realtime=True)
-        agent.process_ready_sessions()
-        first_request = json.loads(event.published[1]["payload"].decode("utf-8"))
-        ok_result = result_input_to_dict(
-            SimpleNamespace(
-                request_id=first_request["request_id"],
-                prev_seq=event.published[1]["seq"],
-                status_code=200,
-                headers=[],
-                body={"choices": [{"message": {"content": "first answer"}}]},
-            ),
-            ts_ms=1710000000500,
-        )
-        agent.observe_message(
-            Message(seq=102, channel_id=12, principal=20001, payload=dumps_payload(ok_result), recipients=[90002]),
-            realtime=True,
-        )
-        event.next_seq = 103
-
-        agent.observe_message(_sync(2, "failed turn", 1710000001000), realtime=True)
-        agent.process_ready_sessions()
-        failed_request = json.loads(event.published[4]["payload"].decode("utf-8"))
-        failed_result = result_input_to_dict(
-            SimpleNamespace(
-                request_id=failed_request["request_id"],
-                prev_seq=event.published[4]["seq"],
-                status_code=500,
-                headers=[],
-                body={"error": {"message": "provider failed"}},
-            ),
-            ts_ms=1710000001500,
-        )
-        with self.assertLogs("im_model_agent.worker", level="WARNING"):
-            agent.observe_message(
-                Message(seq=105, channel_id=12, principal=20001, payload=dumps_payload(failed_result), recipients=[90002]),
-                realtime=True,
-            )
-        event.next_seq = 106
-        retry_request = json.loads(event.published[6]["payload"].decode("utf-8"))
-        retry_result = result_input_to_dict(
-            SimpleNamespace(
-                request_id=retry_request["request_id"],
-                prev_seq=event.published[6]["seq"],
-                status_code=200,
-                headers=[],
-                body={"choices": [{"message": {"content": "retry answer"}}]},
-            ),
-            ts_ms=1710000001800,
-        )
-        agent.observe_message(
-            Message(seq=106, channel_id=12, principal=20001, payload=dumps_payload(retry_result), recipients=[90002]),
-            realtime=True,
-        )
-        event.next_seq = 107
-
-        agent.observe_message(_sync(3, "after failure", 1710000002000), realtime=True)
-        agent.process_ready_sessions()
-
-        next_request = json.loads(event.published[9]["payload"].decode("utf-8"))
-        self.assertEqual([item["role"] for item in next_request["body"]["messages"]], ["system", "user", "assistant", "user", "assistant", "user"])
-        user_messages = [
-            _event_content(item)
-            for item in next_request["body"]["messages"]
-            if item["role"] == "user"
-        ]
-        self.assertEqual(
-            user_messages,
+        recovered_event = FakeOpenEvent()
+        recovered_event.history = sorted(
             [
-                [{"type": "user", "time": "2024-03-09T16:00:00.000Z", "text": "first ok"}],
-                [{"type": "user", "time": "2024-03-09T16:00:01.000Z", "text": "failed turn"}],
-                [{"type": "user", "time": "2024-03-09T16:00:02.000Z", "text": "after failure"}],
+                user,
+                result_message,
+                cmd_result_message,
+                *(published_message(item) for item in event.published),
             ],
+            key=lambda message: message.seq,
         )
-        self.assertEqual(next_request["body"]["messages"][2], {"role": "assistant", "content": "first answer"})
-        self.assertEqual(next_request["body"]["messages"][4], {"role": "assistant", "content": "retry answer"})
+        recovered_event.next_seq = max(message.seq for message in recovered_event.history) + 1
+        recovered = ImModelAgent(config(), recovered_event)
 
-    def test_recovery_tracks_infer_request_without_result_as_in_flight(self):
-        event = FakeOpenEvent()
-        wal_payload = {
-            "kind": "llm.request.prepare",
-            "ts_ms": 1710000000100,
-            "pre_llm_seq": 0,
-            "user_message_seqs": [1],
-        }
-        request_payload = request_input_to_dict(
-            SimpleNamespace(
-                request_id="agent:s1:wal:2",
-                method="POST",
-                path="/v1/chat/completions",
-                body={"model": "gpt-test", "messages": []},
-            ),
-            ts_ms=1710000000200,
-        )
-        event.history = [
-            _sync(1, "hello", 1710000000000),
-            Message(seq=2, channel_id=13, principal=90002, payload=json.dumps(wal_payload).encode("utf-8")),
-            Message(seq=3, channel_id=12, principal=90002, payload=dumps_payload(request_payload)),
-        ]
+        recovered.recover()
 
-        agent = ImModelAgent(_config(), event)
-        agent.recover()
-
-        self.assertEqual(event.fetch_calls[0], (1, 1000, False, (11, 12, 13, 14)))
-        session = agent.state.sessions_by_id["s1"]
-        self.assertEqual(session.in_flight_turn_id, "s1:1")
-        self.assertFalse(session.pending)
-        self.assertEqual(session.latest_attempt().request_seq, 3)
-
-    def test_recovery_republishes_infer_request_for_orphan_wal(self):
-        event = FakeOpenEvent()
-        wal_payload = {
-            "kind": "llm.request.prepare",
-            "ts_ms": 1710000000100,
-            "pre_llm_seq": 0,
-            "user_message_seqs": [1],
-        }
-        event.history = [
-            _sync(1, "hello", 1710000000000),
-            Message(seq=2, channel_id=13, principal=90002, payload=json.dumps(wal_payload).encode("utf-8")),
-        ]
-
-        agent = ImModelAgent(_config(), event)
-        agent.recover()
-
-        self.assertEqual(len(event.published), 1)
-        self.assertEqual(event.published[0]["channel_id"], 12)
-        request = json.loads(event.published[0]["payload"].decode("utf-8"))
-        self.assertEqual(request["request_id"], "agent:s1:wal:2")
-
-    def test_recovery_retries_failed_attempt_without_advancing_prompt_base(self):
-        event = FakeOpenEvent()
-        first_messages = [
-            {"role": "system", "content": "be useful"},
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {"events": [{"type": "user", "time": "2024-03-09T16:00:00.000Z", "text": "first ok"}]},
-                    ensure_ascii=False,
-                ),
-            },
-        ]
-        failed_messages = [
-            *first_messages,
-            {"role": "assistant", "content": "first answer"},
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {"events": [{"type": "user", "time": "2024-03-09T16:00:01.000Z", "text": "failed turn"}]},
-                    ensure_ascii=False,
-                ),
-            },
-        ]
-        first_wal = {
-            "kind": "llm.request.prepare",
-            "ts_ms": 1710000000100,
-            "pre_llm_seq": 0,
-            "user_message_seqs": [1],
-        }
-        first_request = request_input_to_dict(
-            SimpleNamespace(
-                request_id="agent:s1:wal:2",
-                method="POST",
-                path="/v1/chat/completions",
-                body={"model": "gpt-test", "messages": first_messages},
-            ),
-            ts_ms=1710000000200,
-        )
-        first_result = result_input_to_dict(
-            SimpleNamespace(
-                request_id="agent:s1:wal:2",
-                prev_seq=3,
-                status_code=200,
-                headers=[],
-                body={"choices": [{"message": {"content": "first answer"}}]},
-            ),
-            ts_ms=1710000000300,
-        )
-        failed_wal = {
-            "kind": "llm.request.prepare",
-            "ts_ms": 1710000000500,
-            "pre_llm_seq": 3,
-            "user_message_seqs": [6],
-        }
-        failed_request = request_input_to_dict(
-            SimpleNamespace(
-                request_id="agent:s1:wal:7",
-                method="POST",
-                path="/v1/chat/completions",
-                body={"model": "gpt-test", "messages": failed_messages},
-            ),
-            ts_ms=1710000000600,
-        )
-        failed_result = result_input_to_dict(
-            SimpleNamespace(
-                request_id="agent:s1:wal:7",
-                prev_seq=8,
-                status_code=500,
-                headers=[],
-                body={"error": {"message": "provider failed"}},
-            ),
-            ts_ms=1710000000700,
-        )
-        event.history = [
-            _sync(1, "first ok", 1710000000000),
-            Message(seq=2, channel_id=13, principal=90002, payload=json.dumps(first_wal).encode("utf-8")),
-            Message(seq=3, channel_id=12, principal=90002, payload=dumps_payload(first_request)),
-            Message(seq=4, channel_id=12, principal=20001, payload=dumps_payload(first_result), recipients=[90002]),
-            _send_request(5, "im:agent:s1:wal:2", "first answer", 1710000000400),
-            _sync(6, "failed turn", 1710000001000),
-            Message(seq=7, channel_id=13, principal=90002, payload=json.dumps(failed_wal).encode("utf-8")),
-            Message(seq=8, channel_id=12, principal=90002, payload=dumps_payload(failed_request)),
-            Message(seq=9, channel_id=12, principal=20001, payload=dumps_payload(failed_result), recipients=[90002]),
-            _sync(10, "after failure", 1710000002000),
-        ]
-        event.next_seq = 100
-
-        agent = ImModelAgent(_config(), event)
-        agent.recover()
-        agent.process_ready_sessions()
-
-        self.assertEqual(len(event.published), 2)
-        wal = parse_prepare(event.published[0]["payload"])
-        self.assertEqual(wal.user_message_seqs, (6,))
-        request = json.loads(event.published[1]["payload"].decode("utf-8"))
-        self.assertEqual([item["role"] for item in request["body"]["messages"]], ["system", "user", "assistant", "user"])
-        user_messages = [
-            _event_content(item)
-            for item in request["body"]["messages"]
-            if item["role"] == "user"
-        ]
-        self.assertEqual(
-            user_messages,
-            [
-                [{"type": "user", "time": "2024-03-09T16:00:00.000Z", "text": "first ok"}],
-                [{"type": "user", "time": "2024-03-09T16:00:01.000Z", "text": "failed turn"}],
-            ],
-        )
-        self.assertEqual(request["body"]["messages"][2], {"role": "assistant", "content": "first answer"})
-
-    def test_recovery_does_not_retry_older_failed_attempt_when_new_attempt_is_in_flight(self):
-        event = FakeOpenEvent()
-        first_wal = {
-            "kind": "llm.request.prepare",
-            "ts_ms": 1710000000100,
-            "pre_llm_seq": 0,
-            "user_message_seqs": [1],
-        }
-        first_messages = [
-            {"role": "system", "content": "be useful"},
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {"events": [{"type": "user", "time": "2024-03-09T16:00:00.000Z", "text": "failed turn"}]},
-                    ensure_ascii=False,
-                ),
-            },
-        ]
-        first_request = request_input_to_dict(
-            SimpleNamespace(
-                request_id="agent:s1:wal:2",
-                method="POST",
-                path="/v1/chat/completions",
-                body={"model": "gpt-test", "messages": first_messages},
-            ),
-            ts_ms=1710000000200,
-        )
-        first_result = result_input_to_dict(
-            SimpleNamespace(
-                request_id="agent:s1:wal:2",
-                prev_seq=3,
-                status_code=500,
-                headers=[],
-                body={"error": {"message": "provider failed"}},
-            ),
-            ts_ms=1710000000300,
-        )
-        retry_wal = {
-            "kind": "llm.request.prepare",
-            "ts_ms": 1710000000400,
-            "pre_llm_seq": 3,
-            "user_message_seqs": [1],
-        }
-        retry_request = request_input_to_dict(
-            SimpleNamespace(
-                request_id="agent:s1:wal:5",
-                method="POST",
-                path="/v1/chat/completions",
-                body={"model": "gpt-test", "messages": first_messages},
-            ),
-            ts_ms=1710000000500,
-        )
-        event.history = [
-            _sync(1, "failed turn", 1710000000000),
-            Message(seq=2, channel_id=13, principal=90002, payload=json.dumps(first_wal).encode("utf-8")),
-            Message(seq=3, channel_id=12, principal=90002, payload=dumps_payload(first_request)),
-            Message(seq=4, channel_id=12, principal=20001, payload=dumps_payload(first_result), recipients=[90002]),
-            Message(seq=5, channel_id=13, principal=90002, payload=json.dumps(retry_wal).encode("utf-8")),
-            Message(seq=6, channel_id=12, principal=90002, payload=dumps_payload(retry_request)),
-        ]
-
-        agent = ImModelAgent(_config(), event)
-        agent.recover()
-
-        self.assertFalse(event.published)
-        session = agent.state.sessions_by_id["s1"]
-        self.assertEqual(session.in_flight_turn_id, "s1:1")
-        self.assertEqual(session.latest_attempt().request_seq, 6)
-
-    def test_recovery_sends_im_reply_for_result_without_send_request(self):
-        event = FakeOpenEvent()
-        wal_payload = {
-            "kind": "llm.request.prepare",
-            "ts_ms": 1710000000100,
-            "pre_llm_seq": 0,
-            "user_message_seqs": [1],
-        }
-        request_payload = request_input_to_dict(
-            SimpleNamespace(
-                request_id="agent:s1:wal:2",
-                method="POST",
-                path="/v1/chat/completions",
-                body={"model": "gpt-test", "messages": []},
-            ),
-            ts_ms=1710000000200,
-        )
-        result_payload = result_input_to_dict(
-            SimpleNamespace(
-                request_id="agent:s1:wal:2",
-                prev_seq=3,
-                status_code=200,
-                headers=[],
-                body={"choices": [{"message": {"content": "hi back"}}]},
-            ),
-            ts_ms=1710000000300,
-        )
-        event.history = [
-            _sync(1, "hello", 1710000000000),
-            Message(seq=2, channel_id=13, principal=90002, payload=json.dumps(wal_payload).encode("utf-8")),
-            Message(seq=3, channel_id=12, principal=90002, payload=dumps_payload(request_payload)),
-            Message(seq=4, channel_id=12, principal=20001, payload=dumps_payload(result_payload), recipients=[90002]),
-        ]
-
-        agent = ImModelAgent(_config(), event)
-        agent.recover()
-
-        self.assertEqual(len(event.published), 1)
-        self.assertEqual(event.published[0]["channel_id"], 11)
-        send = json.loads(event.published[0]["payload"].decode("utf-8"))
-        self.assertEqual(send["kind"], "send.request")
-        self.assertEqual(send["data"]["content"]["text"], "hi back")
+        session = recovered.state.sessions_by_id["s1"]
+        command = session.commands_by_seq[cmd_request["_seq"]]
+        self.assertEqual(command.request_id, f"cmd:{request['request_id']}:0")
+        self.assertEqual(command.tool_call.id, "call_exec")
+        self.assertIsNotNone(command.result)
 
 
 if __name__ == "__main__":

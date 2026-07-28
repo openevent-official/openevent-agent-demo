@@ -9,7 +9,7 @@
 
 完成后本地会得到：
 
-- `runtime/src/`：从 GitHub 拉取的 OpenEvent、SDK、IM、model-proxy、cmd 和 view 源码。
+- `runtime/src/`：从 GitHub 拉取并固定到明确 commit 的 OpenEvent、IM、model-proxy、cmd 和 view 源码。
 - `runtime/venv/`：Agent Demo 使用的 Python venv。
 - `runtime/src/openevent/build/openevent_server`：本地构建出的 OpenEvent server。
 - `openevent-stack/config/env.sh`：指向上述 venv 和 server 二进制的本机路径覆盖配置。
@@ -78,11 +78,11 @@ source runtime/venv/bin/activate
 `scripts/bootstrap_ubuntu_venv.sh --workdir runtime` 会按顺序执行：
 
 1. 安装 Ubuntu 系统依赖。
-2. 从 GitHub 公开仓库拉取依赖项目到 `runtime/src/`。
-3. 初始化 OpenEvent server 的 Git submodule。
+2. 从 GitHub 公开仓库拉取依赖项目，并 checkout 脚本声明的固定 commit。
+3. 初始化 OpenEvent server 的 Git submodule；Python SDK 使用其中固定的 `openevent-sdk`。
 4. 创建 `runtime/venv`。
 5. 构建 OpenEvent server。
-6. 通过各子项目的 `make install` 把 SDK、IM、model-proxy、cmd 和 view 安装到同一个 venv。
+6. 通过各子项目的 `make install` 把 OpenEvent 自带 SDK、IM、model-proxy、cmd 和 view 安装到同一个 venv。
 7. 生成 `openevent-stack/config/env.sh`。
 8. 验证 venv 中可以 import 运行所需模块。
 
@@ -90,24 +90,29 @@ bootstrap 依赖公开仓库：
 
 ```bash
 https://github.com/openevent-official/openevent.git
-https://github.com/openevent-official/openevent-sdk.git
 https://github.com/openevent-official/openevent-modules-im.git
 https://github.com/openevent-official/openevent-modules-model-proxy.git
 https://github.com/openevent-official/openevent-modules-cmd.git
 https://github.com/openevent-official/openevent-view.git
 ```
 
-如果要覆盖仓库地址，在脚本命令前传环境变量：
+脚本中的 `*_REF` 默认值是经过组合验证的 commit。可以同时覆盖仓库地址和对应 commit/tag：
 
 ```bash
 OPENEVENT_URL=https://github.com/openevent-official/openevent.git \
-OPENEVENT_SDK_URL=https://github.com/openevent-official/openevent-sdk.git \
+OPENEVENT_REF=a1d2d97d0870dd5fc61af329bf0cb94cd124aafa \
 OPENEVENT_MODULES_IM_URL=https://github.com/openevent-official/openevent-modules-im.git \
+OPENEVENT_MODULES_IM_REF=8aebcb35506d7e60384b548800830273bc1781f7 \
 OPENEVENT_MODEL_PROXY_URL=https://github.com/openevent-official/openevent-modules-model-proxy.git \
+OPENEVENT_MODEL_PROXY_REF=60fe36fe30fa5b92b1dffa535082686ea28e75ef \
 OPENEVENT_MODULES_CMD_URL=https://github.com/openevent-official/openevent-modules-cmd.git \
+OPENEVENT_MODULES_CMD_REF=bc92ef9c4b46295e098021d5a637c8c7b09dc9b0 \
 OPENEVENT_VIEW_URL=https://github.com/openevent-official/openevent-view.git \
+OPENEVENT_VIEW_REF=9127056bf0a88f7091c3d1b21e4186ea60180706 \
 scripts/bootstrap_ubuntu_venv.sh --workdir runtime
 ```
+
+覆盖 `*_REF` 后，这些 ref 必须仍是一组协议和配置契约兼容的版本。脚本只保证默认组合经过验证。
 
 ## 常见失败
 

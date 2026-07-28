@@ -3,19 +3,19 @@
 [English version](AGENT_WAL_PROTOCOL.md)
 
 > 状态：草案
-> 适用范围：OpenEvent channel `protocol="agent.wal.v1"` 的 Agent write-ahead log payload 与 channel description
+> 适用范围：OpenEvent channel `protocol="agent.wal.v1"` 的 payload 与 channel description
 
-## 1. Channel 约定
+## 1. 文档职责
 
-每个 Agent 会话 MUST 独占一个 WAL channel。WAL channel 只保存该会话的 Agent 本地推进意图，不承载 IM 内容、模型请求正文或模型结果。
+本文是 `agent.wal.v1` 字段、稳定 ID、发布对账、retry/blocked 和恢复语义的唯一协议事实来源。
+Agent 的持续运行概览见 [IM_MODEL_AGENT_cn.md](IM_MODEL_AGENT_cn.md)。
 
-所有 Agent WAL channel MUST 设置：
+## 2. Channel
 
-```text
-protocol = "agent.wal.v1"
-```
+每个 Agent session 独占一个 WAL channel，设置 `protocol="agent.wal.v1"`。WAL 记录下一条模型请求
+将消费哪些新事实，不保存模型请求正文或命令输出正文。
 
-`description` MUST 是 JSON 字符串：
+`description`：
 
 ```json
 {
@@ -28,144 +28,164 @@ protocol = "agent.wal.v1"
 }
 ```
 
-字段约束：
+WAL channel 推荐为 `private`。Agent principal 必须具备读写权限；其它 worker 不消费 WAL。
 
-- `version`：当前固定为 `v1`
-- `session_id`：Agent 配置中的会话 ID
-- `im_channel_id`：该 Agent 会话绑定的 `im.v1` channel
-- `model_channel_id`：该 Agent 会话绑定的 `llm.v1` channel
-- `updated_at_ms`：毫秒时间戳
-- `metadata`：可选 object，用于承载部署或业务域需要的静态扩展信息
+本协议假定同一 `session_id` 初始化后永久绑定同一组 IM、Model、WAL、Cmd Channel；所有 session 内的
+消息引用都在这组固定绑定下解释。更换任一 Channel 必须创建新的 `session_id`。绑定生命周期由
+[Runtime Reconciler](RUNTIME_RECONCILER_cn.md#channel-协调) 定义。
 
-约束：
+## 3. Payload
 
-- 一个 Agent 会话只能配置一个 WAL channel。
-- 一个 WAL channel 只能归属一个 Agent 会话。
-- 同一 Agent 进程内 `wal_channel_id` MUST 唯一。
-- WAL channel 推荐使用 `private`。
-- Agent principal MUST 具备 WAL channel 读写权限。
-- IM Sync Worker 与 model-proxy worker 不消费 WAL channel，也不需要 WAL channel 权限。
-
-## 2. Payload Envelope
-
-`agent.wal.v1` payload 是 UTF-8 JSON object。首版只定义一种日志：
+协议定义 `llm.request.prepare` 和 `cmd.request.timeout`。Prepare payload：
 
 ```json
 {
   "kind": "llm.request.prepare",
+  "prepare_id": "prepare:agent-session-001:9d70c7",
   "ts_ms": 1710000000000,
   "pre_llm_seq": 12340,
-  "user_message_seqs": [12345, 12346]
+  "user_message_seqs": [],
+  "input_event_refs": [
+    {
+      "type": "exec_result",
+      "seq": 12350
+    }
+  ]
 }
 ```
 
-公共字段：
+字段：
 
-- `kind`：必填，当前固定为 `llm.request.prepare`
-- `ts_ms`：必填，Unix 毫秒时间戳（UTC）
-- `pre_llm_seq`：必填，准备本次 LLM 请求前，本会话上一条 `llm.v1 infer.request` 的 OpenEvent `seq`；若本会话此前没有 LLM 请求，值为 `0`
-- `user_message_seqs`：必填，本次准备提交给 LLM 的用户消息 `im.v1 sync.record.seq` 列表
+- `kind`：必填，固定为 `llm.request.prepare`。
+- `prepare_id`：必填、非空；同一 WAL channel 内唯一，标识这一份确定的新增模型输入。
+- `ts_ms`：必填 Unix 毫秒时间戳。
+- `pre_llm_seq`：必填；必须等于写 WAL 前该 session 最新的 `infer.request.seq`，首次为 `0`。
+- `user_message_seqs`：必填数组，引用新增用户 `sync.record.seq`，没有时为空。
+- `input_event_refs`：必填数组，引用新增工具结果，没有时为空。
 
-协议字段严格校验：未知字段、缺失必填字段、字段类型不匹配均视为非法 payload。
+`user_message_seqs` 与 `input_event_refs` 至少一个非空，也可以同时非空。两个数组均按 seq 严格升序，
+不得重复。
 
-## 3. OpenEvent principal 与 recipients
+`input_event_refs` 元素严格包含：
 
-`principal` 是 OpenEvent EventMessage 的顶层字段，不放入 `agent.wal.v1` payload。
+| 字段 | 规则 |
+| --- | --- |
+| `type` | `exec_result`、`read_stdout_result`、`read_stderr_result` 或 `cmd_timeout` |
+| `seq` | 对应 Cmd result 或 WAL `cmd.request.timeout` 的 OpenEvent seq |
 
-规则：
+引用消息必须属于当前 session 配置的 IM/Cmd/WAL channel，并通过 `prev_seq`、`target_seq`、
+`cmd_request_id` 等协议关系校验。
+所有引用 seq 必须小于当前 WAL seq；已经被另一条 canonical prepare 消费的引用不得再次使用。
+未知字段、未知类型、缺失字段或错误类型均为非法 payload。
 
-- `llm.request.prepare` 的 OpenEvent `principal` MUST 使用 Agent principal。
-- `llm.request.prepare` 的 OpenEvent `recipients` MUST 为空数组。
-- WAL channel 可见性和成员负责访问控制，不使用 `recipients` 表达接收方。
-- payload 中不得包含 `source_principal`、token、API key 或模型请求正文。
+## 4. Prepare ID
 
-## 4. llm.request.prepare
+`prepare_id` 在第一次发布前生成，在该 WAL 发布的所有传输重试中保持不变。它只标识这一份输入引用，
+不表示任务、阶段、开始或结束。不同输入集合必须使用不同 ID；完全相同的逻辑发布必须复用原 ID和
+payload。
 
-`llm.request.prepare` 表示 Agent 准备向 `llm.v1` channel 写入一条新的 `infer.request`。它必须先于对应 `infer.request` 写入 OpenEvent。
+对应模型请求：
+
+```text
+model_request_id = "agent:{session_id}:wal:{wal_seq}:retry:{retry_index}"
+```
+
+一条 WAL 固定本次消费的新输入引用，可以对应多个模型 retry。`retry_index` 从 `1` 开始递增；每个
+retry 都严格按该 WAL 的引用和它之前已接受的上下文构造，不得混入后来排队的事件。请求正文不要求
+逐字节相同，retry 也不新增 WAL。
+
+## 5. 发布对账
+
+发布 WAL 时：
+
+1. 发布前用 `GetStatus` 记录 `max_seq`。
+2. 调用一次 `PublishAutoSeq`。
+3. 成功时使用返回 seq。
+4. 结果不确定时获取新的确定水位，用 `Fetch(channels=[wal_channel_id])` 完整扫描两个水位之间。
+5. 找到相同 `prepare_id` 和内容时复用最小 seq；相同 ID内容不同属于一致性错误。
+6. 完整扫描确认不存在后，才允许用相同 ID和内容重发。
+
+`infer.request` 和 IM `send.request` 采用相同的稳定 ID模式。`cmd.v1` request payload 没有稳定 ID；
+Agent 必须在发布前固定完整 payload，结果不确定时扫描发布前后水位区间，只接受由 Agent principal
+发布且 payload 完全一致的 request。完整扫描确认不存在后才允许重发同一 payload。只查看 channel
+最后一条消息不能完成对账。
+
+## 6. 模型文字和工具
+
+模型结果的每段非空 `content` 使用独立 IM 去重键：
+
+```text
+send.request.request_id = "model-content:{model_request_id}"
+```
+
+无论同一模型结果是否包含工具调用，都使用这一规则。`content` 为空时不写 IM 消息。
+
+工具调用使用：
+
+```text
+cmd_request_id = "cmd:{model_request_id}:{tool_call_index}"
+```
+
+`cmd_request_id` 是 Agent 状态和 WAL timeout 使用的业务关联键，不写入 `cmd.v1` payload。
+`cmd.v1` 任务 ID是实际 request 消息的 OpenEvent `seq`。工具结果进入下一条 WAL 的
+`input_event_refs`；这些关系只关联具体消息和具体调用，不表达更高层任务状态。
+
+Cmd request 超时事件写入当前 session 的 WAL channel：
 
 ```json
 {
-  "kind": "llm.request.prepare",
-  "ts_ms": 1710000000000,
-  "pre_llm_seq": 12340,
-  "user_message_seqs": [12345, 12346]
+  "kind": "cmd.request.timeout",
+  "timeout_id": "cmd-timeout:cmd:agent:agent-session-001:wal:12345:retry:1:0",
+  "ts_ms": 1710000300000,
+  "cmd_request_id": "cmd:agent:agent-session-001:wal:12345:retry:1:0",
+  "cmd_request_seq": 12350,
+  "tool_call_id": "call_exec_1",
+  "tool_name": "exec"
 }
 ```
 
-规则：
+`timeout_id = "cmd-timeout:{cmd_request_id}"`，在 WAL channel 内唯一。`cmd_request_seq` 必须指向当前
+session Cmd channel 中内容匹配的请求；`tool_call_id` 和 `tool_name` 必须匹配已接受的 assistant
+tool call。达到 `agent.cmd_result_timeout_ms` 后，Agent 必须先记录 Cmd channel 确定水位并 Fetch 到该
+水位；只有确认结果不存在，才按第 5 节的发布对账算法写超时事件。相同 ID 内容冲突属于一致性错误。
 
-- `pre_llm_seq` MUST 等于本会话在写入 WAL 前已经确认的上一条 `llm.v1 infer.request.seq`。
-- 如果本会话还没有任何 `infer.request`，`pre_llm_seq` MUST 为 `0`。
-- `user_message_seqs` MUST 是非空数组。
-- `user_message_seqs` 的每个元素 MUST 指向本会话 IM channel 中一条需要触发模型调用的用户 `sync.record.seq`。
-- `user_message_seqs` MUST 按 OpenEvent `seq` 严格升序排列，且不得重复。
-- 如果一次模型请求合并多条用户消息，`user_message_seqs` MUST 精确列出本批次所有用户消息 seq，而不是只记录最后一条高水位。
-- `turn_id` 不是 WAL payload 字段；Agent 恢复时通过 WAL channel description 中的 `session_id` 和 payload 中的 `user_message_seqs[0]` 派生 `turn_id = "{session_id}:{user_message_seqs[0]}"`。
-- 写入 WAL 后，对应的 `llm.v1 infer.request.request_id` MUST 使用该 WAL 消息的 OpenEvent `seq` 生成，格式为 `agent:{session_id}:wal:{wal_seq}`。
-- 每一次新的 `infer.request` attempt 前都 MUST 写入一条新的 WAL 记录。任何模型 attempt
-  失败导致的重试都需要新的 WAL 记录。失败 attempt 包括无匹配结果的超时、非 2xx
-  `infer.result`、模型输出无法解析和非法 tool call。
+超时事件映射为对应 `role=tool` 的 `status="error"`、`error_code="timeout"` 结果，`error_message`
+明确表示等待 Cmd 结果超时。它一旦发布，就成为该 tool call 的唯一已接受结果；后来到达的真实 Cmd
+result 标记为 late，不进入 prompt。若对账时先发现真实结果，则不发布超时事件。
 
-## 5. 关联链
+## 7. Retry
 
-首版 Agent 使用 WAL 作为 IM 输入与 LLM 请求之间的前置提交点，但不使用 `infer.request.prev_seq` 或 `send.request.prev_seq`。跨 channel 关联通过 request_id 约定完成：
+- 当前 retry 明确失败或超过 Agent 等待超时后，才允许发布下一个 retry。
+- 新 retry 使用新的 request ID；model-proxy 因而将其视为新的模型调用。
+- 超时只表示 Agent 不再等待旧请求，不要求 model-proxy 或 Provider 已经停止处理。新 retry 发布后，
+  多个模型调用可以同时在 Provider 侧执行。
+- 并发模型调用只允许带来 token、限流和容量开销，不能改变 Agent 状态语义。模型调用本身必须是无
+  业务副作用的推理；只有当前最高 `retry_index` 的有效结果可以产生 IM、Cmd 或 prompt 副作用。
+- 新 retry 一旦发布，更小 `retry_index` 的迟到结果全部为 stale，不发送 content、不执行工具、不推进 prompt。
+- 发布 retry 的结果不确定时，必须先按该 retry 的 request ID完成历史对账，不能直接增加 index。
+- 达到 `max_model_attempts` 后，WAL 保持 blocked；它引用的输入和后续排队事件都不得被跳过。
+- 明确解除 blocked 后，从历史最大 retry index 的下一个值继续。
 
-```text
-im sync.record.seq in agent wal user_message_seqs
-agent wal.seq => model_request_id = "agent:{session_id}:wal:{wal_seq}"
-llm infer.request.request_id == model_request_id
-llm infer.result.request_id == model_request_id
-llm infer.result.prev_seq -> llm infer.request.seq
-im send.request.request_id == "im:{model_request_id}"
-im send.result.request_id == im send.request.request_id
-im send.result.prev_seq -> im send.request.seq
-```
+## 8. 恢复
 
-如果该 turn 在拿到可接受模型结果前达到模型 attempt 上限，Agent 写冻结 `send.request`，
-而不是普通模型回复：
+- 相同 `prepare_id` 和相同 payload 出现多条：采用最小 seq，其余为重复日志。
+- 相同 `prepare_id` 内容不同：一致性错误。
+- `pre_llm_seq`、输入所属 session、引用类型、引用因果关系或引用唯一性不匹配：一致性错误。
+- WAL 存在而模型请求不存在：按精确输入引用重建并补写请求。
+- 当前模型请求存在而结果不存在：未超时继续等待；超时后按上限决定发布下一 retry 或保持 blocked。
+- 旧 retry 的迟到结果：标记 stale，不产生副作用。
+- 当前 retry 的结果已完整校验并接受，且有非空 `content`，但对应
+  `model-content:{model_request_id}` 不存在：对账后补写 IM request。
+- 当前 retry 的结果已完整校验并接受，且有工具调用，但对应 Cmd request 不存在：按工具顺序和确定
+  payload 补写；恢复时也按顺序和 payload 将现有 request 关联到 `cmd_request_id`。
+- 工具结果没有被后续 WAL 引用：重新加入 session 输入队列。
+- Cmd request 没有结果且未超时：继续等待；已超时则先对账，仍无结果时补写 `cmd.request.timeout`。
+- `cmd.request.timeout` 没有被后续 prepare 引用：以 `cmd_timeout` 重新加入 session 输入队列。
 
-```text
-im send.request.request_id == "freeze:{turn_id}"
-```
+恢复不判断一次工作是否开始、完成或关闭。
 
-含义：
+## 9. 版本
 
-- WAL 记录本次准备提交给 LLM 的用户消息 seq 列表，以及写 WAL 时上一条 LLM 请求的 seq。
-- `infer.request` 不填写 `prev_seq`；通过 `request_id` 中的 `wal_seq` 找回对应 WAL。
-- `send.request` 不填写 `prev_seq`；通过 `request_id="im:{model_request_id}"` 关联到被采用的模型请求。
-- 冻结 `send.request` 也是同一 `turn_id` 的终态回复，但它是 Agent 主动写出的暂停提示，
-  不是模型结果回复。它使用 `request_id="freeze:{turn_id}"`，不填写 `prev_seq`。
-- `infer.result.prev_seq` 和 `send.result.prev_seq` 仍按各自协议必填，只表达 result 指向同协议 request 的关系。
-- 命令调用不写入 WAL payload，而是通过
-  `cmd.run.request.request_id="cmd:{model_request_id}:{tool_call_index}"`
-  关联。命令结果会映射为后续模型输入中的 `exec_result` event；输出读取结果会映射为
-  `read_stdout_result` 或 `read_stderr_result` event；WAL 仍只保存
-  `pre_llm_seq` 和 `user_message_seqs`。
-
-## 6. 恢复语义
-
-Agent 重启后扫描 WAL channel 时：
-
-- 如果存在 `llm.request.prepare`，但找不到 `request_id == "agent:{session_id}:wal:{wal_seq}"` 的 `infer.request`，且该 turn 尚未被后续结果或 IM 回复关闭，Agent MUST 基于 OpenEvent 全部历史重建 prompt 和用户消息批次，并使用该 WAL 记录补发对应的 `infer.request`；无法重建时 MUST 进入 error 状态并退出，等待人工检查。
-- 如果存在 `llm.request.prepare`，且已经存在 `request_id == "agent:{session_id}:wal:{wal_seq}"` 的 `infer.request`，Agent MUST 继续按该模型请求的状态恢复，不再为同一 attempt 创建新的 WAL。
-- 如果该模型请求已有失败 attempt 结果，恢复时 MUST 按运行时相同的重试/冻结规则处理；
-  不写普通 IM 失败回复，也不使用该失败 attempt 推进 prompt 状态。
-- 如果某个 WAL 记录的 `user_message_seqs` 已经被后续完成的 turn 覆盖，且没有孤立副作用需要补偿，该 WAL 记录可视为历史记录，不触发补发。
-- 如果 `pre_llm_seq` 与扫描历史恢复出的上一条 LLM 请求 seq 不一致，Agent MUST 记录一致性错误并进入 error 状态退出，避免并发 Agent 进程或配置错误造成重复推进。
-
-WAL 只表达“准备提交”的事实，不表达模型请求已经成功发布。模型请求是否已经发布，以是否存在 `llm.v1 infer.request.request_id == "agent:{session_id}:wal:{wal_seq}"` 为准。
-
-孤立 WAL 的补发由 Agent 设计决定，但必须遵守以下边界：
-
-- 如果 `pre_llm_seq` 对应的上一条模型请求与当前 WAL 拥有相同 `user_message_seqs`，可视为同一 turn 的下一次 attempt。
-- 如果 `pre_llm_seq` 对应的上一条模型请求拥有不同的 `user_message_seqs`，当前 WAL 表示新 turn。
-- 如果 `pre_llm_seq` 为 `0`，当前 WAL 表示该 session 首轮请求。
-- 如果恢复时无法基于 OpenEvent 全部历史重建 prompt 或用户消息批次，不得猜测请求正文；Agent 必须进入 error 状态并退出，等待人工处理。
-- 如果某个 turn 的 attempt 数已经达到 `max_model_attempts`，且最后一个未被接受的 attempt
-  已失败，Agent 将该 session 恢复为 frozen。后续用户 `sync.record` 会解除冻结并开启新 turn。
-
-## 7. 版本策略
-
-- `agent.wal.v1` 是严格 schema。未知 payload 字段均非法，MUST 被拒绝。
-- 首版仅定义 `llm.request.prepare`；其它 `kind` 在 `agent.wal.v1` 中均非法。
-- 新增 payload 字段、新增 `kind`，或改变已定义字段语义，都需要使用新的 channel protocol，如 `agent.wal.v2`。
+- `agent.wal.v1` 使用严格 schema。
+- 当前仍是草案，以本文字段为准，不兼容此前草案数据。
+- 稳定发布后的破坏性变化必须使用新协议版本。

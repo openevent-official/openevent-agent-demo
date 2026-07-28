@@ -16,10 +16,7 @@ openevent:
   grpc_addr: 127.0.0.1:9527
   admin_addr: 127.0.0.1:9528
   storage:
-    metadata_path: openevent-stack/data/openevent/meta
-  store:
-    rocksdb:
-      path: openevent-stack/data/openevent/messages
+    path: openevent-stack/data/openevent
 
 view:
   port: 9999
@@ -62,7 +59,7 @@ agent:
   principal: p_bot
   name: im-model-agent
   system_prompt: "You are an assistant that talks with users through IM. Keep replies concise and accurate."
-  freeze_message: "The model service is temporarily unavailable. The session is paused. Send another message to continue."
+  cmd_result_timeout_ms: 330000
 
 channels:
   visibility: private

@@ -9,6 +9,7 @@ import unittest
 from dataclasses import dataclass, field
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 import yaml
 
@@ -24,6 +25,10 @@ def _load_module():
 
 
 reconcile = _load_module()
+
+from runtime_reconciler.process import wait_programs_running
+from runtime_reconciler.state import begin_apply, record_apply_phase
+import runtime_reconciler.cli as reconcile_cli
 
 
 def _spec(root: str | None = None) -> dict:
@@ -46,8 +51,7 @@ def _spec(root: str | None = None) -> dict:
         "openevent": {
             "grpc_addr": "127.0.0.1:9527",
             "admin_addr": "127.0.0.1:9528",
-            "storage": {"metadata_path": str(runtime_root / "data/openevent/meta")},
-            "store": {"rocksdb": {"path": str(runtime_root / "data/openevent/messages")}},
+            "storage": {"path": str(runtime_root / "data/openevent")},
         },
         "principals": {
             "p_worker": 90001,
@@ -147,7 +151,7 @@ class FakeRuntime:
 
 
 class ReconcileRuntimeTests(unittest.TestCase):
-    def test_openevent_storage_paths_are_required(self):
+    def test_openevent_storage_path_is_required(self):
         with tempfile.TemporaryDirectory() as temp:
             data = _spec(temp)
             del data["openevent"]["storage"]
@@ -156,26 +160,17 @@ class ReconcileRuntimeTests(unittest.TestCase):
             with self.assertRaisesRegex(reconcile.SpecError, r"openevent\.storage"):
                 reconcile.parse_spec(path, repo_root=Path(temp))
 
-        with tempfile.TemporaryDirectory() as temp:
-            data = _spec(temp)
-            del data["openevent"]["store"]["rocksdb"]["path"]
-            path = _write_spec(data, Path(temp))
-
-            with self.assertRaisesRegex(reconcile.SpecError, r"openevent\.store\.rocksdb\.path"):
-                reconcile.parse_spec(path, repo_root=Path(temp))
-
-    def test_openevent_storage_paths_render_from_spec(self):
+    def test_openevent_storage_path_renders_from_spec(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             data = _spec(temp)
-            data["openevent"]["storage"]["metadata_path"] = "custom/meta"
-            data["openevent"]["store"]["rocksdb"]["path"] = "custom/messages"
+            data["openevent"]["storage"]["path"] = "custom/openevent"
             spec = reconcile.parse_spec(_write_spec(data, root), repo_root=root)
 
             config = reconcile.render_openevent_config(spec)
 
-            self.assertEqual(config["storage"]["metadata_path"], str(root / "custom/meta"))
-            self.assertEqual(config["store"]["rocksdb"]["path"], str(root / "custom/messages"))
+            self.assertEqual(config["storage"]["path"], str(root / "custom/openevent"))
+            self.assertNotIn("store", config)
 
     def test_normalized_includes_principal_refs_and_resolved_values(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -207,20 +202,34 @@ class ReconcileRuntimeTests(unittest.TestCase):
 
             reconcile.validate_configs(configs)
             im_config = configs["im_syncer"]["data"]
+            model_proxy_config = configs["model_proxy"]["data"]
             agent_config = configs["agent"]["data"]
 
             self.assertEqual(im_config["providers"][0]["name"], "lark")
-            self.assertEqual(im_config["providers"][0]["adapter"], "lark")
+            self.assertNotIn("adapter", im_config["providers"][0])
+            self.assertNotIn("enabled", im_config["providers"][0])
             self.assertEqual(im_config["providers"][0]["options"]["api_base_url"], "https://open.larksuite.com")
             self.assertNotIn(
                 spec.im_worker_principal,
                 {item["principal"] for item in im_config["principal_tokens"]},
             )
             self.assertEqual(len(im_config["mappings"]), 2)
+            self.assertNotIn("status", im_config["mappings"][0])
             self.assertTrue(im_config["mappings"][0]["external_user_id"].startswith("dry-open-id-"))
+            provider = model_proxy_config["providers"][spec.model_provider_name]
+            self.assertEqual(model_proxy_config["channels"], [20001])
+            self.assertNotIn("filter_response_headers", model_proxy_config)
+            self.assertEqual(provider["allowlist"]["methods"], ["POST"])
+            self.assertEqual(
+                provider["allowlist"]["paths"],
+                ["/v1/chat/completions", "/v1/responses"],
+            )
             self.assertEqual(agent_config["sessions"][0]["session_id"], "s1")
             self.assertEqual(agent_config["sessions"][0]["im_channel_id"], 10001)
             self.assertEqual(agent_config["sessions"][0]["cmd_channel_id"], 40001)
+            self.assertNotIn("agent_bot_principal", agent_config["sessions"][0])
+            self.assertEqual(agent_config["agent"]["cmd_result_timeout_ms"], 330000)
+            self.assertNotIn("freeze_message", agent_config["agent"])
             self.assertEqual(agent_config["cmd_worker"]["principal"], 30001)
             self.assertNotIn("from_seq", agent_config["openevent"]["subscribe"])
 
@@ -512,6 +521,74 @@ class ReconcileRuntimeTests(unittest.TestCase):
             for item in plan["configs"].values():
                 self.assertEqual(Path(item["path"]).parent, root / "config")
 
+    def test_apply_state_records_phase_and_failure_separately(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            spec = reconcile.parse_spec(_write_spec(_spec(temp), root), repo_root=root)
+
+            begin_apply(spec)
+            state = reconcile.load_state(spec.paths.state_path)
+            self.assertEqual(state["last_apply"]["status"], "in_progress")
+            self.assertEqual(state["last_apply"]["phase"], "parsed")
+            started_at_ms = state["last_apply"]["started_at_ms"]
+
+            record_apply_phase(spec, "openevent_ready")
+            state = reconcile.load_state(spec.paths.state_path)
+            self.assertEqual(state["last_apply"]["phase"], "openevent_ready")
+            self.assertEqual(state["last_apply"]["started_at_ms"], started_at_ms)
+
+            record_apply_phase(
+                spec,
+                "openevent_ready",
+                status="failed",
+                failed_phase="resources_resolved",
+            )
+            state = reconcile.load_state(spec.paths.state_path)
+            self.assertEqual(state["last_apply"]["status"], "failed")
+            self.assertEqual(state["last_apply"]["phase"], "openevent_ready")
+            self.assertEqual(state["last_apply"]["failed_phase"], "resources_resolved")
+            self.assertIn("completed_at_ms", state["last_apply"])
+            self.assertNotIn("last_apply_status", state)
+            self.assertNotIn("last_apply_ms", state)
+
+    def test_written_runtime_state_stops_at_config_committed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            spec = reconcile.parse_spec(_write_spec(_spec(temp), root), repo_root=root)
+            resolved = reconcile.dry_resolve(spec)
+
+            reconcile.write_runtime_files(spec, resolved, dry_run=False)
+
+            state = reconcile.load_state(spec.paths.state_path)
+            self.assertEqual(state["last_apply"]["status"], "in_progress")
+            self.assertEqual(state["last_apply"]["phase"], "config_committed")
+            self.assertNotIn("last_apply_status", state)
+            self.assertNotIn("last_apply_ms", state)
+
+    def test_apply_failure_records_completed_and_failed_phases(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            spec = reconcile.parse_spec(_write_spec(_spec(temp), root), repo_root=root)
+
+            with (
+                patch.object(reconcile_cli, "write_openevent_config", return_value={"changed": False}),
+                patch.object(reconcile_cli, "restart_changed"),
+                patch.object(reconcile_cli, "ensure_program_running"),
+                patch.object(reconcile_cli, "wait_openevent_ready"),
+                patch.object(
+                    reconcile_cli,
+                    "apply_resolve",
+                    side_effect=reconcile.ApplyError("resource resolution failed"),
+                ),
+            ):
+                with self.assertRaisesRegex(reconcile.ApplyError, "resource resolution failed"):
+                    reconcile_cli._apply(spec, None)
+
+            state = reconcile.load_state(spec.paths.state_path)
+            self.assertEqual(state["last_apply"]["status"], "failed")
+            self.assertEqual(state["last_apply"]["phase"], "openevent_ready")
+            self.assertEqual(state["last_apply"]["failed_phase"], "resources_resolved")
+
     def test_apply_resolution_creates_agent_bot_owned_channels(self):
         with tempfile.TemporaryDirectory() as temp:
             path = _write_spec(_spec(temp), Path(temp))
@@ -521,7 +598,7 @@ class ReconcileRuntimeTests(unittest.TestCase):
 
             tokens, _ = reconcile._resolve_principal_tokens(spec, runtime, None, None, actions)
             provider_sessions = {"s1": "oc_1"}
-            channels = reconcile._resolve_channels(spec, runtime, tokens, provider_sessions, None, actions)
+            channels = reconcile._resolve_channels(spec, runtime, tokens, provider_sessions, {}, actions)
 
             self.assertEqual(channels["s1"].im, 100)
             self.assertEqual(channels["s1"].model, 101)
@@ -556,10 +633,101 @@ class ReconcileRuntimeTests(unittest.TestCase):
                 )
             )
 
-            channels = reconcile._resolve_channels(spec, runtime, tokens, provider_sessions, None, actions)
+            channels = reconcile._resolve_channels(spec, runtime, tokens, provider_sessions, {}, actions)
 
             self.assertEqual(channels["s1"].im, 100)
             self.assertEqual(runtime.channels[-1].creator, spec.agent_principal)
+
+    def test_initialized_session_rejects_explicit_channel_change(self):
+        with tempfile.TemporaryDirectory() as temp:
+            data = _spec(temp)
+            data["sessions"][0]["channel_ids"] = {"im": 77}
+            spec = reconcile.parse_spec(_write_spec(data, Path(temp)), repo_root=Path(temp))
+            runtime = FakeRuntime()
+            actions: list[dict] = []
+            tokens, _ = reconcile._resolve_principal_tokens(spec, runtime, None, None, actions)
+            provider_sessions = {"s1": "oc_1"}
+            binding = reconcile.ChannelIds(im=78, model=79, wal=80, cmd=81)
+
+            with self.assertRaisesRegex(reconcile.ApplyError, r"initialized session channel im\.v1"):
+                reconcile._resolve_channels(
+                    spec,
+                    runtime,
+                    tokens,
+                    provider_sessions,
+                    {"s1": binding},
+                    actions,
+                )
+
+    def test_bound_channel_missing_does_not_discover_replacement(self):
+        with tempfile.TemporaryDirectory() as temp:
+            data = _spec(temp)
+            spec = reconcile.parse_spec(_write_spec(data, Path(temp)), repo_root=Path(temp))
+            runtime = FakeRuntime()
+            actions: list[dict] = []
+            tokens, _ = reconcile._resolve_principal_tokens(spec, runtime, None, None, actions)
+            provider_sessions = {"s1": "oc_1"}
+            session = spec.sessions[0]
+            description = reconcile._stable_json(reconcile._im_description(spec, session, "oc_1"))
+            members = [session.user_principal, spec.agent_principal, spec.im_worker_principal]
+            runtime.channels.append(
+                Channel(
+                    channel_id=77,
+                    name=session.im_channel_name,
+                    visibility=reconcile.VISIBILITY_VALUES[spec.channel_visibility],
+                    protocol=reconcile.PROTOCOL_IM,
+                    description=description,
+                    creator=spec.agent_principal,
+                    members=members,
+                )
+            )
+            binding = reconcile.ChannelIds(im=78, model=79, wal=80, cmd=81)
+
+            with self.assertRaisesRegex(reconcile.ApplyError, r"bound im\.v1 channel 78"):
+                reconcile._resolve_channels(
+                    spec,
+                    runtime,
+                    tokens,
+                    provider_sessions,
+                    {"s1": binding},
+                    actions,
+                )
+            self.assertEqual([channel.channel_id for channel in runtime.channels], [77])
+
+    def test_partial_channel_state_does_not_initialize_session(self):
+        with tempfile.TemporaryDirectory() as temp:
+            spec = reconcile.parse_spec(_write_spec(_spec(temp), Path(temp)), repo_root=Path(temp))
+            previous = {"channels": {"sessions": {"s1": {"im": {"channel_id": 77}}}}}
+
+            resolved = reconcile.dry_resolve(spec, previous)
+
+            self.assertEqual(resolved.channels["s1"].im, 10001)
+
+    def test_runtime_state_retains_removed_session_channel_binding(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            spec = reconcile.parse_spec(_write_spec(_spec(temp), root), repo_root=root)
+            spec.paths.config_dir.mkdir(parents=True)
+            previous = {
+                "version": "v1",
+                "channels": {
+                    "sessions": {
+                        "removed": {
+                            "im": {"channel_id": 1},
+                            "model": {"channel_id": 2},
+                            "wal": {"channel_id": 3},
+                            "cmd": {"channel_id": 4},
+                        }
+                    }
+                },
+            }
+            spec.paths.state_path.write_text(yaml.safe_dump(previous), encoding="utf-8")
+
+            reconcile.write_runtime_files(spec, reconcile.dry_resolve(spec), dry_run=False)
+
+            state = reconcile.load_state(spec.paths.state_path)
+            self.assertEqual(state["channels"]["sessions"]["removed"]["cmd"]["channel_id"], 4)
+            self.assertIn("s1", state["channels"]["sessions"])
 
     def test_restart_order_and_force_restart_downstream(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -612,6 +780,27 @@ class ReconcileRuntimeTests(unittest.TestCase):
                 reconcile.subprocess.run = original
 
             self.assertEqual([call[1] for call in calls], ["status", "start"])
+
+    def test_wait_programs_running_checks_every_program(self):
+        with tempfile.TemporaryDirectory() as temp:
+            spec = reconcile.parse_spec(_write_spec(_spec(temp), Path(temp)), repo_root=Path(temp))
+            calls = []
+            original = reconcile.subprocess.run
+
+            def fake_run(args, check=False, capture_output=False, text=False):
+                calls.append(args)
+                return type("Result", (), {"returncode": 0, "stdout": "RUNNING", "stderr": ""})()
+
+            try:
+                reconcile.subprocess.run = fake_run
+                wait_programs_running(spec, timeout_s=0.1)
+            finally:
+                reconcile.subprocess.run = original
+
+            self.assertEqual(
+                {call[-1] for call in calls},
+                set(spec.supervisor_programs.values()),
+            )
 
 
 if __name__ == "__main__":

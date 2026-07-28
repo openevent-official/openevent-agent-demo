@@ -18,11 +18,15 @@ Options:
 
 Environment overrides:
   OPENEVENT_URL                  default: https://github.com/openevent-official/openevent.git
-  OPENEVENT_SDK_URL              default: https://github.com/openevent-official/openevent-sdk.git
+  OPENEVENT_REF                  pinned default commit; accepts a commit or tag
   OPENEVENT_MODULES_IM_URL       default: https://github.com/openevent-official/openevent-modules-im.git
+  OPENEVENT_MODULES_IM_REF       pinned default commit; accepts a commit or tag
   OPENEVENT_MODEL_PROXY_URL      default: https://github.com/openevent-official/openevent-modules-model-proxy.git
+  OPENEVENT_MODEL_PROXY_REF      pinned default commit; accepts a commit or tag
   OPENEVENT_MODULES_CMD_URL      default: https://github.com/openevent-official/openevent-modules-cmd.git
+  OPENEVENT_MODULES_CMD_REF      pinned default commit; accepts a commit or tag
   OPENEVENT_VIEW_URL             default: https://github.com/openevent-official/openevent-view.git
+  OPENEVENT_VIEW_REF             pinned default commit; accepts a commit or tag
   PYTHON_BIN                     default: python3
   JOBS                           default: nproc result, or 2
 
@@ -110,23 +114,25 @@ Commit, stash, or remove that directory before rerunning."
 }
 
 clone_or_update() {
-  local name="$1" url="$2" dir="$3"
+  local name="$1" url="$2" ref="$3" dir="$4"
   if [ -d "$dir/.git" ]; then
     require_clean_or_empty_checkout "$dir"
-    log "updating $name in $dir"
+    log "updating $name checkout in $dir"
     git -C "$dir" remote set-url origin "$url"
-    git -C "$dir" fetch --prune origin || fail "failed to fetch $name from $url"
-    git -C "$dir" pull --ff-only || fail "failed to fast-forward $name; remove local divergence in $dir"
-    return
-  fi
-
-  if [ -e "$dir" ]; then
-    fail "$name target exists but is not a git checkout: $dir"
-  fi
-
-  log "cloning $name from $url"
-  git clone "$url" "$dir" || fail "failed to clone $name from $url
+  else
+    if [ -e "$dir" ]; then
+      fail "$name target exists but is not a git checkout: $dir"
+    fi
+    log "cloning $name from $url"
+    git clone --no-checkout "$url" "$dir" || fail "failed to clone $name from $url
 Check network access and the public GitHub repository URL."
+  fi
+
+  git -C "$dir" fetch --prune --tags origin "$ref" || fail "failed to fetch $name ref $ref from $url"
+  git -C "$dir" checkout --detach FETCH_HEAD || fail "failed to check out $name ref $ref"
+  local actual
+  actual="$(git -C "$dir" rev-parse HEAD)"
+  log "$name pinned at $actual"
 }
 
 install_apt_packages() {
@@ -235,11 +241,15 @@ done
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 OPENEVENT_URL="${OPENEVENT_URL:-https://github.com/openevent-official/openevent.git}"
-OPENEVENT_SDK_URL="${OPENEVENT_SDK_URL:-https://github.com/openevent-official/openevent-sdk.git}"
+OPENEVENT_REF="${OPENEVENT_REF:-a1d2d97d0870dd5fc61af329bf0cb94cd124aafa}"
 OPENEVENT_MODULES_IM_URL="${OPENEVENT_MODULES_IM_URL:-https://github.com/openevent-official/openevent-modules-im.git}"
+OPENEVENT_MODULES_IM_REF="${OPENEVENT_MODULES_IM_REF:-8aebcb35506d7e60384b548800830273bc1781f7}"
 OPENEVENT_MODEL_PROXY_URL="${OPENEVENT_MODEL_PROXY_URL:-https://github.com/openevent-official/openevent-modules-model-proxy.git}"
+OPENEVENT_MODEL_PROXY_REF="${OPENEVENT_MODEL_PROXY_REF:-60fe36fe30fa5b92b1dffa535082686ea28e75ef}"
 OPENEVENT_MODULES_CMD_URL="${OPENEVENT_MODULES_CMD_URL:-https://github.com/openevent-official/openevent-modules-cmd.git}"
+OPENEVENT_MODULES_CMD_REF="${OPENEVENT_MODULES_CMD_REF:-bc92ef9c4b46295e098021d5a637c8c7b09dc9b0}"
 OPENEVENT_VIEW_URL="${OPENEVENT_VIEW_URL:-https://github.com/openevent-official/openevent-view.git}"
+OPENEVENT_VIEW_REF="${OPENEVENT_VIEW_REF:-9127056bf0a88f7091c3d1b21e4186ea60180706}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || printf '2')}"
 export PYTHONDONTWRITEBYTECODE=1
 export PIP_NO_COMPILE=1
@@ -263,12 +273,11 @@ check_cmake_version
 
 run mkdir -p "$SRC_DIR"
 
-clone_or_update "OPENEVENT" "$OPENEVENT_URL" "$SRC_DIR/openevent"
-clone_or_update "OPENEVENT_SDK" "$OPENEVENT_SDK_URL" "$SRC_DIR/openevent-sdk"
-clone_or_update "OPENEVENT_MODULES_IM" "$OPENEVENT_MODULES_IM_URL" "$SRC_DIR/openevent-modules-im"
-clone_or_update "OPENEVENT_MODEL_PROXY" "$OPENEVENT_MODEL_PROXY_URL" "$SRC_DIR/openevent-modules-model-proxy"
-clone_or_update "OPENEVENT_MODULES_CMD" "$OPENEVENT_MODULES_CMD_URL" "$SRC_DIR/openevent-modules-cmd"
-clone_or_update "OPENEVENT_VIEW" "$OPENEVENT_VIEW_URL" "$SRC_DIR/openevent-view"
+clone_or_update "OPENEVENT" "$OPENEVENT_URL" "$OPENEVENT_REF" "$SRC_DIR/openevent"
+clone_or_update "OPENEVENT_MODULES_IM" "$OPENEVENT_MODULES_IM_URL" "$OPENEVENT_MODULES_IM_REF" "$SRC_DIR/openevent-modules-im"
+clone_or_update "OPENEVENT_MODEL_PROXY" "$OPENEVENT_MODEL_PROXY_URL" "$OPENEVENT_MODEL_PROXY_REF" "$SRC_DIR/openevent-modules-model-proxy"
+clone_or_update "OPENEVENT_MODULES_CMD" "$OPENEVENT_MODULES_CMD_URL" "$OPENEVENT_MODULES_CMD_REF" "$SRC_DIR/openevent-modules-cmd"
+clone_or_update "OPENEVENT_VIEW" "$OPENEVENT_VIEW_URL" "$OPENEVENT_VIEW_REF" "$SRC_DIR/openevent-view"
 
 log "initializing OpenEvent server submodules"
 git -C "$SRC_DIR/openevent" submodule update --init --recursive || fail "failed to initialize OpenEvent submodules"
@@ -284,7 +293,7 @@ run cmake --build "$SRC_DIR/openevent/build" --target openevent_server -j "$JOBS
 SERVER_BIN="$SRC_DIR/openevent/build/openevent_server"
 [ -x "$SERVER_BIN" ] || fail "OpenEvent server binary was not created: $SERVER_BIN"
 
-run make -C "$SRC_DIR/openevent-sdk" PYTHON="$VENV_PYTHON" INSTALL_ARGS="--no-compile" install
+run make -C "$SRC_DIR/openevent/openevent-sdk" PYTHON="$VENV_PYTHON" INSTALL_ARGS="--no-compile" install
 run make -C "$SRC_DIR/openevent-modules-im" PYTHON="$VENV_PYTHON" INSTALL_ARGS="--no-compile" install
 run make -C "$SRC_DIR/openevent-modules-model-proxy" PYTHON="$VENV_PYTHON" INSTALL_ARGS="--no-compile" install
 run make -C "$SRC_DIR/openevent-modules-cmd" PYTHON="$VENV_PYTHON" INSTALL_ARGS="--no-compile" install

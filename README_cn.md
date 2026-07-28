@@ -97,8 +97,8 @@ source runtime/venv/bin/activate
 | --- | --- |
 | [docs/UBUNTU_ENVIRONMENT_cn.md](docs/UBUNTU_ENVIRONMENT_cn.md) | Ubuntu 24.04 环境和 venv 准备 |
 | [docs/RUNTIME_RECONCILER_cn.md](docs/RUNTIME_RECONCILER_cn.md) | 声明式运行配置、生成文件、token/channel 协调 |
-| [docs/IM_MODEL_AGENT_cn.md](docs/IM_MODEL_AGENT_cn.md) | Agent 配置和消息处理流程 |
-| [docs/AGENT_WAL_PROTOCOL_cn.md](docs/AGENT_WAL_PROTOCOL_cn.md) | Agent WAL channel 和 payload 协议 |
+| [docs/IM_MODEL_AGENT_cn.md](docs/IM_MODEL_AGENT_cn.md) | Agent 配置和持续处理概览 |
+| [docs/AGENT_WAL_PROTOCOL_cn.md](docs/AGENT_WAL_PROTOCOL_cn.md) | WAL 字段、稳定 ID、发布对账、retry/blocked 和恢复协议 |
 
 相关项目文档：
 

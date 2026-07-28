@@ -3,9 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import time
-from types import SimpleNamespace
 from typing import Any
 
+from grpc import RpcError, StatusCode
 from openevent.cmd_sdk import (
     CmdOutputReadRequest,
     CmdOutputReadRequestInput,
@@ -14,36 +14,45 @@ from openevent.cmd_sdk import (
     CmdRunRequestInput,
     CmdRunResult,
     create_client as create_cmd_client,
+    parse_message as parse_cmd_message,
 )
 from openevent.im_sdk import SendRequestInput, create_client as create_im_client
-from openevent.model_proxy_sdk import (
-    InferRequest,
-    InferRequestInput,
-    InferResult,
-    create_client as create_model_client,
-)
+from openevent.model_proxy_sdk import InferRequest, InferRequestInput, InferResult, create_client as create_model_client
 from openevent.model_proxy_sdk import parse_message as parse_llm_message
 from openevent.model_proxy_sdk import publish_infer_request
 
 from .config import AgentRuntimeConfig, ConfigError
 from .prompt import (
+    AssistantMessage,
+    ToolCall,
     UserPromptMessage,
-    append_assistant_message,
-    append_user_events,
     build_model_messages,
     command_result_event,
-    extract_assistant_text,
-    extract_tool_calls,
     extract_user_text,
     model_tools,
     output_read_event,
-    parse_tool_call,
+    parse_assistant_message,
+    system_prompt_content,
+    tool_result_message,
+    trim_messages,
+    visible_content,
 )
-from .state import AgentRuntimeState, AttemptState, CommandState, SessionState, parse_cmd_request_id
-from .wal import encode_prepare, freeze_request_id, model_request_id, now_ms, parse_prepare
+from .state import AgentRuntimeState, AgentStateError, AttemptState, CommandState, ImRequestState, SessionState
+from .wal import CmdTimeout, InputRef, WalPrepare, encode_cmd_timeout, encode_prepare, model_request_id, now_ms, parse_wal
+
 
 LOG = logging.getLogger(__name__)
 DEFAULT_OUTPUT_READ_BYTES = 65536
+_GUARANTEED_NOT_COMMITTED = frozenset(
+    {
+        StatusCode.UNAUTHENTICATED,
+        StatusCode.PERMISSION_DENIED,
+        StatusCode.NOT_FOUND,
+        StatusCode.INVALID_ARGUMENT,
+        StatusCode.RESOURCE_EXHAUSTED,
+        StatusCode.ABORTED,
+    }
+)
 
 
 class ImModelAgent:
@@ -57,73 +66,64 @@ class ImModelAgent:
         self.stopped = False
 
     def start(self) -> None:
-        scan_end_seq = self.recover()
+        scan_end = self.recover()
         self.process_ready_sessions()
-        self.consume(scan_end_seq + 1)
+        self.consume(scan_end + 1)
 
     def stop(self) -> None:
         self.stopped = True
 
     def recover(self) -> int:
         self.validate_channels()
-        status = self.openevent_client.get_status(self.config.agent.principal, self.config.agent.token)
-        scan_end_seq = int(status.max_seq)
-        from_seq = 1
-        while from_seq <= scan_end_seq:
+        scan_end = int(self.openevent_client.get_status(self.config.agent.principal, self.config.agent.token).max_seq)
+        next_seq = 1
+        while next_seq <= scan_end:
             response = self.openevent_client.fetch(
                 self.config.agent.principal,
                 self.config.agent.token,
-                from_seq=from_seq,
+                from_seq=next_seq,
                 limit=1000,
                 only_my_recipient=False,
                 channels=self._fetch_channels(),
             )
             for message in response.messages:
-                if int(message.seq) <= scan_end_seq:
+                if int(message.seq) <= scan_end:
                     self.observe_message(message, realtime=False)
-            next_seq = int(response.next_seq)
-            if next_seq <= from_seq:
-                raise RuntimeError("Fetch did not advance next_seq during recovery")
-            from_seq = next_seq
-        self.state.max_seen_seq = scan_end_seq
-        self._recover_session_progress()
-        return scan_end_seq
+            advanced = int(response.next_seq)
+            if advanced <= next_seq:
+                raise RuntimeError("Fetch did not advance during recovery")
+            next_seq = advanced
+        self.state.max_seen_seq = scan_end
+        self._rebuild_sessions()
+        return scan_end
 
     def validate_channels(self) -> None:
         for session in self.config.enabled_sessions:
             im = self._get_channel(session.im_channel_id)
             if im.protocol != "im.v1":
                 raise ConfigError(f"channel {session.im_channel_id} protocol must be im.v1")
-            im_desc = _json_description(im.description, session.im_channel_id)
-            if im_desc.get("session_type") != "p2p":
+            description = _json_description(im.description, session.im_channel_id)
+            if description.get("session_type") != "p2p":
                 raise ConfigError(f"channel {session.im_channel_id} description.session_type must be p2p")
-            _require_members(
-                im,
-                session.im_channel_id,
-                {session.user_principal, self.config.agent.principal, self.config.im_sync_worker.principal},
-            )
+            _require_members(im, session.im_channel_id, {session.user_principal, self.config.agent.principal, self.config.im_sync_worker.principal})
 
             model = self._get_channel(session.model_channel_id)
             if model.protocol != "llm.v1":
                 raise ConfigError(f"channel {session.model_channel_id} protocol must be llm.v1")
-            _require_members(
-                model,
-                session.model_channel_id,
-                {self.config.agent.principal, self.config.model_proxy.principal},
-            )
+            _require_members(model, session.model_channel_id, {self.config.agent.principal, self.config.model_proxy.principal})
 
             wal = self._get_channel(session.wal_channel_id)
             if wal.protocol != "agent.wal.v1":
                 raise ConfigError(f"channel {session.wal_channel_id} protocol must be agent.wal.v1")
-            wal_desc = _json_description(wal.description, session.wal_channel_id)
-            if wal_desc.get("version") != "v1":
-                raise ConfigError(f"channel {session.wal_channel_id} WAL description.version must be v1")
-            if wal_desc.get("session_id") != session.session_id:
-                raise ConfigError(f"channel {session.wal_channel_id} WAL description.session_id mismatch")
-            if int(wal_desc.get("im_channel_id", 0)) != session.im_channel_id:
-                raise ConfigError(f"channel {session.wal_channel_id} WAL description.im_channel_id mismatch")
-            if int(wal_desc.get("model_channel_id", 0)) != session.model_channel_id:
-                raise ConfigError(f"channel {session.wal_channel_id} WAL description.model_channel_id mismatch")
+            wal_description = _json_description(wal.description, session.wal_channel_id)
+            expected = {
+                "version": "v1",
+                "session_id": session.session_id,
+                "im_channel_id": session.im_channel_id,
+                "model_channel_id": session.model_channel_id,
+            }
+            if any(wal_description.get(key) != value for key, value in expected.items()):
+                raise ConfigError(f"channel {session.wal_channel_id} WAL description mismatch")
             _require_members(wal, session.wal_channel_id, {self.config.agent.principal})
 
             cmd = self._get_channel(session.cmd_channel_id)
@@ -142,578 +142,595 @@ class ImModelAgent:
                 only_my_recipient=self.config.openevent.subscribe.only_my_recipient,
                 channels=self._fetch_channels(),
             )
-            if not response.messages:
-                next_seq = int(response.next_seq)
-                time.sleep(self.config.openevent.subscribe.idle_sleep_ms / 1000)
-                continue
             for message in response.messages:
                 self.observe_message(message, realtime=True)
                 self.state.max_seen_seq = max(self.state.max_seen_seq, int(message.seq))
             next_seq = int(response.next_seq)
             self.process_ready_sessions()
-
-    def _fetch_channels(self) -> tuple[int, ...]:
-        channels: list[int] = []
-        for session in self.config.enabled_sessions:
-            channels.extend([session.im_channel_id, session.model_channel_id, session.wal_channel_id, session.cmd_channel_id])
-        return tuple(dict.fromkeys(channels))
+            if not response.messages:
+                time.sleep(self.config.openevent.subscribe.idle_sleep_ms / 1000)
 
     def observe_message(self, message: Any, realtime: bool) -> None:
         channel_id = int(message.channel_id)
         if channel_id in self.state.sessions_by_im:
-            self._observe_im_message(message)
-            return
-        if channel_id in self.state.sessions_by_wal:
-            self.state.observe_wal(int(message.seq), channel_id, parse_prepare(message.payload))
-            return
-        if channel_id in self.state.sessions_by_model:
-            parsed = parse_llm_message(message)
-            self.state.observe_llm_message(parsed)
-            if isinstance(parsed.payload, InferResult) and realtime:
-                self._handle_model_result(parsed)
-            return
-        if channel_id in self.state.sessions_by_cmd:
-            parsed = self.cmd_client.parse_message(message)
-            if isinstance(parsed.payload, (CmdRunRequest, CmdOutputReadRequest)) and parsed.principal != self.config.agent.principal:
-                return
-            if isinstance(parsed.payload, (CmdRunResult, CmdOutputReadResult)):
-                if parsed.principal != self.config.cmd_worker.principal:
-                    return
-                if self.config.agent.principal not in parsed.recipients:
-                    return
-            command = self.state.observe_cmd_message(parsed)
-            if command is not None and isinstance(parsed.payload, (CmdRunResult, CmdOutputReadResult)) and realtime:
-                self._handle_cmd_result(parsed.channel_id, command)
+            self._observe_im(message)
+        elif channel_id in self.state.sessions_by_wal:
+            self._observe_wal(message)
+        elif channel_id in self.state.sessions_by_model:
+            self._observe_model(message, realtime)
+        elif channel_id in self.state.sessions_by_cmd:
+            self._observe_cmd(message, realtime)
 
     def process_ready_sessions(self) -> None:
         for session in self.state.sessions_by_id.values():
-            if session.in_flight_turn_id:
-                self._check_in_flight_timeout(session)
-                continue
-            if session.frozen or not session.pending:
-                continue
-            self._start_turn(session)
+            self._advance(session)
 
-    def _observe_im_message(self, message: Any) -> None:
-        try:
-            parsed = self.im_client.parse_message(message)
-        except Exception as exc:
-            LOG.warning("im payload parse failed", extra={"seq": int(message.seq), "error": str(exc)})
+    def unblock(self, session_id: str) -> None:
+        session = self.state.sessions_by_id[session_id]
+        wal = session.active_wal
+        if wal is None or not wal.blocked:
             return
+        wal.blocked = False
+        self._publish_model_request(session, wal, wal.latest_retry + 1, self._retry_messages(wal))
+
+    def _observe_im(self, message: Any) -> None:
+        parsed = self.im_client.parse_message(message)
         session = self.state.sessions_by_im[parsed.channel_id]
         if parsed.kind == "send.request" and parsed.principal == self.config.agent.principal:
-            self.state.observe_im_send_request(session, parsed)
+            self.state.observe_im_request(session, parsed)
             return
         if parsed.kind == "send.result" and parsed.principal == self.config.im_sync_worker.principal:
-            self.state.observe_im_send_result(session, parsed)
             if parsed.data.get("status") == "FAILED":
-                session.frozen = True
+                LOG.warning("ignoring legacy failed IM result", extra={"request_id": parsed.request_id})
+                return
+            self.state.observe_im_result(session, parsed)
             return
-        if parsed.kind != "sync.record":
-            return
-        if self.state.is_agent_echo(session, parsed, self.config.agent.principal):
+        if parsed.kind != "sync.record" or self.state.is_agent_echo(session, parsed, self.config.agent.principal):
             return
         if parsed.principal != session.config.user_principal:
             return
-        user_message = UserPromptMessage(
-            seq=parsed.seq,
-            event_ms=parsed.event_ms,
-            text=extract_user_text(parsed.data, self.config.agent.non_text_placeholder),
-        )
-        if session.frozen:
-            session.frozen = False
-        self.state.observe_user_message(session, user_message)
-
-    def _start_turn(self, session: SessionState) -> None:
-        pending = list(session.pending)
-        if not pending:
-            return
-        turn = f"{session.config.session_id}:{pending[0].seq}"
-        if turn in session.terminal_send_by_turn:
-            session.remove_pending_seqs(tuple(item.seq for item in pending))
-            return
-        messages = build_model_messages(
-            system_prompt=self.config.agent.system_prompt,
-            previous_messages=session.prompt_messages,
-            pending_user_messages=pending,
-            max_context_messages=self.config.agent.max_context_messages,
-        )
-        self._publish_attempt(session, pending, messages, turn)
-
-    def _publish_attempt(
-        self,
-        session: SessionState,
-        pending: list[UserPromptMessage],
-        messages: list[dict[str, Any]],
-        turn: str,
-    ) -> None:
-        user_message_seqs = tuple(item.seq for item in pending)
-        wal_payload = encode_prepare(
-            pre_llm_seq=session.last_llm_request_seq,
-            user_message_seqs=user_message_seqs,
-            ts_ms=now_ms(),
-        )
-        wal_response = self.openevent_client.publish_auto_seq(
-            principal=self.config.agent.principal,
-            token=self.config.agent.token,
-            channel_id=session.config.wal_channel_id,
-            payload=wal_payload,
-            recipients=(),
-        )
-        wal_seq = int(wal_response.seq)
-        self.state.observe_wal(wal_seq, session.config.wal_channel_id, parse_prepare(wal_payload))
-        request_id = model_request_id(session.config.session_id, wal_seq)
-        ts_ms = now_ms()
-        body = {
-            "model": self.config.agent.model,
-            "messages": messages,
-            "tools": model_tools(),
-            "stream": False,
-        }
-        request_seq = publish_infer_request(
-            self.model_client,
-            channel_id=session.config.model_channel_id,
-            principal=self.config.agent.principal,
-            req=InferRequestInput(
-                request_id=request_id,
-                method="POST",
-                path="/v1/chat/completions",
-                body=body,
-                ts_ms=ts_ms,
+        self.state.observe_user(
+            session,
+            UserPromptMessage(
+                seq=parsed.seq,
+                event_ms=parsed.event_ms,
+                text=extract_user_text(parsed.data, self.config.agent.non_text_placeholder),
             ),
         )
-        attempt = session.attempts[wal_seq]
-        attempt.request_seq = request_seq
-        attempt.request = InferRequest(
-            request_id=request_id,
-            method="POST",
-            path="/v1/chat/completions",
-            ts_ms=ts_ms,
-            body=body,
-        )
-        session.last_llm_request_seq = max(session.last_llm_request_seq, request_seq)
-        session.in_flight_turn_id = turn
 
-    def _recover_session_progress(self) -> None:
-        for session in self.state.sessions_by_id.values():
-            self._rebuild_prompt_from_terminal_turns(session)
-            self._recover_model_results_without_im_reply(session)
-            self._recover_orphan_wal(session)
+    def _observe_wal(self, message: Any) -> None:
+        session = self.state.sessions_by_wal[int(message.channel_id)]
+        parsed = parse_wal(message.payload)
+        if isinstance(parsed, WalPrepare):
+            self.state.observe_prepare(session, int(message.seq), parsed)
+        else:
+            self.state.observe_timeout(session, int(message.seq), parsed)
 
-    def _rebuild_prompt_from_terminal_turns(self, session: SessionState) -> None:
-        prompt_messages: list[dict[str, Any]] = []
-        for attempt in sorted(session.attempts.values(), key=lambda item: item.request_seq or 0):
-            if attempt.wal.turn_id not in session.terminal_send_by_turn:
-                continue
-            successful_messages = self._prompt_messages_for_successful_attempt(attempt)
-            if successful_messages is not None:
-                prompt_messages = successful_messages
-        session.prompt_messages = prompt_messages
-
-    def _recover_model_results_without_im_reply(self, session: SessionState) -> None:
-        attempts_by_turn: dict[str, list[AttemptState]] = {}
-        for attempt in session.attempts.values():
-            attempts_by_turn.setdefault(attempt.wal.turn_id, []).append(attempt)
-        ordered_turns = sorted(
-            attempts_by_turn,
-            key=lambda turn: min(item.wal.seq for item in attempts_by_turn[turn]),
-        )
-        for turn in ordered_turns:
-            if turn in session.terminal_send_by_turn:
-                continue
-            attempts = sorted(attempts_by_turn[turn], key=lambda item: item.wal.seq)
-            latest = attempts[-1]
-            if latest.request is None or latest.result is None:
-                continue
-            self._handle_model_result(SimpleNamespace(channel_id=session.config.model_channel_id, payload=latest.result))
-            if session.in_flight_turn_id == turn or turn in session.terminal_send_by_turn or session.frozen:
-                break
-
-    def _recover_orphan_wal(self, session: SessionState) -> None:
-        if session.in_flight_turn_id:
-            return
-        attempts = sorted(session.attempts.values(), key=lambda item: item.wal.seq)
-        for attempt in attempts:
-            if attempt.request is not None or attempt.wal.turn_id in session.terminal_send_by_turn:
-                continue
-            messages = self._messages_for_orphan_wal(session, attempt)
-            self._publish_model_request_for_wal(session, attempt, messages)
-            return
-
-    def _messages_for_orphan_wal(self, session: SessionState, attempt: Any) -> list[dict[str, Any]]:
-        same_turn_requests = [
-            item
-            for item in session.attempts.values()
-            if item.wal.turn_id == attempt.wal.turn_id and item.request is not None
-        ]
-        if same_turn_requests:
-            latest = max(same_turn_requests, key=lambda item: item.request_seq or 0)
-            if latest.result is not None:
-                raw_tool_calls = extract_tool_calls(latest.result.body)
-                parsed_tool_calls = self._parse_tool_calls_or_fail(session, latest, raw_tool_calls) if raw_tool_calls else None
-                if parsed_tool_calls:
-                    events = self._tool_result_events(session, latest, parsed_tool_calls)
-                    if events is not None:
-                        return append_user_events(
-                            list(latest.request.body["messages"]),
-                            events,
-                            self.config.agent.max_context_messages,
-                        )
-            return list(latest.request.body["messages"])
-        pending = []
-        for seq in attempt.wal.payload.user_message_seqs:
-            message = self.state.user_messages.get(seq)
-            if message is None:
-                raise RuntimeError(f"cannot rebuild orphan WAL {attempt.wal.seq}: missing user message {seq}")
-            pending.append(message)
-        return build_model_messages(
-            system_prompt=self.config.agent.system_prompt,
-            previous_messages=session.prompt_messages,
-            pending_user_messages=pending,
-            max_context_messages=self.config.agent.max_context_messages,
-        )
-
-    def _publish_model_request_for_wal(
-        self,
-        session: SessionState,
-        attempt: Any,
-        messages: list[dict[str, Any]],
-    ) -> int:
-        request_id = model_request_id(session.config.session_id, attempt.wal.seq)
-        ts_ms = now_ms()
-        body = {"model": self.config.agent.model, "messages": messages, "tools": model_tools(), "stream": False}
-        request_seq = publish_infer_request(
-            self.model_client,
-            channel_id=session.config.model_channel_id,
-            principal=self.config.agent.principal,
-            req=InferRequestInput(
-                request_id=request_id,
-                method="POST",
-                path="/v1/chat/completions",
-                body=body,
-                ts_ms=ts_ms,
-            ),
-        )
-        attempt.request_seq = request_seq
-        attempt.request = InferRequest(
-            request_id=request_id,
-            method="POST",
-            path="/v1/chat/completions",
-            ts_ms=ts_ms,
-            body=body,
-        )
-        session.last_llm_request_seq = max(session.last_llm_request_seq, request_seq)
-        session.in_flight_turn_id = attempt.wal.turn_id
-        return request_seq
-
-    def _handle_model_result(self, message: Any) -> None:
-        parsed = message.payload
-        session = self.state.sessions_by_model.get(message.channel_id)
-        if session is None:
-            return
-        matched_attempt = self._find_attempt_for_result(session, parsed)
-        if matched_attempt is None or matched_attempt.wal.turn_id in session.terminal_send_by_turn:
-            return
-        if matched_attempt is not self._latest_attempt_for_turn(session, matched_attempt.wal.turn_id):
-            LOG.info("ignoring stale model result", extra={"request_id": parsed.request_id})
-            return
-        if parsed.status_code < 200 or parsed.status_code >= 300:
-            LOG.warning("model result non-2xx", extra={"request_id": parsed.request_id, "status_code": parsed.status_code})
-            self._handle_attempt_failure(session, matched_attempt, "model_result_non_2xx")
-            return
-        raw_tool_calls = extract_tool_calls(parsed.body)
-        if raw_tool_calls:
-            parsed_tool_calls = self._parse_tool_calls_or_fail(session, matched_attempt, raw_tool_calls)
-            if parsed_tool_calls is None:
+    def _observe_model(self, message: Any, realtime: bool) -> None:
+        parsed = parse_llm_message(message)
+        session = self.state.sessions_by_model[parsed.channel_id]
+        attempt: AttemptState | None
+        if isinstance(parsed.payload, InferRequest):
+            if parsed.principal != self.config.agent.principal:
                 return
-            self._continue_tool_chain(session, matched_attempt, parsed_tool_calls)
-            return
-        assistant_text = extract_assistant_text(parsed.body)
-        if not assistant_text:
-            LOG.warning("model result missing assistant text", extra={"request_id": parsed.request_id})
-            self._handle_attempt_failure(session, matched_attempt, "model_result_missing_assistant_text")
-            return
-        turn = matched_attempt.wal.turn_id
-        send_seq = self._publish_im_reply(session, f"im:{parsed.request_id}", assistant_text)
-        session.terminal_send_by_turn[turn] = SimpleNamespace(seq=send_seq, request_id=f"im:{parsed.request_id}")
-        session.prompt_messages = self._prompt_messages_for_successful_attempt(matched_attempt, assistant_text) or []
-        session.in_flight_turn_id = None
+            attempt = self.state.observe_model_request(session, parsed.seq, parsed.payload)
+        elif isinstance(parsed.payload, InferResult):
+            if parsed.principal != self.config.model_proxy.principal or self.config.agent.principal not in parsed.recipients:
+                return
+            attempt = self.state.observe_model_result(session, parsed.seq, parsed.payload)
+            if attempt is not None:
+                if realtime:
+                    self._accept_or_retry(session, attempt)
+                elif 200 <= parsed.payload.status_code < 300:
+                    assistant = parse_assistant_message(parsed.payload.body)
+                    if assistant is not None:
+                        attempt.assistant, attempt.accepted = assistant, True
 
-    def _parse_tool_calls_or_fail(
-        self,
-        session: SessionState,
-        attempt: AttemptState,
-        raw_tool_calls: list[Any],
-    ) -> list[tuple[int, str, dict[str, Any]]] | None:
-        parsed: list[tuple[int, str, dict[str, Any]]] = []
-        for index, raw in enumerate(raw_tool_calls):
-            tool_call = parse_tool_call(raw)
-            if tool_call is None:
-                LOG.warning("model result invalid tool call", extra={"request_id": attempt.request_id, "tool_call_index": index})
-                self._handle_attempt_failure(session, attempt, "model_result_invalid_tool_call")
-                return None
-            name, arguments = tool_call
-            parsed.append((index, name, arguments))
-        return parsed
+    def _observe_cmd(self, message: Any, realtime: bool) -> None:
+        parsed = parse_cmd_message(message)
+        session = self.state.sessions_by_cmd[parsed.channel_id]
+        payload = parsed.payload
+        if isinstance(payload, (CmdRunRequest, CmdOutputReadRequest)):
+            if parsed.principal != self.config.agent.principal:
+                return
+            existing = session.commands_by_seq.get(parsed.seq)
+            if existing is not None:
+                if existing.request != payload:
+                    raise AgentStateError(f"conflicting Cmd request at seq {parsed.seq}")
+                return
+            pending = self._next_unbound_tool(session)
+            if pending is None:
+                raise AgentStateError(f"Cmd request {parsed.seq} has no pending accepted tool call")
+            attempt, index, tool_call = pending
+            if not _cmd_request_matches_tool(payload, tool_call):
+                raise AgentStateError(f"Cmd request {parsed.seq} does not match the next accepted tool call")
+            assert attempt.request is not None
+            model_id = attempt.request.request_id
+            request_id = f"cmd:{model_id}:{index}"
+            command = session.commands_by_id.setdefault(request_id, CommandState(model_id, index, tool_call))
+            command.request_seq, command.request = parsed.seq, payload
+            session.commands_by_seq[parsed.seq] = command
+            return
+        if isinstance(payload, (CmdRunResult, CmdOutputReadResult)):
+            if parsed.principal != self.config.cmd_worker.principal or self.config.agent.principal not in parsed.recipients:
+                return
+            command = session.commands_by_seq.get(payload.prev_seq)
+            if command is None or command.timeout is not None:
+                return
+            command.result_seq, command.result = parsed.seq, payload
+            ref_type = "exec_result" if isinstance(payload, CmdRunResult) else f"read_{command.request.stream}_result"
+            session.pending_tool_refs.setdefault(parsed.seq, InputRef(ref_type, parsed.seq))
+            if realtime:
+                self._advance(session)
 
-    def _continue_tool_chain(
-        self,
-        session: SessionState,
-        attempt: AttemptState,
-        tool_calls: list[tuple[int, str, dict[str, Any]]],
-    ) -> None:
-        if attempt.request is None:
+    def _rebuild_sessions(self) -> None:
+        for session in self.state.sessions_by_id.values():
+            session.prompt_messages = []
+            for wal in sorted(session.wal_by_seq.values(), key=lambda item: item.seq):
+                attempt = wal.latest_attempt
+                if attempt is None or attempt.result is None:
+                    continue
+                self._accept_or_retry(session, attempt, recovery=True)
+
+    def _advance(self, session: SessionState) -> None:
+        wal = session.active_wal
+        if wal is not None:
+            if wal.blocked:
+                return
+            attempt = wal.latest_attempt
+            if attempt is None:
+                self._publish_model_request(session, wal, 1, self._messages_for_prepare(session, wal.payload))
+                return
+            if attempt.result is None:
+                if attempt.request and now_ms() >= attempt.request.ts_ms + self.config.agent.model_timeout_ms:
+                    self._retry(session, attempt, "model request timeout")
+                return
+            if not attempt.accepted:
+                self._accept_or_retry(session, attempt)
+                return
+            if attempt.assistant and attempt.assistant.tool_calls:
+                self._advance_tools(session, attempt)
+                return
+        if session.pending_users or session.pending_tool_refs:
+            self._publish_prepare(session)
+
+    def _publish_prepare(self, session: SessionState) -> None:
+        users = tuple(sorted(session.pending_users))
+        refs = tuple(session.pending_tool_refs[seq] for seq in sorted(session.pending_tool_refs))
+        payload = encode_prepare(
+            pre_llm_seq=session.last_llm_request_seq,
+            user_message_seqs=users,
+            input_event_refs=refs,
+        )
+        expected = json.loads(payload.decode("utf-8"))
+        seq = self._reliable_publish(
+            channel_id=session.config.wal_channel_id,
+            stable_id=expected["prepare_id"],
+            expected=expected,
+            publish=lambda: int(self.openevent_client.publish_auto_seq(
+                principal=self.config.agent.principal,
+                token=self.config.agent.token,
+                channel_id=session.config.wal_channel_id,
+                payload=payload,
+                recipients=(),
+            ).seq),
+            decode=lambda message: _wal_identity(message, self.config.agent.principal),
+        )
+        wal = self.state.observe_prepare(session, seq, parse_wal(payload))
+        self._publish_model_request(session, wal, 1, self._messages_for_prepare(session, wal.payload))
+
+    def _messages_for_prepare(self, session: SessionState, prepare: WalPrepare) -> list[dict[str, Any]]:
+        messages = [dict(item) for item in session.prompt_messages]
+        if not messages:
+            messages = [{"role": "system", "content": system_prompt_content(self.config.agent.system_prompt)}]
+        for ref in prepare.input_event_refs:
+            command = self._command_for_result_seq(session, ref.seq)
+            if command is None:
+                raise RuntimeError(f"missing command for input ref {ref.seq}")
+            messages.append(tool_result_message(command.tool_call.id, _result_from_command(command)))
+        users = [self.state.user_messages[seq] for seq in prepare.user_message_seqs]
+        if users:
+            messages = build_model_messages(
+                system_prompt=self.config.agent.system_prompt,
+                previous_messages=messages,
+                pending_user_messages=users,
+                max_context_messages=self.config.agent.max_context_messages,
+            )
+        return trim_messages(messages, self.config.agent.max_context_messages)
+
+    def _publish_model_request(self, session: SessionState, wal: Any, retry: int, messages: list[dict[str, Any]]) -> None:
+        request_id = model_request_id(session.config.session_id, wal.seq, retry)
+        body = {"model": self.config.agent.model, "messages": messages, "tools": model_tools(), "stream": False}
+        timestamp = now_ms()
+        request = InferRequest(request_id=request_id, method="POST", path="/v1/chat/completions", ts_ms=timestamp, body=body)
+        seq = self._reliable_publish(
+            channel_id=session.config.model_channel_id,
+            stable_id=request_id,
+            expected=request,
+            publish=lambda: publish_infer_request(
+                self.model_client,
+                channel_id=session.config.model_channel_id,
+                principal=self.config.agent.principal,
+                req=InferRequestInput(request_id=request_id, method="POST", path="/v1/chat/completions", body=body, ts_ms=timestamp),
+            ),
+            decode=lambda message: _model_request_identity(message, self.config.agent.principal),
+        )
+        attempt = wal.attempts.setdefault(retry, AttemptState(wal=wal, retry_index=retry))
+        attempt.request_seq, attempt.request = seq, request
+        session.last_llm_request_seq = max(session.last_llm_request_seq, seq)
+
+    def _accept_or_retry(self, session: SessionState, attempt: AttemptState, recovery: bool = False) -> None:
+        if attempt.stale or attempt.retry_index != attempt.wal.latest_retry:
+            attempt.stale = True
             return
-        pending_command = self._first_pending_command(session, attempt, tool_calls)
-        if pending_command is not None:
-            session.in_flight_turn_id = attempt.wal.turn_id
+        result = attempt.result
+        if result is None:
             return
-        next_tool = self._first_unpublished_tool(session, attempt, tool_calls)
-        if next_tool is not None:
-            index, name, arguments = next_tool
-            self._publish_cmd_request(session, attempt, index, name, arguments)
-            session.in_flight_turn_id = attempt.wal.turn_id
+        if result.status_code < 200 or result.status_code >= 300:
+            if not recovery:
+                self._retry(session, attempt, f"model status {result.status_code}")
             return
-        events = self._tool_result_events(session, attempt, tool_calls)
-        if events is None:
-            session.in_flight_turn_id = attempt.wal.turn_id
+        assistant = parse_assistant_message(result.body)
+        if assistant is None:
+            if not recovery:
+                self._retry(session, attempt, "invalid assistant message")
             return
-        messages = append_user_events(
-            list(attempt.request.body.get("messages", [])),
-            events,
+        attempt.assistant, attempt.accepted = assistant, True
+        session.prompt_messages = trim_messages(
+            [*attempt.request.body.get("messages", []), assistant.raw],
             self.config.agent.max_context_messages,
         )
-        pending = self._pending_messages_for_attempt(attempt)
-        self._publish_attempt(session, pending, messages, attempt.wal.turn_id)
+        content = visible_content(assistant.content)
+        if content is not None:
+            self._ensure_im_content(session, result.request_id, content)
+        if assistant.tool_calls and not recovery:
+            self._advance_tools(session, attempt)
 
-    def _first_pending_command(
+    def _retry(self, session: SessionState, attempt: AttemptState, reason: str) -> None:
+        wal = attempt.wal
+        if attempt.retry_index != wal.latest_retry:
+            return
+        if wal.latest_retry % self.config.agent.max_model_attempts == 0:
+            wal.blocked = True
+            LOG.error("model WAL blocked", extra={"wal_seq": wal.seq, "reason": reason})
+            return
+        self._publish_model_request(session, wal, wal.latest_retry + 1, self._retry_messages(wal))
+
+    def _retry_messages(self, wal: Any) -> list[dict[str, Any]]:
+        latest = wal.latest_attempt
+        if latest is None or latest.request is None:
+            raise RuntimeError(f"cannot retry WAL {wal.seq} without request")
+        return list(latest.request.body.get("messages", []))
+
+    def _advance_tools(self, session: SessionState, attempt: AttemptState) -> None:
+        assert attempt.assistant is not None
+        for index, tool_call in enumerate(attempt.assistant.tool_calls):
+            request_id = f"cmd:{attempt.result.request_id}:{index}"
+            command = session.commands_by_id.get(request_id)
+            if command is None:
+                self._publish_cmd(session, attempt, index, tool_call)
+                return
+            if not command.complete:
+                self._check_command_timeout(session, command)
+                return
+        self._publish_prepare(session)
+
+    def _publish_cmd(self, session: SessionState, attempt: AttemptState, index: int, tool_call: ToolCall) -> None:
+        request_id = f"cmd:{attempt.result.request_id}:{index}"
+        timestamp = now_ms()
+        if tool_call.name == "exec":
+            request: CmdRunRequest | CmdOutputReadRequest = CmdRunRequest(command=tool_call.arguments["command"], workdir=tool_call.arguments.get("workdir"), timeout_ms=tool_call.arguments.get("timeout_ms"), ts_ms=timestamp)
+            publish = lambda: self.cmd_client.publish_run_request(
+                principal=self.config.agent.principal,
+                token=self.config.agent.token,
+                channel_id=session.config.cmd_channel_id,
+                req=CmdRunRequestInput(command=tool_call.arguments["command"], workdir=tool_call.arguments.get("workdir"), timeout_ms=tool_call.arguments.get("timeout_ms"), ts_ms=timestamp),
+            )
+        else:
+            stream = "stdout" if tool_call.name == "read_stdout" else "stderr"
+            request = CmdOutputReadRequest(target_seq=tool_call.arguments["exec_id"], stream=stream, offset=0, nbytes=DEFAULT_OUTPUT_READ_BYTES, ts_ms=timestamp)
+            publish = lambda: self.cmd_client.publish_output_read_request(
+                principal=self.config.agent.principal,
+                token=self.config.agent.token,
+                channel_id=session.config.cmd_channel_id,
+                req=CmdOutputReadRequestInput(target_seq=tool_call.arguments["exec_id"], stream=stream, offset=0, nbytes=DEFAULT_OUTPUT_READ_BYTES, ts_ms=timestamp),
+            )
+        seq = self._reliable_publish(
+            channel_id=session.config.cmd_channel_id,
+            stable_id=request_id,
+            expected=request,
+            publish=publish,
+            decode=lambda message: self._cmd_request_identity(message, request_id, request),
+        )
+        command = CommandState(attempt.result.request_id, index, tool_call, seq, request)
+        session.commands_by_id[request_id] = command
+        session.commands_by_seq[seq] = command
+
+    def _check_command_timeout(self, session: SessionState, command: CommandState) -> None:
+        if command.request is None or command.request_seq is None:
+            return
+        if now_ms() < command.request.ts_ms + self.config.agent.cmd_result_timeout_ms:
+            return
+        if self._reconcile_cmd_result(session, command):
+            return
+        payload = encode_cmd_timeout(
+            cmd_request_id=command.request_id,
+            cmd_request_seq=command.request_seq,
+            tool_call_id=command.tool_call.id,
+            tool_name=command.tool_call.name,
+        )
+        expected = json.loads(payload.decode("utf-8"))
+        seq = self._reliable_publish(
+            channel_id=session.config.wal_channel_id,
+            stable_id=expected["timeout_id"],
+            expected=expected,
+            publish=lambda: int(self.openevent_client.publish_auto_seq(
+                principal=self.config.agent.principal,
+                token=self.config.agent.token,
+                channel_id=session.config.wal_channel_id,
+                payload=payload,
+                recipients=(),
+            ).seq),
+            decode=lambda message: _wal_identity(message, self.config.agent.principal),
+        )
+        timeout = parse_wal(payload)
+        assert isinstance(timeout, CmdTimeout)
+        self.state.observe_timeout(session, seq, timeout)
+
+    def _reconcile_cmd_result(self, session: SessionState, command: CommandState) -> bool:
+        watermark = int(self.openevent_client.get_status(self.config.agent.principal, self.config.agent.token).max_seq)
+        next_seq = command.request_seq + 1
+        while next_seq <= watermark:
+            response = self.openevent_client.fetch(
+                self.config.agent.principal,
+                self.config.agent.token,
+                from_seq=next_seq,
+                limit=1000,
+                only_my_recipient=False,
+                channels=(session.config.cmd_channel_id,),
+            )
+            for message in response.messages:
+                if int(message.seq) <= watermark:
+                    self._observe_cmd(message, realtime=False)
+            advanced = int(response.next_seq)
+            if advanced <= next_seq:
+                raise RuntimeError("Fetch did not advance during Cmd timeout reconciliation")
+            next_seq = advanced
+        return command.result is not None
+
+    def _ensure_im_content(self, session: SessionState, model_request_id_value: str, content: str) -> None:
+        request_id = f"model-content:{model_request_id_value}"
+        existing = session.im_requests_by_id.get(request_id)
+        if existing is not None:
+            if (
+                existing.principal != self.config.agent.principal
+                or existing.recipients
+                or existing.data.get("msg_type") != "text"
+                or existing.data.get("content") != {"text": content}
+            ):
+                raise AgentStateError(f"conflicting IM request ID {request_id}")
+            return
+        event_ms = now_ms()
+        expected = (request_id, "text", {"text": content}, event_ms)
+        seq = self._reliable_publish(
+            channel_id=session.config.im_channel_id,
+            stable_id=request_id,
+            expected=expected,
+            publish=lambda: self.im_client.publish_send_request(
+                principal=self.config.agent.principal,
+                token=self.config.agent.token,
+                channel_id=session.config.im_channel_id,
+                req=SendRequestInput(request_id=request_id, msg_type="text", content={"text": content}, event_ms=event_ms),
+            ),
+            decode=lambda message: self._im_request_identity(message),
+        )
+        self.state.record_im_request(
+            session,
+            ImRequestState(
+                seq=seq,
+                principal=self.config.agent.principal,
+                recipients=(),
+                request_id=request_id,
+                event_ms=event_ms,
+                data={"msg_type": "text", "content": {"text": content}},
+            ),
+        )
+
+    def _reliable_publish(self, *, channel_id: int, stable_id: str, expected: Any, publish: Any, decode: Any) -> int:
+        before = int(self.openevent_client.get_status(self.config.agent.principal, self.config.agent.token).max_seq)
+        try:
+            return int(publish())
+        except Exception as exc:
+            if not _publish_outcome_unknown(exc):
+                raise
+            after = int(self.openevent_client.get_status(self.config.agent.principal, self.config.agent.token).max_seq)
+            found: list[int] = []
+            next_seq = before + 1
+            while next_seq <= after:
+                response = self.openevent_client.fetch(
+                    self.config.agent.principal,
+                    self.config.agent.token,
+                    from_seq=next_seq,
+                    limit=1000,
+                    only_my_recipient=False,
+                    channels=(channel_id,),
+                )
+                for message in response.messages:
+                    if int(message.seq) > after:
+                        continue
+                    identity = decode(message)
+                    if identity is None or identity[0] != stable_id:
+                        continue
+                    if identity[1] != expected:
+                        raise RuntimeError(f"conflicting content for stable ID {stable_id}")
+                    found.append(int(message.seq))
+                advanced = int(response.next_seq)
+                if advanced <= next_seq:
+                    raise RuntimeError("Fetch did not advance during publish reconciliation")
+                next_seq = advanced
+            if found:
+                return min(found)
+            return int(publish())
+
+    def _cmd_request_identity(
         self,
-        session: SessionState,
-        attempt: AttemptState,
-        tool_calls: list[tuple[int, str, dict[str, Any]]],
-    ) -> CommandState | None:
-        for index, _, _ in tool_calls:
-            command = session.commands_by_request_id.get(cmd_request_id(attempt.request_id, index))
-            if command is not None and command.result is None:
+        message: Any,
+        stable_id: str,
+        expected: CmdRunRequest | CmdOutputReadRequest,
+    ) -> tuple[str, Any] | None:
+        parsed = parse_cmd_message(message)
+        if (
+            parsed.principal != self.config.agent.principal
+            or parsed.recipients
+            or parsed.payload != expected
+        ):
+            return None
+        return stable_id, parsed.payload
+
+    def _im_request_identity(self, message: Any) -> tuple[str, Any] | None:
+        parsed = self.im_client.parse_message(message)
+        if (
+            parsed.kind != "send.request"
+            or parsed.principal != self.config.agent.principal
+            or parsed.recipients
+        ):
+            return None
+        return parsed.request_id or "", (parsed.request_id or "", parsed.data.get("msg_type"), parsed.data.get("content"), parsed.event_ms)
+
+    def _next_unbound_tool(self, session: SessionState) -> tuple[AttemptState, int, ToolCall] | None:
+        attempts = sorted(
+            (
+                attempt
+                for wal in session.wal_by_seq.values()
+                for attempt in wal.attempts.values()
+                if attempt.accepted and not attempt.stale and attempt.assistant is not None
+            ),
+            key=lambda attempt: (attempt.result_seq or 0, attempt.retry_index),
+        )
+        for attempt in attempts:
+            assert attempt.request is not None
+            assert attempt.assistant is not None
+            for index, tool_call in enumerate(attempt.assistant.tool_calls):
+                request_id = f"cmd:{attempt.request.request_id}:{index}"
+                if request_id not in session.commands_by_id:
+                    return attempt, index, tool_call
+        return None
+
+    def _command_for_result_seq(self, session: SessionState, seq: int) -> CommandState | None:
+        for command in session.commands_by_id.values():
+            if command.result_seq == seq or command.timeout_seq == seq:
                 return command
         return None
 
-    def _first_unpublished_tool(
-        self,
-        session: SessionState,
-        attempt: AttemptState,
-        tool_calls: list[tuple[int, str, dict[str, Any]]],
-    ) -> tuple[int, str, dict[str, Any]] | None:
-        for tool_call in tool_calls:
-            index, _, _ = tool_call
-            if cmd_request_id(attempt.request_id, index) not in session.commands_by_request_id:
-                return tool_call
-        return None
-
-    def _publish_cmd_request(
-        self,
-        session: SessionState,
-        attempt: AttemptState,
-        tool_call_index: int,
-        tool_name: str,
-        arguments: dict[str, Any],
-    ) -> int:
-        request_id = cmd_request_id(attempt.request_id, tool_call_index)
-        ts_ms = now_ms()
-        if tool_name == "exec":
-            seq = self.cmd_client.publish_run_request(
-                principal=self.config.agent.principal,
-                token=self.config.agent.token,
-                channel_id=session.config.cmd_channel_id,
-                req=CmdRunRequestInput(
-                    request_id=request_id,
-                    command=arguments["command"],
-                    workdir=arguments.get("workdir"),
-                    timeout_ms=arguments.get("timeout_ms"),
-                    ts_ms=ts_ms,
-                ),
-            )
-            payload = CmdRunRequest(
-                request_id=request_id,
-                command=arguments["command"],
-                workdir=arguments.get("workdir"),
-                timeout_ms=arguments.get("timeout_ms"),
-                ts_ms=ts_ms,
-            )
-        else:
-            stream = "stdout" if tool_name == "read_stdout" else "stderr"
-            seq = self.cmd_client.publish_output_read_request(
-                principal=self.config.agent.principal,
-                token=self.config.agent.token,
-                channel_id=session.config.cmd_channel_id,
-                req=CmdOutputReadRequestInput(
-                    request_id=request_id,
-                    target_seq=arguments["exec_id"],
-                    stream=stream,
-                    offset=0,
-                    nbytes=DEFAULT_OUTPUT_READ_BYTES,
-                    ts_ms=ts_ms,
-                ),
-            )
-            payload = CmdOutputReadRequest(
-                request_id=request_id,
-                target_seq=arguments["exec_id"],
-                stream=stream,
-                offset=0,
-                nbytes=DEFAULT_OUTPUT_READ_BYTES,
-                ts_ms=ts_ms,
-            )
-        command = CommandState(
-            turn_id=attempt.wal.turn_id,
-            model_request_id=attempt.request_id,
-            tool_call_index=tool_call_index,
-            tool_name=tool_name,
-            arguments=dict(arguments),
-            request_seq=seq,
-            request=payload,
-        )
-        session.commands_by_request_id[request_id] = command
-        session.commands_by_seq[seq] = command
-        return seq
-
-    def _tool_result_events(
-        self,
-        session: SessionState,
-        attempt: AttemptState,
-        tool_calls: list[tuple[int, str, dict[str, Any]]],
-    ) -> list[dict[str, Any]] | None:
-        events: list[dict[str, Any]] = []
-        for index, _, _ in tool_calls:
-            command = session.commands_by_request_id.get(cmd_request_id(attempt.request_id, index))
-            if command is None or command.request is None or command.result is None:
-                return None
-            events.append(_event_from_command(command))
-        return events
-
-    def _pending_messages_for_attempt(self, attempt: AttemptState) -> list[UserPromptMessage]:
-        try:
-            return [self.state.user_messages[seq] for seq in attempt.wal.payload.user_message_seqs]
-        except KeyError as exc:
-            raise RuntimeError(f"cannot continue turn {attempt.wal.turn_id}: missing user message {exc.args[0]}") from exc
-
-    def _handle_cmd_result(self, channel_id: int, command: CommandState) -> None:
-        session = self.state.sessions_by_cmd.get(channel_id)
-        if session is None or command.result is None:
-            return
-        if command.turn_id in session.terminal_send_by_turn:
-            return
-        parsed = parse_cmd_request_id(command.request_id)
-        if parsed is None:
-            return
-        model_request_id_value, _ = parsed
-        attempt = self._attempt_by_request_id(session, model_request_id_value)
-        if attempt is None or attempt.result is None:
-            return
-        if attempt is not self._latest_attempt_for_turn(session, attempt.wal.turn_id):
-            return
-        raw_tool_calls = extract_tool_calls(attempt.result.body)
-        parsed_tool_calls = self._parse_tool_calls_or_fail(session, attempt, raw_tool_calls)
-        if parsed_tool_calls is None:
-            return
-        self._continue_tool_chain(session, attempt, parsed_tool_calls)
-
-    def _attempt_by_request_id(self, session: SessionState, request_id: str) -> AttemptState | None:
-        for attempt in session.attempts.values():
-            if attempt.request_id == request_id:
-                return attempt
-        return None
-
-    def _find_attempt_for_result(self, session: SessionState, result: InferResult) -> AttemptState | None:
-        for attempt in session.attempts.values():
-            if attempt.request is None:
-                continue
-            if attempt.request.request_id == result.request_id and attempt.request_seq == result.prev_seq:
-                return attempt
-        return None
-
-    def _latest_attempt_for_turn(self, session: SessionState, turn: str) -> AttemptState | None:
-        attempts = [item for item in session.attempts.values() if item.wal.turn_id == turn]
-        if not attempts:
-            return None
-        return max(attempts, key=lambda item: item.wal.seq)
-
-    def _prompt_messages_for_successful_attempt(
-        self,
-        attempt: AttemptState,
-        assistant_text: str | None = None,
-    ) -> list[dict[str, Any]] | None:
-        if attempt.request is None or attempt.result is None:
-            return None
-        if attempt.result.status_code < 200 or attempt.result.status_code >= 300:
-            return None
-        if extract_tool_calls(attempt.result.body):
-            return None
-        resolved_text = assistant_text if assistant_text is not None else extract_assistant_text(attempt.result.body)
-        if not resolved_text:
-            return None
-        return append_assistant_message(
-            list(attempt.request.body.get("messages", [])),
-            resolved_text,
-            self.config.agent.max_context_messages,
-        )
-
-    def _check_in_flight_timeout(self, session: SessionState) -> None:
-        turn = session.in_flight_turn_id
-        if turn is None:
-            return
-        attempts = [item for item in session.attempts.values() if item.wal.turn_id == turn]
-        if not attempts:
-            session.in_flight_turn_id = None
-            return
-        latest = max(attempts, key=lambda item: item.wal.seq)
-        if latest.result is not None or latest.request is None:
-            return
-        if now_ms() < latest.request.ts_ms + self.config.agent.model_timeout_ms:
-            return
-        self._handle_attempt_failure(session, latest, "model_request_timeout")
-
-    def _handle_attempt_failure(self, session: SessionState, latest: AttemptState, reason: str) -> None:
-        turn = latest.wal.turn_id
-        if turn in session.terminal_send_by_turn:
-            session.in_flight_turn_id = None
-            return
-        attempts = [item for item in session.attempts.values() if item.wal.turn_id == turn]
-        if len(attempts) >= self.config.agent.max_model_attempts:
-            request_id = freeze_request_id(turn)
-            send_seq = self._publish_im_reply(session, request_id, self.config.agent.freeze_message)
-            session.terminal_send_by_turn[turn] = SimpleNamespace(seq=send_seq, request_id=request_id)
-            session.frozen = True
-            session.in_flight_turn_id = None
-            return
-        try:
-            pending = [self.state.user_messages[seq] for seq in latest.wal.payload.user_message_seqs]
-        except KeyError as exc:
-            raise RuntimeError(f"cannot retry failed model attempt for turn {turn}: missing user message {exc.args[0]}") from exc
-        messages = list(latest.request.body["messages"])
-        LOG.info("retrying failed model attempt", extra={"turn_id": turn, "reason": reason, "attempts": len(attempts)})
-        self._publish_attempt(session, pending, messages, turn)
-
-    def _publish_im_reply(self, session: SessionState, request_id: str, text: str) -> int:
-        seq = self.im_client.publish_send_request(
-            principal=self.config.agent.principal,
-            token=self.config.agent.token,
-            channel_id=session.config.im_channel_id,
-            req=SendRequestInput(
-                request_id=request_id,
-                msg_type="text",
-                content={"text": text},
-                event_ms=now_ms(),
-            ),
-        )
-        return seq
+    def _fetch_channels(self) -> tuple[int, ...]:
+        result: list[int] = []
+        for session in self.config.enabled_sessions:
+            result.extend((session.im_channel_id, session.model_channel_id, session.wal_channel_id, session.cmd_channel_id))
+        return tuple(dict.fromkeys(result))
 
     def _get_channel(self, channel_id: int) -> Any:
-        response = self.openevent_client.get_channel(
-            self.config.agent.principal,
-            self.config.agent.token,
-            channel_id,
+        return self.openevent_client.get_channel(self.config.agent.principal, self.config.agent.token, channel_id).channel
+
+
+def _result_from_command(command: CommandState) -> dict[str, Any]:
+    if command.timeout is not None:
+        if command.tool_call.name == "exec":
+            return command_result_event(
+                exec_id=None,
+                command=command.tool_call.arguments["command"],
+                status="error",
+                stdout=None,
+                stderr=None,
+                error_code="timeout",
+                error_message="timed out waiting for Cmd result",
+            )
+        stream = "stdout" if command.tool_call.name == "read_stdout" else "stderr"
+        return output_read_event(
+            stream=stream,
+            exec_id=command.tool_call.arguments["exec_id"],
+            status="error",
+            content=None,
+            error_code="timeout",
+            error_message="timed out waiting for Cmd result",
         )
-        return response.channel
+    if isinstance(command.request, CmdRunRequest) and isinstance(command.result, CmdRunResult):
+        timed_out = command.result.status == "TIMEOUT"
+        return command_result_event(
+            exec_id=command.result.prev_seq,
+            command=command.request.command,
+            status="ok" if command.result.status == "SUCCESS" else "error",
+            stdout=_inline_text(command.result.stdout),
+            stderr=_inline_text(command.result.stderr),
+            error_code="timeout" if timed_out else None,
+            error_message=command.result.error_message or ("command execution timed out" if timed_out else None),
+        )
+    if isinstance(command.request, CmdOutputReadRequest) and isinstance(command.result, CmdOutputReadResult):
+        status = "ok" if command.result.status == "SUCCESS" else "error"
+        error = command.result.error_message
+        content = command.result.content if command.result.content_encoding == "utf-8" else None
+        if status == "error" and not error:
+            error = "command output not found" if command.result.status == "NOT_FOUND" else f"command output read failed with status {command.result.status}"
+        if command.result.content_encoding != "utf-8" and not error:
+            status, error = "error", "command output is not UTF-8 text"
+        return output_read_event(stream=command.request.stream, exec_id=command.request.target_seq, status=status, content=content, error_message=error)
+    raise RuntimeError("command request/result kind mismatch")
+
+
+def _inline_text(output: Any) -> str | None:
+    return output.content if getattr(output, "content_encoding", None) == "utf-8" and isinstance(getattr(output, "content", None), str) else None
+
+
+def _cmd_request_matches_tool(payload: CmdRunRequest | CmdOutputReadRequest, tool_call: ToolCall) -> bool:
+    if isinstance(payload, CmdRunRequest):
+        return (
+            tool_call.name == "exec"
+            and payload.command == tool_call.arguments["command"]
+            and payload.workdir == tool_call.arguments.get("workdir")
+            and payload.timeout_ms == tool_call.arguments.get("timeout_ms")
+        )
+    stream = "stdout" if tool_call.name == "read_stdout" else "stderr"
+    return (
+        tool_call.name in {"read_stdout", "read_stderr"}
+        and payload.target_seq == tool_call.arguments["exec_id"]
+        and payload.stream == stream
+        and payload.offset == 0
+        and payload.nbytes == DEFAULT_OUTPUT_READ_BYTES
+    )
+
+
+def _wal_identity(message: Any, agent_principal: int) -> tuple[str, Any] | None:
+    if int(message.principal) != agent_principal or tuple(message.recipients):
+        return None
+    try:
+        data = json.loads(message.payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    stable_id = data.get("prepare_id") if data.get("kind") == "llm.request.prepare" else data.get("timeout_id")
+    return (stable_id, data) if isinstance(stable_id, str) and stable_id else None
+
+
+def _model_request_identity(message: Any, agent_principal: int) -> tuple[str, Any] | None:
+    parsed = parse_llm_message(message)
+    if (
+        not isinstance(parsed.payload, InferRequest)
+        or parsed.principal != agent_principal
+        or parsed.recipients
+    ):
+        return None
+    return parsed.payload.request_id, parsed.payload
+
+
+def _publish_outcome_unknown(exc: Exception) -> bool:
+    if bool(getattr(exc, "outcome_unknown", False)):
+        return True
+    if not isinstance(exc, RpcError):
+        return False
+    try:
+        return exc.code() not in _GUARANTEED_NOT_COMMITTED
+    except Exception:
+        return True
 
 
 def _json_description(value: str, channel_id: int) -> dict[str, Any]:
@@ -727,58 +744,8 @@ def _json_description(value: str, channel_id: int) -> dict[str, Any]:
 
 
 def _require_members(channel: Any, channel_id: int, required: set[int]) -> None:
-    visibility = int(getattr(channel, "visibility", 0))
-    if visibility == 0:
+    if int(getattr(channel, "visibility", 0)) == 0:
         return
-    members = set(int(item) for item in getattr(channel, "members", []))
-    missing = required - members
+    missing = required - {int(item) for item in getattr(channel, "members", [])}
     if missing:
         raise ConfigError(f"channel {channel_id} missing members: {sorted(missing)}")
-
-
-def cmd_request_id(model_request_id_value: str, tool_call_index: int) -> str:
-    return f"cmd:{model_request_id_value}:{tool_call_index}"
-
-
-def _event_from_command(command: CommandState) -> dict[str, Any]:
-    if isinstance(command.request, CmdRunRequest) and isinstance(command.result, CmdRunResult):
-        return command_result_event(
-            exec_id=command.result.prev_seq,
-            command=command.request.command,
-            status="ok" if command.result.status == "SUCCESS" else "error",
-            stdout=_inline_text(command.result.stdout),
-            stderr=_inline_text(command.result.stderr),
-            error_message=command.result.error_message,
-        )
-    if isinstance(command.request, CmdOutputReadRequest) and isinstance(command.result, CmdOutputReadResult):
-        stream = command.request.stream
-        error_message = command.result.error_message
-        status = "ok" if command.result.status == "SUCCESS" else "error"
-        content = command.result.content if command.result.content_encoding == "utf-8" else None
-        if status == "error" and error_message is None:
-            error_message = _output_read_error_message(command.result.status)
-        if command.result.content_encoding != "utf-8" and error_message is None:
-            status = "error"
-            error_message = "command output is not UTF-8 text"
-        return output_read_event(
-            stream=stream,
-            exec_id=command.request.target_seq,
-            status=status,
-            content=content,
-            error_message=error_message,
-        )
-    raise RuntimeError("command request/result kind mismatch")
-
-
-def _inline_text(output: Any) -> str | None:
-    if getattr(output, "content_encoding", None) == "utf-8":
-        content = getattr(output, "content", None)
-        if isinstance(content, str):
-            return content
-    return None
-
-
-def _output_read_error_message(status: str) -> str:
-    if status == "NOT_FOUND":
-        return "command output not found"
-    return f"command output read failed with status {status}"

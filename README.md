@@ -110,8 +110,8 @@ This repository's main documents:
 | --- | --- |
 | [docs/UBUNTU_ENVIRONMENT.md](docs/UBUNTU_ENVIRONMENT.md) | Ubuntu 24.04 environment and venv preparation |
 | [docs/RUNTIME_RECONCILER.md](docs/RUNTIME_RECONCILER.md) | Declarative runtime configuration, generated files, token/channel reconciliation |
-| [docs/IM_MODEL_AGENT.md](docs/IM_MODEL_AGENT.md) | Agent configuration and message processing flow |
-| [docs/AGENT_WAL_PROTOCOL.md](docs/AGENT_WAL_PROTOCOL.md) | Agent WAL channel and payload protocol |
+| [docs/IM_MODEL_AGENT.md](docs/IM_MODEL_AGENT.md) | Agent configuration and continuous-processing overview |
+| [docs/AGENT_WAL_PROTOCOL.md](docs/AGENT_WAL_PROTOCOL.md) | WAL fields, stable IDs, publish reconciliation, retry/blocked, and recovery protocol |
 
 Related project documentation:
 

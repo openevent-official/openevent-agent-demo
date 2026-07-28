@@ -56,7 +56,8 @@ The example keeps common fields. Fields marked "no" in the field tables can be
 deleted and will use defaults. `runtime.supervisor.ctl`, `view.port`, `tokens`,
 `im.sync.*`, `model.provider_name`, `model.timeout_ms`, `agent.name`,
 `agent.max_context_messages`, `agent.model_timeout_ms`,
-`agent.max_model_attempts`, `agent.freeze_message`, `channels.visibility`, and
+`agent.max_model_attempts`,
+`channels.visibility`, and
 `sessions[].enabled` are all optional.
 
 ```yaml
@@ -79,10 +80,7 @@ openevent:
   admin_addr: 127.0.0.1:9528
   max_payload_bytes: 16777216
   storage:
-    metadata_path: openevent-stack/data/openevent/meta
-  store:
-    rocksdb:
-      path: openevent-stack/data/openevent/messages
+    path: openevent-stack/data/openevent
 
 view:
   port: 8080
@@ -111,9 +109,11 @@ im:
     app_id: cli_replace_with_lark_app_id
     app_secret: replace_with_lark_app_secret
   sync:
-    interval_ms: 5000
+    history_retry_delay_ms: 1000
+    history_overlap_ms: 300000
+    history_lookback_ms: 300000
     page_size: 50
-    startup_lookback_ms: 300000
+    event_queue_size: 1000
 
 model:
   proxy_principal: p_model_proxy
@@ -135,7 +135,7 @@ agent:
   max_context_messages: 20
   model_timeout_ms: 60000
   max_model_attempts: 3
-  freeze_message: "The model service is temporarily unavailable. The session is paused. Send another message to continue."
+  cmd_result_timeout_ms: 330000
 
 channels:
   visibility: private
@@ -174,8 +174,7 @@ sessions:
 | --- | --- | --- | --- |
 | `openevent.grpc_addr` | yes | | Business gRPC address used by the SDK, IM syncer, model-proxy, and Agent. |
 | `openevent.admin_addr` | yes | | Admin gRPC address used by Reconciler to call `ListTokens` and `AddToken`. |
-| `openevent.storage.metadata_path` | yes | | OpenEvent metadata storage path. Relative paths are resolved from the demo repository root. |
-| `openevent.store.rocksdb.path` | yes | | OpenEvent message RocksDB storage path. Relative paths are resolved from the demo repository root. |
+| `openevent.storage.path` | yes | | Unified OpenEvent RocksDB directory. Metadata and messages use different Column Families in the same DB. Relative paths are resolved from the demo repository root. |
 | `openevent.max_payload_bytes` | no | `16777216` | Written to OpenEvent server, model-proxy, and cmd-worker configuration. |
 
 ### Principals And Tokens
@@ -227,9 +226,11 @@ region.
 | `im.bot.app_id` | yes | | Feishu/Lark application ID. Also used to generate the bot mapping `external_user_id`. |
 | `im.bot.app_secret` | yes | | Feishu/Lark application secret. Written to `im-p2p-syncer.yaml`. |
 | `im.bot.api_base_url` | no | provider default | Not recommended in input YAML. Derived from `im.provider`: `https://open.feishu.cn` for `feishu`, `https://open.larksuite.com` for `lark`. |
-| `im.sync.interval_ms` | no | `5000` | IM polling interval. |
+| `im.sync.history_retry_delay_ms` | no | `1000` | Retry delay after a Provider history fetch failure. |
+| `im.sync.history_overlap_ms` | no | `300000` | Overlap window for the history fetch watermark. |
+| `im.sync.history_lookback_ms` | no | `300000` | History lookback window on first startup. |
 | `im.sync.page_size` | no | `50` | Provider message page size. |
-| `im.sync.startup_lookback_ms` | no | `300000` | Lookback window for the first poll. |
+| `im.sync.event_queue_size` | no | `1000` | Provider live-event queue capacity. |
 
 Feishu/Lark bot messages are mapped by application identity. Reconciler uses
 `im.bot.app_id` as the bot mapping `external_user_id`.
@@ -296,6 +297,10 @@ is the Agent's internal stable business key.
 | `model.model` | yes | | Model name used by the Agent when constructing request bodies. It is not written to model-proxy provider configuration. |
 | `model.timeout_ms` | no | `65000` | Total timeout for model-proxy calls to the provider. |
 
+Generated model-proxy configuration explicitly allows only
+`POST /v1/chat/completions` and `POST /v1/responses`. Requests to other provider
+methods or paths are rejected before an HTTP request is sent.
+
 ### Agent
 
 | Field | Required | Default | Description |
@@ -305,8 +310,8 @@ is the Agent's internal stable business key.
 | `agent.system_prompt` | yes | | Agent system prompt. |
 | `agent.max_context_messages` | no | `20` | Context limit for prompts maintained by the Agent. |
 | `agent.model_timeout_ms` | no | `60000` | How long the Agent waits for a model result. |
-| `agent.max_model_attempts` | no | `3` | Maximum model attempts for the same turn. |
-| `agent.freeze_message` | no | built-in English text | Freeze message written back to IM after repeated model attempt failures. |
+| `agent.max_model_attempts` | no | `3` | Maximum automatic attempts for one WAL; see the [Agent WAL protocol](AGENT_WAL_PROTOCOL.md) for retry and blocked semantics. |
+| `agent.cmd_result_timeout_ms` | no | `330000` | How long the Agent waits for a Cmd result before reconciling history and supplying a failed tool result to the model. |
 
 ### Channels
 
@@ -334,10 +339,10 @@ Each enabled session has four channels.
 | `sessions[].channels.model` | no | `<runtime.name>.llm.<session_id>` | Model channel name. |
 | `sessions[].channels.wal` | no | `<runtime.name>.wal.<session_id>` | WAL channel name. |
 | `sessions[].channels.cmd` | no | `<runtime.name>.cmd.<session_id>` | Cmd channel name used by Agent local command calls. |
-| `sessions[].channel_ids.im` | no | | Manually specified existing IM channel id. |
-| `sessions[].channel_ids.model` | no | | Manually specified existing Model channel id. |
-| `sessions[].channel_ids.wal` | no | | Manually specified existing WAL channel id. |
-| `sessions[].channel_ids.cmd` | no | | Manually specified existing Cmd channel id. |
+| `sessions[].channel_ids.im` | no | | Selected IM channel id for an uninitialized session; after initialization it must be omitted or equal the bound id. |
+| `sessions[].channel_ids.model` | no | | Selected Model channel id for an uninitialized session; after initialization it must be omitted or equal the bound id. |
+| `sessions[].channel_ids.wal` | no | | Selected WAL channel id for an uninitialized session; after initialization it must be omitted or equal the bound id. |
+| `sessions[].channel_ids.cmd` | no | | Selected Cmd channel id for an uninitialized session; after initialization it must be omitted or equal the bound id. |
 
 Within one Agent configuration, enabled sessions must have unique `model`,
 `wal`, and `cmd` channel names. IM channel names must also be unique. Each
@@ -359,8 +364,7 @@ config/desired.normalized.yaml
 config/state.yaml
 config/secrets.yaml
 config/plan.yaml
-data/openevent/meta/
-data/openevent/messages/
+data/openevent/
 data/cmd-worker-output/
 ```
 
@@ -368,13 +372,13 @@ File descriptions:
 
 | File | Description |
 | --- | --- |
-| `config/openevent-server.yaml` | OpenEvent server configuration, including gRPC/admin addresses and data paths from `openevent.storage` / `openevent.store`. |
+| `config/openevent-server.yaml` | OpenEvent server configuration, including gRPC/admin addresses and the unified RocksDB path from `openevent.storage.path`. |
 | `config/im-p2p-syncer.yaml` | IM syncer configuration, including Feishu/Lark credentials, user/bot mappings, and principal tokens. |
-| `config/model-proxy.yaml` | model-proxy configuration, including provider base URL/API key, OpenEvent token, and response-header filtering switch. |
+| `config/model-proxy.yaml` | model-proxy configuration, including provider base URL/API key, OpenEvent token, channel ids, and request limits. |
 | `config/cmd-worker.yaml` | cmd-worker configuration, including OpenEvent token, cmd channel ids, output directory, concurrency, and timeout settings. |
 | `config/im-model-agent.yaml` | Agent configuration, including Agent token, model name, and IM/Model/WAL/Cmd channel ids. |
 | `config/desired.normalized.yaml` | Desired state after defaults are expanded. Sensitive values are redacted. |
-| `config/state.yaml` | Configuration digests, token digests, channel ids, and apply status from the last apply. |
+| `config/state.yaml` | Configuration digests, token digests, permanent channel bindings for every initialized session, and the latest apply status and phase. |
 | `config/secrets.yaml` | Plaintext OpenEvent tokens that were automatically created or adopted. |
 | `config/plan.yaml` | Actions and configuration summary for this apply. |
 
@@ -385,22 +389,24 @@ API keys, and must not be committed.
 
 ## Apply Flow
 
-The `--apply` order is:
+`--apply` records five checkpoints in `config/state.yaml`:
 
-1. Parse input YAML, fill defaults, and validate fields.
-2. Generate and write `config/openevent-server.yaml`.
-3. Restart OpenEvent if OpenEvent configuration changed.
-4. Ensure the OpenEvent process is running and wait for business and admin ports
-   to become available.
-5. Resolve or create OpenEvent tokens.
-6. Resolve or create IM, Model, Cmd, and WAL channels.
-7. Generate IM syncer, model-proxy, cmd-worker, and Agent configuration.
-8. Write `config/desired.normalized.yaml`, component configuration under
-   `config/`, `config/state.yaml`, `config/secrets.yaml`, and
-   `config/plan.yaml`.
-9. Restart downstream processes whose configuration changed. If OpenEvent
-   configuration changed, downstream processes are force-restarted.
-10. Ensure model-proxy, cmd-worker, IM syncer, and Agent processes are in the running state.
+| Phase | Completed work |
+| --- | --- |
+| `parsed` | The input YAML was parsed, defaults were filled, and fields were validated. |
+| `openevent_ready` | `config/openevent-server.yaml` was written, OpenEvent was started or restarted when needed, and its business and admin ports became available. |
+| `resources_resolved` | Provider identities and sessions, OpenEvent tokens, and IM/Model/Cmd/WAL channels were resolved or created. |
+| `config_committed` | All downstream configurations were rendered and validated, then normalized desired state, component configurations, secrets, plan, and state were written. |
+| `processes_running` | Changed downstream processes were restarted in dependency order, missing processes were started, and supervisor reported every configured program as `RUNNING`. |
+
+`last_apply.status` is `in_progress`, `complete`, or `failed`. `last_apply.phase`
+is the last completed checkpoint. On failure, `last_apply.failed_phase` identifies
+the checkpoint that was being attempted. Timestamps record when the apply began,
+was last updated, and completed or failed.
+
+An apply is `complete` only at `processes_running`. This phase confirms a
+supervisor observation, not end-to-end health: it does not prove that Provider
+credentials, model requests, IM delivery, or the complete event path work.
 
 Restart order:
 
@@ -408,8 +414,8 @@ Restart order:
 openevent -> model_proxy -> cmd_worker -> im_syncer -> agent
 ```
 
-Agent starts last because it depends on IM syncer, model-proxy, and cmd-worker
-channels being ready to consume.
+Agent starts last so IM syncer, model-proxy, and cmd-worker receive their
+start/restart commands first. This ordering does not itself prove readiness.
 
 ## Token Reconciliation
 
@@ -432,16 +438,31 @@ Token usage:
 
 ## Channel Reconciliation
 
-Reconciler tries to reuse existing channels instead of creating new channels on
-every run.
+`session_id` is the permanent binding key for the IM, Model, WAL, and Cmd
+channels. A session becomes initialized after all four channels have been
+resolved and validated and their complete mapping is written to
+`config/state.yaml` during `config_committed`. The four ids are committed as one
+set; a partial mapping does not initialize a session.
 
-Lookup priority:
+Channel reconciliation has two lifecycle paths:
 
-1. Channel id recorded in `config/state.yaml`.
-2. Explicit channel id from the input YAML.
-3. Channel with the same name from OpenEvent `ListChannels`.
-4. Channel from OpenEvent `ListChannels` whose protocol and stable description
-   business fields match.
+1. Uninitialized: for each channel type, try the explicit id from the input
+   YAML, a channel with the same name, and then a channel whose protocol and
+   stable description business fields match. Create a channel only when no
+   candidate is reusable. An explicit id is an instruction, not a hint: if it
+   is missing, inaccessible, or incompatible, apply fails without falling back
+   to discovery or creation.
+2. Initialized: the four ids stored in `config/state.yaml` are the only
+   authoritative mapping. Explicit ids may be omitted; when provided, they
+   must equal the stored values. If any id differs or any bound channel is
+   missing, inaccessible, or incompatible, apply fails. Reconciler does not
+   discover or create a replacement.
+
+Disabling a session, temporarily removing it from the desired configuration,
+or later re-enabling it does not release the binding. `config/state.yaml` must
+retain the complete mapping for every initialized session, not only currently
+enabled sessions. Replacing any channel requires a new `session_id`; the
+original `session_id` has no unbind or rebind operation.
 
 Reusable conditions:
 
@@ -452,7 +473,8 @@ Reusable conditions:
 - Required members already exist, or the `agent.principal` token is usable and
   can add missing members through `AddMember`.
 
-If a channel is not reusable, Reconciler creates a new one. Reconciler does not
+When only required members are missing, Reconciler may add them under the
+conditions above; this does not change channel identity. Reconciler does not
 modify the `protocol`, `description`, `visibility`, or `creator` of old channels,
 because the current OpenEvent API has no channel update operation. It also does
 not delete old channels or historical events.
@@ -466,78 +488,22 @@ Stable description fields:
 | WAL | `version=v1`, `session_id`, `im_channel_id`, `model_channel_id`, `metadata.runtime_name` |
 | Cmd | `version=v1`, `metadata.runtime_name`, `metadata.agent_session_id`, `metadata.cmd_worker_principal` |
 
-Creation order:
-
-1. IM channel.
-2. Model channel.
-3. Cmd channel.
-4. WAL channel.
-
-WAL description needs the final IM/Model channel ids, so WAL must be created
-last.
+WAL resolution depends on the final IM and Model channel ids because both are
+stored in its description. Cmd has no ordering dependency on WAL; no stronger
+creation order is part of the contract.
 
 ## Derived Configuration Notes
 
-IM syncer:
+This table records only mappings that are not obvious from the input field
+names. Each component's own documentation remains authoritative for its config
+schema and runtime behavior.
 
-- `worker.principal/token` uses the principal referenced by
-  `im.worker_principal`.
-- `principal_tokens` includes each active user and bot principal token; it does
-  not include the worker itself.
-- Each enabled session generates two active mappings:
-  - `identity_type=user`, where `external_user_id` comes from the user's
-    `external_id` or resolved phone/email.
-  - `identity_type=bot`, where `external_user_id` uses `im.bot.app_id`.
-- `openevent.publish.use_auto_seq` is fixed to `true`.
-- Feishu/Lark sync mode is fixed to `poll`.
-
-Model proxy:
-
-- `protocol` is fixed to `llm.v1`.
-- Request idempotency is handled in model-proxy process memory. During startup
-  recovery, model-proxy rebuilds that state by scanning the OpenEvent log.
-- `model.base_url/api_key/timeout_ms` are written to provider configuration.
-- `model.model` is not written to the model-proxy provider configuration; it is
-  written to Agent configuration and used by the Agent to construct request
-  bodies.
-
-Cmd worker:
-
-- `protocol` is fixed to `cmd.v1`.
-- `principal/token` uses the principal referenced by `cmd.worker_principal`.
-- `channel_ids` contains the resolved cmd channel ids for enabled sessions.
-- `output_dir` defaults to `<runtime_root>/data/cmd-worker-output`.
-- The cmd worker process is a stack component; the Agent does not execute shell
-  commands directly.
-
-Agent:
-
-- `agent.principal/token` uses the principal referenced by `agent.principal`.
-- Each enabled session writes the final resolved `im_channel_id`,
-  `model_channel_id`, `wal_channel_id`, and `cmd_channel_id`.
-- Agent configuration does not contain `from_seq`; the Agent restores state from
-  OpenEvent history itself, then continues consuming live messages.
-
-## Limits And Boundaries
-
-- Currently only `im.provider=feishu|lark` and `im.session_type=p2p` are
-  supported.
-- `channels.visibility=public` is currently disallowed.
-- Reconciler does not allocate principals; it only creates tokens for declared
-  principals.
-- Reconciler does not delete tokens, channels, or historical events.
-- Reconciler does not update immutable metadata of existing channels; when
-  metadata drifts, it creates a new channel.
-- Reconciler can prevent this configuration from generating multiple
-  model-proxy consumers for the same Model channel, but it cannot enforce global
-  mutual exclusion at the OpenEvent layer.
-- Reconciler prevents this configuration from generating multiple cmd-worker
-  consumers for the same Cmd channel, but it cannot enforce global mutual
-  exclusion at the OpenEvent layer.
-- `--dry-run` uses preview token/channel ids and does not represent real
-  OpenEvent state.
-- Generated configuration contains secrets; the runtime root should not be
-  committed to git.
+| Component | Generated Contract |
+| --- | --- |
+| IM syncer | `worker.principal/token` comes from `im.worker_principal`. `principal_tokens` contains enabled users and the bot, not the worker. Every enabled session creates one user mapping and one bot mapping; user `external_user_id` is explicit or resolved from phone/email, while the bot uses `im.bot.app_id`. |
+| model-proxy | Protocol is `llm.v1`; `channels` contains enabled Model channel ids. Provider config receives `model.base_url/api_key/timeout_ms`; `model.model` goes to Agent config instead. |
+| cmd-worker | Protocol is `cmd.v1`; principal/token and enabled Cmd channel ids are resolved from the desired state. `output_dir` defaults to `<runtime_root>/data/cmd-worker-output`; Agent never executes shell commands directly. |
+| Agent | Principal/token and all four resolved channel ids are generated per enabled session. There is no `from_seq`; Agent restores its position from OpenEvent history. |
 
 ## Troubleshooting
 
@@ -566,7 +532,7 @@ Troubleshooting files:
 | File | What To Check |
 | --- | --- |
 | `config/plan.yaml` | Token creation/adoption, channel creation/reuse, configuration writes, and restart actions for this run. |
-| `config/state.yaml` | Current runtime token digests, channel ids, and configuration digests. |
+| `config/state.yaml` | Current token and configuration digests, permanent channel bindings for initialized sessions, and `last_apply` status, completed phase, or failed phase. |
 | `config/secrets.yaml` | OpenEvent tokens that were automatically created or adopted. Keep it secret. |
 | `config/*.yaml` component configuration | Final real configuration passed to each component. |
 | `logs/*.log` | Logs for components started by local `openevent-stack/process.sh`. |
@@ -584,19 +550,11 @@ Common errors:
 | `created token is not usable for principal ...` | Usually caused by multiple leftover OpenEvent processes on the same port, so Admin and business gRPC requests reach different instances. `openevent-stack/process.sh start openevent` cleans stale processes with the same configuration. |
 | `supervisor start/restart failed` | Check that `runtime.supervisor.ctl` and `runtime.supervisor.programs.*` can start the corresponding processes. |
 
-## Dependency Project Contracts
+## Dependency Contracts
 
-- OpenEvent API and token/channel behavior are defined by
-  `openevent-sdk/docs/API.md`.
-- OpenEvent server configuration is defined by `openevent/docs/CONFIG.md`.
-- IM P2P syncer configuration is defined by
-  `openevent-modules-im/docs/IM-P2P-SYNCER.md`.
-- model-proxy configuration is defined by
-  `openevent-modules-model-proxy/docs/CONFIGURATION.md`.
-- Cmd protocol, worker configuration, and SDK behavior are defined by
-  `openevent-modules-cmd/docs/CMD_PROTOCOL.md`,
-  `openevent-modules-cmd/docs/CONFIGURATION.md`, and
-  `openevent-modules-cmd/docs/SDK_USAGE.md`.
-- Agent behavior is defined by [IM_MODEL_AGENT.md](IM_MODEL_AGENT.md).
-- Agent WAL payload is defined by
-  [AGENT_WAL_PROTOCOL.md](AGENT_WAL_PROTOCOL.md).
+Generated configuration is validated with the config parsers installed in the
+current Python environment. OpenEvent and each worker's public documentation
+remain authoritative for their own APIs, protocols, and config schema;
+Reconciler owns only the input-to-config mapping described here. Agent behavior
+and WAL fields are defined locally by [IM_MODEL_AGENT.md](IM_MODEL_AGENT.md) and
+[AGENT_WAL_PROTOCOL.md](AGENT_WAL_PROTOCOL.md).

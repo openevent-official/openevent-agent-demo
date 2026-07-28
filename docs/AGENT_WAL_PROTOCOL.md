@@ -3,22 +3,19 @@
 [中文版](AGENT_WAL_PROTOCOL_cn.md)
 
 > Status: draft
-> Scope: Agent write-ahead log payloads and channel descriptions for OpenEvent
-> channels with `protocol="agent.wal.v1"`
+> Scope: payload and Channel description for `protocol="agent.wal.v1"`
 
-## 1. Channel Conventions
+## 1. Document Responsibility
 
-Each Agent session MUST own exactly one WAL channel. The WAL channel stores only
-the Agent's local advancement intent for that session. It does not carry IM
-content, model request bodies, or model results.
+This document is the sole protocol authority for `agent.wal.v1` fields, stable
+IDs, publish reconciliation, retry/blocked, and recovery semantics. The
+continuous Agent overview is documented in [IM_MODEL_AGENT.md](IM_MODEL_AGENT.md).
 
-All Agent WAL channels MUST set:
+## 2. Channel
 
-```text
-protocol = "agent.wal.v1"
-```
-
-`description` MUST be a JSON string:
+Each Agent session owns one WAL Channel with `protocol="agent.wal.v1"`. The WAL
+records the new facts consumed by the next model request. It does not store the
+model request body or command output bodies.
 
 ```json
 {
@@ -31,204 +28,185 @@ protocol = "agent.wal.v1"
 }
 ```
 
-Field constraints:
+`private` visibility is recommended. The Agent principal needs read and write
+access. Other workers do not consume this Channel.
 
-- `version`: currently fixed to `v1`.
-- `session_id`: session ID from Agent configuration.
-- `im_channel_id`: the `im.v1` channel bound to this Agent session.
-- `model_channel_id`: the `llm.v1` channel bound to this Agent session.
-- `updated_at_ms`: millisecond timestamp.
-- `metadata`: optional object for static deployment or business-domain
-  extension information.
+This protocol assumes that a `session_id`, once initialized, is permanently
+bound to the same IM, Model, WAL, and Cmd Channels. All session-scoped message
+references are interpreted within that fixed binding. Replacing any Channel
+requires a new `session_id`. The [Runtime Reconciler](RUNTIME_RECONCILER.md#channel-reconciliation)
+defines the binding lifecycle.
 
-Constraints:
+## 3. Payload
 
-- One Agent session can configure only one WAL channel.
-- One WAL channel can belong to only one Agent session.
-- `wal_channel_id` MUST be unique within the same Agent process.
-- WAL channels should use `private` visibility.
-- The Agent principal MUST have read/write permission on the WAL channel.
-- IM Sync Worker and model-proxy worker do not consume the WAL channel and do
-  not need WAL channel permission.
-
-## 2. Payload Envelope
-
-`agent.wal.v1` payloads are UTF-8 JSON objects. The first version defines one
-log kind:
+The protocol defines `llm.request.prepare` and `cmd.request.timeout`. The prepare payload is:
 
 ```json
 {
   "kind": "llm.request.prepare",
+  "prepare_id": "prepare:agent-session-001:9d70c7",
   "ts_ms": 1710000000000,
   "pre_llm_seq": 12340,
-  "user_message_seqs": [12345, 12346]
+  "user_message_seqs": [],
+  "input_event_refs": [
+    {
+      "type": "exec_result",
+      "seq": 12350
+    }
+  ]
 }
 ```
 
-Common fields:
+- `kind`: required and fixed to `llm.request.prepare`.
+- `prepare_id`: required, non-empty, and unique within the WAL Channel for this exact set of new model inputs.
+- `ts_ms`: required Unix timestamp in milliseconds.
+- `pre_llm_seq`: required and equal to the latest `infer.request.seq` in this session before the WAL, or `0` initially.
+- `user_message_seqs`: required array of new user `sync.record.seq` values; empty when absent.
+- `input_event_refs`: required array of new tool results; empty when absent.
 
-- `kind`: required; currently fixed to `llm.request.prepare`.
-- `ts_ms`: required; Unix millisecond timestamp (UTC).
-- `pre_llm_seq`: required; before preparing this LLM request, the OpenEvent
-  `seq` of the previous `llm.v1 infer.request` in this session. If this session
-  has no previous LLM request, the value is `0`.
-- `user_message_seqs`: required; the list of user `im.v1 sync.record.seq`
-  values prepared for this LLM request.
+At least one input array is non-empty. Both arrays are strictly increasing by
+seq and contain no duplicates.
 
-Protocol fields are validated strictly. Unknown fields, missing required fields,
-or mismatched field types are invalid payloads.
+Each `input_event_refs` item strictly contains:
 
-## 3. OpenEvent principal And recipients
+| Field | Rule |
+| --- | --- |
+| `type` | `exec_result`, `read_stdout_result`, `read_stderr_result`, or `cmd_timeout` |
+| `seq` | OpenEvent seq of the matching Cmd result or WAL `cmd.request.timeout` |
 
-`principal` is a top-level OpenEvent EventMessage field and is not stored inside the
-`agent.wal.v1` payload.
+References must belong to the configured IM/Cmd/WAL Channel for this session and
+pass relationship validation such as `prev_seq`, `target_seq`, and
+`cmd_request_id`. Every referenced seq precedes the WAL seq, and a reference
+already consumed by another canonical prepare cannot be reused. Unknown or
+malformed fields are invalid.
 
-Rules:
+## 4. Prepare ID
 
-- The OpenEvent `principal` of `llm.request.prepare` MUST be the Agent
-  principal.
-- The OpenEvent `recipients` of `llm.request.prepare` MUST be an empty array.
-- WAL channel visibility and members provide access control; `recipients` is not
-  used to express receivers.
-- Payloads MUST NOT contain `source_principal`, tokens, API keys, or model
-  request bodies.
+The Agent generates `prepare_id` before the first publish and keeps it unchanged
+across transport retries. It identifies only this exact input set. It does not
+represent a task, phase, start, or completion. Different input sets use
+different IDs; retries of the same logical publish reuse the ID and payload.
 
-## 4. llm.request.prepare
+The model request uses:
 
-`llm.request.prepare` means the Agent is preparing to write a new
-`infer.request` to the `llm.v1` channel. It must be written to OpenEvent before
-the corresponding `infer.request`.
+```text
+model_request_id = "agent:{session_id}:wal:{wal_seq}:retry:{retry_index}"
+```
+
+One WAL record fixes the new input references consumed by the request and may
+map to multiple model retries. `retry_index` starts at `1`. Each retry is built
+strictly from those references and the accepted context preceding the WAL;
+later queued events are not included. Request bodies need not be byte-for-byte
+identical, and retries do not create another WAL record.
+
+## 5. Publish Reconciliation
+
+1. Record `max_seq` with `GetStatus` before publishing.
+2. Call `PublishAutoSeq` once.
+3. On success, use the returned seq.
+4. On an uncertain result, obtain a fixed reconciliation watermark and fully scan the interval with `Fetch(channels=[wal_channel_id])`.
+5. Reuse the smallest matching seq when ID and content match; conflicting content is a consistency error.
+6. Republish the same ID and content only after the complete scan confirms absence.
+
+Model and IM requests use the same stable-ID method. A `cmd.v1` request payload
+has no stable ID. Before publishing it, the Agent fixes the complete payload. On
+an uncertain result, it scans the full watermark interval and accepts only a
+request from the Agent principal with exactly that payload. It republishes the
+same payload only after the complete scan confirms absence. Looking only at the
+latest Channel message is insufficient.
+
+## 6. Model Text and Tools
+
+Each non-empty model `content` uses an independent IM deduplication key:
+
+```text
+send.request.request_id = "model-content:{model_request_id}"
+```
+
+This applies whether or not the same model result contains tool calls. Empty
+`content` does not create an IM message.
+
+Tool calls use:
+
+```text
+cmd_request_id = "cmd:{model_request_id}:{tool_call_index}"
+```
+
+`cmd_request_id` is an Agent-state and WAL-timeout business correlation key; it
+is not a `cmd.v1` payload field. The OpenEvent seq of the actual `cmd.v1` request
+is the Cmd task ID. Tool results enter the next WAL through `input_event_refs`.
+These relationships identify concrete messages and calls, not a higher-level
+task state.
+
+A Cmd request timeout event is written to the current session's WAL Channel:
 
 ```json
 {
-  "kind": "llm.request.prepare",
-  "ts_ms": 1710000000000,
-  "pre_llm_seq": 12340,
-  "user_message_seqs": [12345, 12346]
+  "kind": "cmd.request.timeout",
+  "timeout_id": "cmd-timeout:cmd:agent:agent-session-001:wal:12345:retry:1:0",
+  "ts_ms": 1710000300000,
+  "cmd_request_id": "cmd:agent:agent-session-001:wal:12345:retry:1:0",
+  "cmd_request_seq": 12350,
+  "tool_call_id": "call_exec_1",
+  "tool_name": "exec"
 }
 ```
 
-Rules:
+`timeout_id = "cmd-timeout:{cmd_request_id}"` is unique in the WAL Channel.
+`cmd_request_seq` must reference the matching request in this session's Cmd
+Channel; `tool_call_id` and `tool_name` must match the accepted assistant tool
+call. After `agent.cmd_result_timeout_ms`, the Agent records a deterministic Cmd
+Channel watermark and Fetches through it. It publishes the timeout event using
+the reconciliation algorithm in section 5 only when no result exists through
+that watermark. Conflicting content under the same ID is a consistency error.
 
-- `pre_llm_seq` MUST equal the previous `llm.v1 infer.request.seq` confirmed by
-  this session before writing the WAL record.
-- If the session has no previous `infer.request`, `pre_llm_seq` MUST be `0`.
-- `user_message_seqs` MUST be a non-empty array.
-- Every element in `user_message_seqs` MUST point to a user `sync.record.seq` in
-  this session's IM channel that needs to trigger a model call.
-- `user_message_seqs` MUST be strictly increasing by OpenEvent `seq` and MUST
-  NOT contain duplicates.
-- If one model request merges multiple user messages, `user_message_seqs` MUST
-  list all user message seq values in the batch exactly, not only the final
-  high-water mark.
-- `turn_id` is not a WAL payload field. During recovery, the Agent derives
-  `turn_id = "{session_id}:{user_message_seqs[0]}"` from the `session_id` in the
-  WAL channel description and the first user message seq in the payload.
-- After writing the WAL record, the corresponding `llm.v1
-  infer.request.request_id` MUST be generated from the OpenEvent `seq` of that
-  WAL message, using the format `agent:{session_id}:wal:{wal_seq}`.
-- A new WAL record MUST be written before every new `infer.request` attempt.
-  Any retry caused by a failed model attempt also requires a new WAL record.
-  Failed attempts include timeout without a matching result, non-2xx
-  `infer.result`, unparsable model output, and invalid tool calls.
+The timeout maps to the matching `role=tool` result with `status="error"`,
+`error_code="timeout"`, and an `error_message` that says waiting for the Cmd
+result timed out. Once published, it is the only accepted result for that tool
+call. A later real Cmd result is marked late and does not enter the prompt. If
+reconciliation finds the real result first, no timeout event is published.
 
-## 5. Correlation Chain
+## 7. Retry
 
-The first Agent version uses WAL as the pre-commit point between IM input and
-LLM request, but does not use `infer.request.prev_seq` or
-`send.request.prev_seq`. Cross-channel correlation is done through `request_id`
-conventions:
+- The next retry is published only after the current retry explicitly fails or exceeds the Agent wait timeout.
+- Each retry has a new request ID and is a new model call to model-proxy.
+- A timeout only means that the Agent no longer waits for the older request; it
+  does not require model-proxy or the provider to have stopped processing it.
+  Multiple model calls may therefore execute concurrently at the provider.
+- Concurrent model calls may add token, rate-limit, and capacity cost, but must
+  not change Agent state semantics. Model inference itself has no business side
+  effects. Only the valid result for the highest current `retry_index` may
+  produce IM, Cmd, or prompt side effects.
+- Once a newer retry is published, all later results from lower indexes are stale and produce no text, tools, or prompt changes.
+- An uncertain retry publish is reconciled by its request ID before another index may be allocated.
+- At `max_model_attempts`, the WAL remains blocked. Its referenced input and later queued events cannot be skipped.
+- Explicit unblock continues from the next index after the historical maximum.
 
-```text
-im sync.record.seq in agent wal user_message_seqs
-agent wal.seq => model_request_id = "agent:{session_id}:wal:{wal_seq}"
-llm infer.request.request_id == model_request_id
-llm infer.result.request_id == model_request_id
-llm infer.result.prev_seq -> llm infer.request.seq
-im send.request.request_id == "im:{model_request_id}"
-im send.result.request_id == im send.request.request_id
-im send.result.prev_seq -> im send.request.seq
-```
+## 8. Recovery
 
-If the turn reaches the model-attempt limit before an acceptable model result,
-the Agent writes a freeze `send.request` instead of a normal model reply:
+- Duplicate records with identical `prepare_id` and payload use the smallest seq.
+- The same `prepare_id` with different content is a consistency error.
+- A mismatched `pre_llm_seq`, session ownership, reference type, causal
+  relationship, or reference uniqueness is a consistency error.
+- A WAL record without a model request is rebuilt from exact input references.
+- A current model request without a result waits until timeout, then either publishes the next retry or remains blocked at the configured limit.
+- Late results from older retries are stale and have no side effects.
+- If the current retry result was fully validated and accepted, missing
+  `model-content:{model_request_id}` for its non-empty content is reconciled and published.
+- If the current retry result was fully validated and accepted, missing Cmd
+  requests are restored in tool order from deterministic payloads. Recovery
+  associates existing requests with `cmd_request_id` by the same order and
+  payload validation.
+- Tool results not covered by a later WAL return to the session input queue.
+- A Cmd request without a result waits before its deadline; after the deadline the
+  Agent reconciles history and publishes `cmd.request.timeout` if no result exists.
+- A `cmd.request.timeout` not covered by a later prepare returns to the session
+  input queue as `cmd_timeout`.
 
-```text
-im send.request.request_id == "freeze:{turn_id}"
-```
+Recovery never decides that a unit of work started, completed, or closed.
 
-Meaning:
+## 9. Versioning
 
-- WAL records the user message seq list prepared for this LLM request and the
-  previous LLM request seq observed when the WAL record was written.
-- `infer.request` does not set `prev_seq`; the corresponding WAL is recovered
-  from the `wal_seq` embedded in `request_id`.
-- `send.request` does not set `prev_seq`; it is associated with the selected
-  model request through `request_id="im:{model_request_id}"`.
-- A freeze `send.request` is also a terminal reply for the same `turn_id`, but
-  it is an Agent-generated pause message rather than a model result. It uses
-  `request_id="freeze:{turn_id}"` and does not set `prev_seq`.
-- `infer.result.prev_seq` and `send.result.prev_seq` remain required by their
-  respective protocols and only express that a result points to a request in the
-  same protocol.
-- Command calls are correlated outside the WAL payload through
-  `cmd.run.request.request_id="cmd:{model_request_id}:{tool_call_index}"`.
-  Command results are mapped into later model input as `exec_result` events.
-  Output-read results are mapped as `read_stdout_result` or
-  `read_stderr_result` events. WAL still stores only `pre_llm_seq` and
-  `user_message_seqs`.
-
-## 6. Recovery Semantics
-
-When the Agent scans the WAL channel after restart:
-
-- If a `llm.request.prepare` exists, but no `infer.request` with
-  `request_id == "agent:{session_id}:wal:{wal_seq}"` exists, and the turn has
-  not been closed by a later result or IM reply, the Agent MUST rebuild the
-  prompt and user message batch from full OpenEvent history and republish the
-  corresponding `infer.request` using that WAL record. If it cannot rebuild the
-  request, it MUST enter an error state and exit for manual inspection.
-- If a `llm.request.prepare` exists and an `infer.request` with
-  `request_id == "agent:{session_id}:wal:{wal_seq}"` already exists, the Agent
-  MUST continue recovery based on that model request state and MUST NOT create a
-  new WAL record for the same attempt.
-- If that model request has a failed attempt result, recovery MUST apply the
-  same retry/freeze rules as live processing. It does not write a normal IM
-  failure reply and does not advance prompt state from that failed attempt.
-- If a WAL record's `user_message_seqs` have already been covered by a later
-  completed turn and there is no isolated side effect that needs compensation,
-  the WAL record can be treated as history and does not trigger republishing.
-- If `pre_llm_seq` does not match the previous LLM request seq reconstructed
-  from scanned history, the Agent MUST record a consistency error, enter an
-  error state, and exit to avoid duplicate advancement caused by concurrent
-  Agent processes or configuration mistakes.
-
-WAL expresses only the fact that the Agent is "prepared to submit". Whether the
-model request has actually been published is determined only by the existence of
-`llm.v1 infer.request.request_id == "agent:{session_id}:wal:{wal_seq}"`.
-
-The Agent design decides how to republish isolated WAL records, but it must stay
-within these boundaries:
-
-- If the previous model request referenced by `pre_llm_seq` has the same
-  `user_message_seqs`, the current WAL can be treated as the next attempt of the
-  same turn.
-- If the previous model request referenced by `pre_llm_seq` has different
-  `user_message_seqs`, the current WAL represents a new turn.
-- If `pre_llm_seq` is `0`, the current WAL represents the first request in the
-  session.
-- If recovery cannot rebuild the prompt or user message batch from full
-  OpenEvent history, the Agent MUST NOT guess the request body. It must enter an
-  error state and exit for manual handling.
-- If the attempt count for a turn has reached `max_model_attempts` and the last
-  unaccepted attempt has failed, the Agent restores that session as frozen. A
-  later user `sync.record` unfreezes the session and starts a new turn.
-
-## 7. Versioning
-
-- `agent.wal.v1` is a strict schema. Unknown payload fields are invalid and
-  MUST be rejected.
-- The first version defines only `llm.request.prepare`; other `kind` values are
-  invalid in `agent.wal.v1`.
-- Adding payload fields, adding `kind` values, or changing already defined field
-  semantics requires a new channel protocol, such as `agent.wal.v2`.
+- `agent.wal.v1` uses a strict schema.
+- This is still a draft and is not compatible with earlier draft data.
+- Breaking changes after stable release require a new protocol version.

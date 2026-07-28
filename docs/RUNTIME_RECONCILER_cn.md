@@ -50,7 +50,8 @@ python3 scripts/reconcile_runtime.py --spec runtime.yaml --print-config agent
 示例里保留的是常用配置；字段表中标为“否”的字段可以删掉并使用默认值。
 `runtime.supervisor.ctl`、`view.port`、`tokens`、`im.sync.*`、`model.provider_name`、
 `model.timeout_ms`、`agent.name`、`agent.max_context_messages`、`agent.model_timeout_ms`、
-`agent.max_model_attempts`、`agent.freeze_message`、`channels.visibility` 和
+`agent.max_model_attempts`、
+`channels.visibility` 和
 `sessions[].enabled` 都不是必填项。
 
 ```yaml
@@ -73,10 +74,7 @@ openevent:
   admin_addr: 127.0.0.1:9528
   max_payload_bytes: 16777216
   storage:
-    metadata_path: openevent-stack/data/openevent/meta
-  store:
-    rocksdb:
-      path: openevent-stack/data/openevent/messages
+    path: openevent-stack/data/openevent
 
 view:
   port: 8080
@@ -105,9 +103,11 @@ im:
     app_id: cli_replace_with_lark_app_id
     app_secret: replace_with_lark_app_secret
   sync:
-    interval_ms: 5000
+    history_retry_delay_ms: 1000
+    history_overlap_ms: 300000
+    history_lookback_ms: 300000
     page_size: 50
-    startup_lookback_ms: 300000
+    event_queue_size: 1000
 
 model:
   proxy_principal: p_model_proxy
@@ -129,7 +129,7 @@ agent:
   max_context_messages: 20
   model_timeout_ms: 60000
   max_model_attempts: 3
-  freeze_message: "模型服务暂时没有响应，会话已暂停。请再发送一条消息以继续。"
+  cmd_result_timeout_ms: 330000
 
 channels:
   visibility: private
@@ -168,8 +168,7 @@ sessions:
 | --- | --- | --- | --- |
 | `openevent.grpc_addr` | 是 | | 业务 gRPC 地址，给 SDK、IM syncer、model-proxy 和 Agent 使用。 |
 | `openevent.admin_addr` | 是 | | 管理 gRPC 地址，Reconciler 用它调用 `ListTokens` 和 `AddToken`。 |
-| `openevent.storage.metadata_path` | 是 | | OpenEvent metadata 存储路径。相对路径按 demo 仓库根目录解析。 |
-| `openevent.store.rocksdb.path` | 是 | | OpenEvent 消息 RocksDB 存储路径。相对路径按 demo 仓库根目录解析。 |
+| `openevent.storage.path` | 是 | | OpenEvent 统一 RocksDB 数据目录；metadata 和消息使用同一 DB 的不同 Column Family。相对路径按 demo 仓库根目录解析。 |
 | `openevent.max_payload_bytes` | 否 | `16777216` | 写入 OpenEvent server、model-proxy 和 cmd-worker 配置。 |
 
 ### Principals And Tokens
@@ -211,9 +210,11 @@ token 协调顺序：
 | `im.bot.app_id` | 是 | | Feishu/Lark 应用 ID。也用于生成 bot mapping 的 `external_user_id`。 |
 | `im.bot.app_secret` | 是 | | Feishu/Lark 应用密钥。写入 `im-p2p-syncer.yaml`。 |
 | `im.bot.api_base_url` | 否 | provider 默认值 | 不建议在输入 YAML 暴露。由 `im.provider` 推导：`feishu` 为 `https://open.feishu.cn`，`lark` 为 `https://open.larksuite.com`。 |
-| `im.sync.interval_ms` | 否 | `5000` | IM 轮询间隔。 |
+| `im.sync.history_retry_delay_ms` | 否 | `1000` | Provider 历史拉取失败后的重试间隔。 |
+| `im.sync.history_overlap_ms` | 否 | `300000` | 历史拉取水位的重叠窗口。 |
+| `im.sync.history_lookback_ms` | 否 | `300000` | 首次启动的历史回看窗口。 |
 | `im.sync.page_size` | 否 | `50` | Provider 消息分页大小。 |
-| `im.sync.startup_lookback_ms` | 否 | `300000` | 首次轮询回看窗口。 |
+| `im.sync.event_queue_size` | 否 | `1000` | Provider 实时事件队列容量。 |
 
 Feishu/Lark bot 消息按应用身份映射。Reconciler 使用 `im.bot.app_id`
 作为 bot mapping 的 `external_user_id`。
@@ -271,6 +272,9 @@ Reconciler 不暴露 Provider `chat_id`。它会根据 enabled session 的 `user
 | `model.model` | 是 | | Agent 构造模型请求时使用的模型名。不会写入 model-proxy provider 配置。 |
 | `model.timeout_ms` | 否 | `65000` | model-proxy 调 provider 的总超时。 |
 
+生成的 model-proxy 配置只显式允许 `POST /v1/chat/completions` 和
+`POST /v1/responses`。其他 Provider method 或 path 会在发送 HTTP 请求前被拒绝。
+
 ### Agent
 
 | 字段 | 必填 | 默认 | 说明 |
@@ -280,8 +284,8 @@ Reconciler 不暴露 Provider `chat_id`。它会根据 enabled session 的 `user
 | `agent.system_prompt` | 是 | | Agent system prompt。 |
 | `agent.max_context_messages` | 否 | `20` | Agent 自维护 prompt 的上下文上限。 |
 | `agent.model_timeout_ms` | 否 | `60000` | Agent 等待模型结果的超时时间。 |
-| `agent.max_model_attempts` | 否 | `3` | 同一 turn 的最大模型尝试次数。 |
-| `agent.freeze_message` | 否 | 内置英文文案 | 模型 attempt 多次失败后写回 IM 的冻结提示。 |
+| `agent.max_model_attempts` | 否 | `3` | 同一 WAL 的最大自动尝试次数；具体 retry 和 blocked 语义见 [Agent WAL 协议](AGENT_WAL_PROTOCOL_cn.md)。 |
+| `agent.cmd_result_timeout_ms` | 否 | `330000` | Agent 等待 Cmd result 的时间；超时并完成历史对账后向模型提供失败工具结果。 |
 
 ### Channels
 
@@ -309,10 +313,10 @@ Reconciler 不暴露 Provider `chat_id`。它会根据 enabled session 的 `user
 | `sessions[].channels.model` | 否 | `<runtime.name>.llm.<session_id>` | Model channel 名称。 |
 | `sessions[].channels.wal` | 否 | `<runtime.name>.wal.<session_id>` | WAL channel 名称。 |
 | `sessions[].channels.cmd` | 否 | `<runtime.name>.cmd.<session_id>` | Agent 本地命令调用使用的 Cmd channel 名称。 |
-| `sessions[].channel_ids.im` | 否 | | 人工指定已有 IM channel id。 |
-| `sessions[].channel_ids.model` | 否 | | 人工指定已有 Model channel id。 |
-| `sessions[].channel_ids.wal` | 否 | | 人工指定已有 WAL channel id。 |
-| `sessions[].channel_ids.cmd` | 否 | | 人工指定已有 Cmd channel id。 |
+| `sessions[].channel_ids.im` | 否 | | 未初始化 session 的指定 IM channel id；初始化后只能省略或与已绑定 id 相同。 |
+| `sessions[].channel_ids.model` | 否 | | 未初始化 session 的指定 Model channel id；初始化后只能省略或与已绑定 id 相同。 |
+| `sessions[].channel_ids.wal` | 否 | | 未初始化 session 的指定 WAL channel id；初始化后只能省略或与已绑定 id 相同。 |
+| `sessions[].channel_ids.cmd` | 否 | | 未初始化 session 的指定 Cmd channel id；初始化后只能省略或与已绑定 id 相同。 |
 
 同一份 Agent 配置中，enabled session 的 `model`、`wal` 和 `cmd` channel name 必须唯一。
 IM channel name 也必须唯一。每个 enabled session 最终会写入一个 IM channel id、
@@ -332,8 +336,7 @@ config/desired.normalized.yaml
 config/state.yaml
 config/secrets.yaml
 config/plan.yaml
-data/openevent/meta/
-data/openevent/messages/
+data/openevent/
 data/cmd-worker-output/
 ```
 
@@ -341,13 +344,13 @@ data/cmd-worker-output/
 
 | 文件 | 说明 |
 | --- | --- |
-| `config/openevent-server.yaml` | OpenEvent server 配置，包含 gRPC/admin 地址和 `openevent.storage`/`openevent.store` 指定的数据路径。 |
+| `config/openevent-server.yaml` | OpenEvent server 配置，包含 gRPC/admin 地址和 `openevent.storage.path` 指定的统一 RocksDB 路径。 |
 | `config/im-p2p-syncer.yaml` | IM syncer 配置，包含 Feishu/Lark 凭据、用户/bot mappings、principal tokens。 |
-| `config/model-proxy.yaml` | model-proxy 配置，包含 provider base URL/API key、OpenEvent token、响应 header 过滤开关。 |
+| `config/model-proxy.yaml` | model-proxy 配置，包含 provider base URL/API key、OpenEvent token、channel ids 和请求限制。 |
 | `config/cmd-worker.yaml` | cmd-worker 配置，包含 OpenEvent token、cmd channel ids、输出目录、并发和超时设置。 |
 | `config/im-model-agent.yaml` | Agent 配置，包含 Agent token、模型名、IM/Model/WAL/Cmd channel ids。 |
 | `config/desired.normalized.yaml` | 展开默认值后的目标状态。敏感值会被 redacted。 |
-| `config/state.yaml` | 上次 apply 的配置摘要、token 摘要、channel id 和 apply 状态。 |
+| `config/state.yaml` | 配置摘要、token 摘要、所有已初始化 session 的永久 channel 绑定，以及最近一次 apply 的状态和阶段。 |
 | `config/secrets.yaml` | 自动创建或采用的 OpenEvent 明文 token。 |
 | `config/plan.yaml` | 本次 apply 的 actions 和配置摘要。 |
 
@@ -356,18 +359,22 @@ data/cmd-worker-output/
 
 ## Apply 流程
 
-`--apply` 顺序是：
+`--apply` 在 `config/state.yaml` 中记录五个检查点：
 
-1. 解析输入 YAML，填默认值，校验字段。
-2. 生成并写入 `config/openevent-server.yaml`。
-3. 如果 OpenEvent 配置变化，重启 OpenEvent。
-4. 确保 OpenEvent 进程已运行，并等待业务端口和管理端口可用。
-5. 解析或创建 OpenEvent token。
-6. 解析或创建 IM、Model、Cmd、WAL channel。
-7. 生成 IM syncer、model-proxy、cmd-worker 和 Agent 配置。
-8. 写入 `config/desired.normalized.yaml`、`config/` 下的组件配置、`config/state.yaml`、`config/secrets.yaml`、`config/plan.yaml`。
-9. 对配置变化的下游进程执行 restart；如果 OpenEvent 配置变化，会强制重启下游进程。
-10. 确保 model-proxy、cmd-worker、IM syncer 和 Agent 进程处于 running 状态。
+| 阶段 | 已完成的工作 |
+| --- | --- |
+| `parsed` | 输入 YAML 已解析，默认值已展开，字段已校验。 |
+| `openevent_ready` | 已写入 `config/openevent-server.yaml`，按需启动或重启 OpenEvent，并确认业务端口和管理端口可用。 |
+| `resources_resolved` | 已解析或创建 Provider 身份和会话、OpenEvent token，以及 IM/Model/Cmd/WAL channel。 |
+| `config_committed` | 已渲染并校验所有下游配置，并写入 normalized desired state、组件配置、secrets、plan 和 state。 |
+| `processes_running` | 已按依赖顺序重启配置变化的下游进程，启动缺失进程，并由 supervisor 确认所有配置的程序都处于 `RUNNING`。 |
+
+`last_apply.status` 取值为 `in_progress`、`complete` 或 `failed`。
+`last_apply.phase` 表示最后完成的检查点。失败时，`last_apply.failed_phase` 表示当时正在执行的
+检查点。时间戳分别记录 apply 开始、最近更新以及完成或失败的时间。
+
+只有到达 `processes_running`，apply 才会记为 `complete`。这个阶段只证明 supervisor 观察到
+进程在运行，不等于端到端健康；它不能证明 Provider 凭据、模型请求、IM 投递或完整事件链路可用。
 
 重启顺序：
 
@@ -375,7 +382,8 @@ data/cmd-worker-output/
 openevent -> model_proxy -> cmd_worker -> im_syncer -> agent
 ```
 
-Agent 最后启动，因为它依赖 IM syncer、model-proxy 和 cmd-worker 的 channel 已经可消费。
+Agent 最后启动，让 IM syncer、model-proxy 和 cmd-worker 先收到 start/restart 命令；这个顺序本身
+不证明它们已经 ready。
 
 ## Token 协调
 
@@ -397,14 +405,22 @@ token 使用位置：
 
 ## Channel 协调
 
-Reconciler 会尽量复用已有 channel，而不是每次创建新 channel。
+`session_id` 是 IM、Model、WAL、Cmd 四个 channel 的永久绑定键。一个 session 的四个 channel 全部
+解析、校验并在 `config_committed` 阶段以完整映射写入 `config/state.yaml` 后，该 session 完成初始化。
+四个 id 必须作为一组提交；部分映射不代表初始化完成。
 
-查找优先级：
+Channel 协调分为两个生命周期：
 
-1. `config/state.yaml` 中记录的 channel id。
-2. 输入 YAML 中显式写的 channel id。
-3. OpenEvent `ListChannels` 中 name 相同的 channel。
-4. OpenEvent `ListChannels` 中 protocol 和 description 稳定业务字段匹配的 channel。
+1. 未初始化：每类 channel 按输入 YAML 中的显式 id、同名 channel、protocol 和 description 稳定
+   业务字段匹配的 channel 依次查找；没有可复用候选时创建。显式 id 是指令，不是提示：它不存在、
+   不可访问或不兼容时，apply 直接失败，不能回退到自动发现或创建。
+2. 已初始化：`config/state.yaml` 中保存的四个 id 是唯一权威映射。输入中的显式 id 可以省略；如果
+   提供，必须与保存值相同。任一 id 不同，或者已绑定 channel 缺失、不可访问或不兼容时，apply
+   直接失败；Reconciler 不再查找或创建替代 channel。
+
+禁用 session、从目标配置中暂时移除 session，或随后重新启用，都不解除绑定。`config/state.yaml`
+必须保留所有已初始化 session 的完整映射，而不只保留当前 enabled session。需要更换任一 channel
+时，必须使用新的 `session_id` 创建新 session；原 `session_id` 不提供解绑或重绑操作。
 
 可复用条件：
 
@@ -414,9 +430,9 @@ Reconciler 会尽量复用已有 channel，而不是每次创建新 channel。
 - channel creator 必须是 `agent.principal` 解析出的 principal。
 - 必需成员已经存在，或 `agent.principal` 的 token 可用且能通过 `AddMember` 补齐。
 
-不可复用时会创建新 channel。Reconciler 不会修改旧 channel 的 `protocol`、`description`、
-`visibility` 或 `creator`，因为当前 OpenEvent API 没有 channel update。它也不会删除旧
-channel 或历史事件。
+只缺必需成员时，Reconciler 可以按上述条件补齐成员；这不改变 channel 身份。Reconciler 不会修改
+旧 channel 的 `protocol`、`description`、`visibility` 或 `creator`，因为当前 OpenEvent API 没有
+channel update。它也不会删除旧 channel 或历史事件。
 
 description 稳定字段：
 
@@ -427,60 +443,20 @@ description 稳定字段：
 | WAL | `version=v1`、`session_id`、`im_channel_id`、`model_channel_id`、`metadata.runtime_name` |
 | Cmd | `version=v1`、`metadata.runtime_name`、`metadata.agent_session_id`、`metadata.cmd_worker_principal` |
 
-创建顺序：
-
-1. IM channel。
-2. Model channel。
-3. Cmd channel。
-4. WAL channel。
-
-WAL description 需要最终 IM/Model channel id，所以 WAL 必须最后创建。
+WAL 的解析依赖最终 IM 和 Model channel id，因为它的 description 会记录这两个 id。Cmd 和 WAL
+之间没有顺序依赖，设计不再规定更强的创建顺序。
 
 ## 派生配置要点
 
-IM syncer：
+这里只记录无法从输入字段名直接看出的映射。各组件自己的文档仍是其配置 schema 和运行行为的
+权威来源。
 
-- `worker.principal/token` 使用 `im.worker_principal` 引用的 principal。
-- `principal_tokens` 包含每个 active user 和 bot principal 的 token；不包含 worker 自己。
-- 每个 enabled session 生成两条 active mapping：
-  - `identity_type=user`，`external_user_id` 来自用户 `external_id` 或手机号/邮箱解析结果。
-  - `identity_type=bot`，`external_user_id` 使用 `im.bot.app_id`。
-- `openevent.publish.use_auto_seq` 固定为 `true`。
-- Feishu/Lark sync mode 固定为 `poll`。
-
-Model proxy：
-
-- `protocol` 固定为 `llm.v1`。
-- 请求幂等由 model-proxy 进程内内存处理；启动恢复时，model-proxy 通过扫描 OpenEvent 日志重建该状态。
-- `model.base_url/api_key/timeout_ms` 写入 provider 配置。
-- `model.model` 不写入 model-proxy provider；它写入 Agent 配置，由 Agent 构造请求 body。
-
-Cmd worker：
-
-- `protocol` 固定为 `cmd.v1`。
-- `principal/token` 使用 `cmd.worker_principal` 引用的 principal。
-- `channel_ids` 包含 enabled sessions 最终解析出的 cmd channel ids。
-- `output_dir` 默认写到 `<runtime_root>/data/cmd-worker-output`。
-- cmd worker 是 stack 组件；Agent 不直接执行 shell 命令。
-
-Agent：
-
-- `agent.principal/token` 使用 `agent.principal` 引用的 principal。
-- 每个 enabled session 写入最终解析出的 `im_channel_id`、`model_channel_id` 和
-  `wal_channel_id`、`cmd_channel_id`。
-- Agent 配置不包含 `from_seq`；Agent 自己从 OpenEvent 历史恢复状态，再继续实时消费。
-
-## 限制和边界
-
-- 当前只支持 `im.provider=feishu|lark` 和 `im.session_type=p2p`。
-- 当前不允许 `channels.visibility=public`。
-- Reconciler 不分配 principal，只为已声明 principal 创建 token。
-- Reconciler 不删除 token、channel 或历史事件。
-- Reconciler 不更新已有 channel 的 immutable metadata；metadata 漂移时创建新 channel。
-- Reconciler 只能防止本配置生成多个 model-proxy 消费同一个 Model channel；不能从 OpenEvent 层强制全局互斥。
-- Reconciler 会防止本配置生成多个 cmd-worker 消费同一个 Cmd channel；但不能从 OpenEvent 层强制全局互斥。
-- `--dry-run` 使用预览 token/channel id，不代表真实 OpenEvent 状态。
-- 生成配置包含密钥；runtime root 不应该提交到 git。
+| 组件 | 生成契约 |
+| --- | --- |
+| IM syncer | `worker.principal/token` 来自 `im.worker_principal`；`principal_tokens` 包含 enabled user 和 bot，不包含 worker。每个 enabled session 生成一条 user mapping 和一条 bot mapping；user `external_user_id` 使用显式值或手机号/邮箱解析结果，bot 使用 `im.bot.app_id`。 |
+| model-proxy | protocol 固定为 `llm.v1`；`channels` 包含 enabled Model channel ids。provider 配置接收 `model.base_url/api_key/timeout_ms`；`model.model` 只进入 Agent 配置。 |
+| cmd-worker | protocol 固定为 `cmd.v1`；principal/token 和 enabled Cmd channel ids 从目标状态解析。`output_dir` 默认是 `<runtime_root>/data/cmd-worker-output`；Agent 不直接执行 shell。 |
+| Agent | 每个 enabled session 生成 principal/token 和四个最终 channel id。配置没有 `from_seq`；Agent 从 OpenEvent 历史恢复消费位置。 |
 
 ## 排错
 
@@ -509,7 +485,7 @@ python3 scripts/reconcile_runtime.py --spec openevent-stack/stack.yaml --print-c
 | 文件 | 看什么 |
 | --- | --- |
 | `config/plan.yaml` | 本次创建/采用 token、创建/复用 channel、写配置和重启动作。 |
-| `config/state.yaml` | 当前 runtime 记录的 token 摘要、channel id 和配置摘要。 |
+| `config/state.yaml` | 当前 token/config 摘要、已初始化 session 的永久 channel 绑定，以及 `last_apply` 状态、已完成阶段或失败阶段。 |
 | `config/secrets.yaml` | 自动创建或采用的 OpenEvent token。注意保密。 |
 | `config/*.yaml` 组件配置 | 最终传给各组件的真实配置。 |
 | `logs/*.log` | 本地 `openevent-stack/process.sh` 启动的组件日志。 |
@@ -527,14 +503,9 @@ python3 scripts/reconcile_runtime.py --spec openevent-stack/stack.yaml --print-c
 | `created token is not usable for principal ...` | 通常是同一端口上残留了多个 OpenEvent 进程，Admin 和业务 gRPC 请求落到了不同实例；`openevent-stack/process.sh start openevent` 会清理同配置的陈旧进程。 |
 | `supervisor start/restart failed` | 检查 `runtime.supervisor.ctl` 和 `runtime.supervisor.programs.*` 是否能启动对应进程。 |
 
-## 依赖项目契约
+## 依赖契约
 
-- OpenEvent API 和 token/channel 行为以 `openevent-sdk/docs/API.md` 为准。
-- OpenEvent server 配置以 `openevent/docs/CONFIG.md` 为准。
-- IM P2P syncer 配置以 `openevent-modules-im/docs/IM-P2P-SYNCER.md` 为准。
-- model-proxy 配置以 `openevent-modules-model-proxy/docs/CONFIGURATION.md` 为准。
-- Cmd 协议、worker 配置和 SDK 行为以 `openevent-modules-cmd/docs/CMD_PROTOCOL.md`、
-  `openevent-modules-cmd/docs/CONFIGURATION.md` 和
-  `openevent-modules-cmd/docs/SDK_USAGE.md` 为准。
-- Agent 行为以 [IM_MODEL_AGENT_cn.md](IM_MODEL_AGENT_cn.md) 为准。
-- Agent WAL payload 以 [AGENT_WAL_PROTOCOL_cn.md](AGENT_WAL_PROTOCOL_cn.md) 为准。
+生成配置使用当前 Python 环境中已安装组件的 config parser 校验。OpenEvent 和各 Worker 的 API、
+协议与配置 schema 仍以组件自己的公开文档为准；Reconciler 只负责本文定义的输入到配置映射。Agent
+行为和 WAL 字段由本项目的 [IM_MODEL_AGENT_cn.md](IM_MODEL_AGENT_cn.md) 与
+[AGENT_WAL_PROTOCOL_cn.md](AGENT_WAL_PROTOCOL_cn.md) 定义。
