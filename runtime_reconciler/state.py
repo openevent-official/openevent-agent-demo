@@ -1,269 +1,141 @@
 from __future__ import annotations
-
-import time
+import json
+import sys
 from pathlib import Path
-from typing import Any
-
 import yaml
-
 from .common import _atomic_write, _dump_yaml, _sha256
-from .model import ChannelIds, DesiredSpec, ResolvedRuntime, _required_principal_refs
-from .render import _validate_openevent_config, render_configs, render_openevent_config, validate_configs
+from .model import ApplyError, STATE_VERSION
 
-
-APPLY_PHASES = (
-    "parsed",
-    "openevent_ready",
-    "resources_resolved",
-    "config_committed",
-    "processes_running",
+INITIALIZATION_FAILURE_MESSAGE = (
+    "deployment initialization did not complete; automatic resume is unavailable. "
+    "Existing processes, data and resources are preserved and require operator review; "
+    "see the Runtime initialization-failure guidance before deciding what to keep or rebuild"
 )
-APPLY_STATUSES = {"in_progress", "complete", "failed"}
 
-
-def load_state(path: Path) -> dict[str, Any] | None:
+def load_state(path: Path, *, expected_version=STATE_VERSION, spec=None):
     if not path.exists():
         return None
     data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    return data if isinstance(data, dict) else None
+    if not isinstance(data, dict) or data.get("version") != expected_version:
+        raise ApplyError(f"unsupported state format in {path.name}; old IM state is not migrated")
+    if spec and data.get("deployment_id") != spec.deployment_id:
+        raise ApplyError("runtime state belongs to another deployment")
+    if spec and data.get("principals") != spec.principals:
+        raise ApplyError("deployment principals cannot change in an initialized runtime")
+    if spec and data.get("work_root") != spec.agent["work_root"]:
+        raise ApplyError("work_root cannot change in an initialized deployment")
+    if spec and data.get("supervisor") != {"ctl": spec.supervisor_ctl, "programs": spec.supervisor_programs}:
+        raise ApplyError("runtime state is missing its supervisor binding or supervisor.ctl/programs changed; use a new deployment")
+    if data.get("initialized") and (not isinstance(data.get("channels"), dict) or set(data["channels"]) != {"model", "cmd", "wal"}):
+        raise ApplyError("initialized deployment is missing its permanent Channel binding")
+    return data
 
+def save_state(spec, state):
+    state = {**state, "version": STATE_VERSION, "deployment_id": spec.deployment_id, "principals": spec.principals,
+             "work_root": spec.agent["work_root"],
+             "supervisor": {"ctl": spec.supervisor_ctl, "programs": spec.supervisor_programs}}
+    if "configs" in state:
+        state["configs"] = {key: {"path": item["path"], "sha256": item["sha256"]}
+                            for key, item in state["configs"].items()}
+    _atomic_write(spec.paths.state_path, _dump_yaml(state), 0o600)
 
-def _state_channel_ids(state: dict[str, Any] | None, session_id: str) -> dict[str, int]:
-    if not state:
-        return {}
-    raw = (((state.get("channels") or {}).get("sessions") or {}).get(session_id) or {})
-    result: dict[str, int] = {}
-    for key in ("im", "model", "wal", "cmd"):
-        item = raw.get(key)
-        if not isinstance(item, dict):
-            return {}
-        value = item.get("channel_id")
-        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-            return {}
-        result[key] = value
-    return result
+def require_completed_initialization(state):
+    if state is not None and not state.get("initialized"):
+        raise ApplyError(INITIALIZATION_FAILURE_MESSAGE)
 
+def begin_apply(spec, pending=()):
+    state = load_state(spec.paths.state_path, spec=spec)
+    require_completed_initialization(state)
+    if not spec.paths.state_path.exists() and spec.paths.secrets_path.exists():
+        raise ApplyError("existing deployment is missing its runtime state; refusing to initialize new bindings")
+    state = state or {}
+    # Until every generated file is committed, even the old spec cannot
+    # safely start a possibly mixed set of configuration files.
+    state.pop("applied_spec_sha256", None)
+    state["pending_restarts"] = sorted(set(state.get("pending_restarts", ())) | set(pending))
+    save_state(spec, state)
 
-def _state_channel_binding(state: dict[str, Any] | None, session_id: str) -> ChannelIds | None:
-    ids = _state_channel_ids(state, session_id)
-    return ChannelIds(**ids) if ids else None
+def add_pending_restarts(spec, pending):
+    state = load_state(spec.paths.state_path, spec=spec) or {}
+    state["pending_restarts"] = sorted(set(state.get("pending_restarts", ())) | set(pending))
+    save_state(spec, state)
 
+def complete_start(spec):
+    state = load_state(spec.paths.state_path, spec=spec) or {}
+    state["initialized"] = True
+    state["pending_restarts"] = []
+    save_state(spec, state)
 
-def begin_apply(spec: DesiredSpec) -> None:
-    spec.paths.runtime_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    spec.paths.config_dir.mkdir(parents=True, exist_ok=True)
-    state = load_state(spec.paths.state_path) or {
-        "version": "v1",
-        "runtime_name": spec.runtime_name,
-    }
-    _write_apply_state(spec, state, phase="parsed", status="in_progress", reset=True)
+def _config_content(name, data):
+    return json.dumps(data, ensure_ascii=False, indent=2) + "\n" if name.endswith(".json") else _dump_yaml(data)
 
+def config_record(spec, key, name, data, previous):
+    digest = _sha256(_config_content(name, data).encode())
+    return {"path": str(spec.paths.config_dir / name), "sha256": digest,
+            "changed": (key in previous.get("pending_restarts", ())
+                        or previous.get("configs", {}).get(key, {}).get("sha256") != digest)}
 
-def record_apply_phase(
-    spec: DesiredSpec,
-    phase: str,
-    status: str = "in_progress",
-    *,
-    failed_phase: str | None = None,
-) -> None:
-    state = load_state(spec.paths.state_path) or {
-        "version": "v1",
-        "runtime_name": spec.runtime_name,
-    }
-    _write_apply_state(
-        spec,
-        state,
-        phase=phase,
-        status=status,
-        failed_phase=failed_phase,
-    )
-
-
-def write_openevent_config(spec: DesiredSpec) -> dict[str, Any]:
-    spec.paths.runtime_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    spec.paths.config_dir.mkdir(parents=True, exist_ok=True)
-    spec.openevent_storage_path.mkdir(parents=True, exist_ok=True)
-    data = render_openevent_config(spec)
-    _validate_openevent_config(data)
-    path = spec.paths.config_dir / "openevent-server.yaml"
-    content = _dump_yaml(data)
-    previous = path.read_text(encoding="utf-8") if path.exists() else None
-    changed = previous != content
+def _write_config(spec, name, data):
+    path = spec.paths.config_dir / name
+    content = _config_content(name, data)
+    changed = not path.exists() or path.read_text(encoding="utf-8") != content
     if changed:
         _atomic_write(path, content, 0o600)
-    return {"path": str(path), "sha256": _sha256(content.encode("utf-8")), "changed": changed}
+    return {"path": str(path), "sha256": _sha256(content.encode()), "changed": changed}
 
+def write_openevent_config(spec):
+    from .render import render_openevent_config
+    Path(spec.openevent["storage_path"]).mkdir(parents=True, exist_ok=True)
+    return _write_config(spec, "openevent-server.yaml", render_openevent_config(spec))
 
-def write_runtime_files(
-    spec: DesiredSpec,
-    resolved: ResolvedRuntime,
-    dry_run: bool,
-    openevent_config: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+def prepare_runtime_files(spec, resolved):
+    from .render import render_configs, validate_configs
     configs = render_configs(spec, resolved)
     validate_configs(configs)
-    plan = {"actions": list(resolved.actions), "configs": {}}
+    previous = load_state(spec.paths.state_path, spec=spec) or {}
+    plan = {"actions": resolved.actions, "configs": {
+        key: config_record(spec, key, item["path"], item["data"], previous)
+        for key, item in configs.items()}}
+    plan["configs"]["cmd_worker"]["changed"] |= previous.get("cmd_environment") != {
+        "object_target": spec.agent["object_target"]}
+    return configs, plan
+
+def write_runtime_files(spec, resolved, dry_run, *, prepared=None, completed=()):
+    from .render import render_configs
+    plan = {"actions": resolved.actions, "configs": {}}
     if dry_run:
-        for name, item in configs.items():
-            content = _dump_yaml(item["data"])
-            plan["configs"][name] = {
-                "path": str(spec.paths.config_dir / item["path"]),
-                "sha256": _sha256(content.encode("utf-8")),
-                "would_write": True,
-            }
+        configs = render_configs(spec, resolved)
+        channels = {kind: channel_id for kind, channel_id in resolved.channels.as_dict().items()
+                    if channel_id is not None}
+        if channels:
+            plan["channels"] = channels
+        plan["notes"] = ["OpenEvent access tokens will be reused or created automatically during --apply."]
+        for key, item in configs.items():
+            plan["configs"][key] = {"path": str(spec.paths.config_dir / item["path"]), "would_write": True}
         return plan
-    spec.paths.runtime_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    spec.paths.config_dir.mkdir(parents=True, exist_ok=True)
-    spec.openevent_storage_path.mkdir(parents=True, exist_ok=True)
-    _atomic_write(spec.paths.desired_path, _dump_yaml(spec.normalized()), 0o600)
-    for name, item in configs.items():
-        if openevent_config is not None and name == "openevent":
-            plan["configs"][name] = openevent_config
-            continue
-        path = spec.paths.config_dir / item["path"]
-        content = _dump_yaml(item["data"])
-        previous = path.read_text(encoding="utf-8") if path.exists() else None
-        changed = previous != content
-        if changed:
-            _atomic_write(path, content, 0o600)
-        plan["configs"][name] = {"path": str(path), "sha256": _sha256(content.encode("utf-8")), "changed": changed}
-    previous_state = load_state(spec.paths.state_path) or {}
-    apply_state = _next_apply_state(
-        previous_state.get("last_apply"),
-        phase="config_committed",
-        status="in_progress",
-    )
-    state = {
-        "version": "v1",
-        "runtime_name": spec.runtime_name,
-        "last_apply": apply_state,
-        "configs": plan["configs"],
-        "tokens": _token_state(spec, resolved),
-        "channels": _channel_state(previous_state, resolved),
-    }
-    state["im"] = _im_state(spec, resolved)
-    _atomic_write(spec.paths.secrets_path, _dump_yaml(_secrets_state(spec, resolved)), 0o600)
-    _atomic_write(spec.paths.plan_path, _dump_yaml(plan), 0o600)
-    _atomic_write(spec.paths.state_path, _dump_yaml(state), 0o600)
+    configs, plan = prepared or prepare_runtime_files(spec, resolved)
+    for key, item in configs.items():
+        _write_config(spec, item["path"], item["data"])
+        if key in completed:
+            plan["configs"][key]["changed"] = False
+    environment = {"object_target": spec.agent["object_target"]}
+    state = load_state(spec.paths.state_path, spec=spec) or {}
+    pending = (set(state.get("pending_restarts", ()))
+               | {key for key, item in plan["configs"].items() if item["changed"]}) - set(completed)
+    state.pop("chat_launch", None)
+    state.update({"channels": resolved.channels.as_dict(), "configs": plan["configs"],
+                  "cmd_environment": environment,
+                  "applied_spec_sha256": spec.fingerprint(),
+                  "pending_restarts": sorted(pending)})
+    save_state(spec, state)
+    (spec.paths.config_dir / "chat-launch.json").unlink(missing_ok=True)
     return plan
 
 
-def _write_apply_state(
-    spec: DesiredSpec,
-    state: dict[str, Any],
-    *,
-    phase: str,
-    status: str,
-    reset: bool = False,
-    failed_phase: str | None = None,
-) -> None:
-    previous = None if reset else state.get("last_apply")
-    apply_state = _next_apply_state(
-        previous,
-        phase=phase,
-        status=status,
-        failed_phase=failed_phase,
-    )
-    state["version"] = "v1"
-    state["runtime_name"] = spec.runtime_name
-    state["last_apply"] = apply_state
-    state.pop("last_apply_status", None)
-    state.pop("last_apply_ms", None)
-    _atomic_write(spec.paths.state_path, _dump_yaml(state), 0o600)
-
-
-def _next_apply_state(
-    previous: Any,
-    *,
-    phase: str,
-    status: str,
-    failed_phase: str | None = None,
-) -> dict[str, Any]:
-    if phase not in APPLY_PHASES:
-        raise ValueError(f"unknown apply phase: {phase}")
-    if status not in APPLY_STATUSES:
-        raise ValueError(f"unknown apply status: {status}")
-    if failed_phase is not None and failed_phase not in APPLY_PHASES:
-        raise ValueError(f"unknown failed apply phase: {failed_phase}")
-    now_ms = int(time.time() * 1000)
-    previous = previous if isinstance(previous, dict) else {}
-    result = {
-        "status": status,
-        "phase": phase,
-        "started_at_ms": previous.get("started_at_ms", now_ms),
-        "updated_at_ms": now_ms,
-    }
-    if failed_phase is not None:
-        result["failed_phase"] = failed_phase
-    if status in {"complete", "failed"}:
-        result["completed_at_ms"] = now_ms
-    return result
-
-
-def _token_state(spec: DesiredSpec, resolved: ResolvedRuntime) -> dict[str, Any]:
-    return {
-        key: {
-            "principal": spec.principals[key],
-            "source": resolved.token_sources[key],
-            "token_sha256": _sha256(resolved.tokens[key].encode("utf-8")),
-        }
-        for key in _required_principal_refs(spec)
-    }
-
-
-def _im_state(spec: DesiredSpec, resolved: ResolvedRuntime) -> dict[str, Any]:
-    return {
-        "provider": spec.im_provider,
-        "users": {
-            user.principal: {
-                "external_id_source": resolved.im_user_external_id_sources[user.principal],
-                "external_id_sha256": _sha256(
-                    resolved.im_user_external_ids[user.principal].encode("utf-8")
-                ),
-            }
-            for user in spec.im_users
-        },
-        "sessions": {
-            session.session_id: {
-                "provider": spec.im_provider,
-                "provider_session_id": resolved.im_provider_session_ids[session.session_id],
-                "provider_session_id_source": resolved.im_provider_session_id_sources[session.session_id],
-                "provider_session_id_sha256": _sha256(
-                    resolved.im_provider_session_ids[session.session_id].encode("utf-8")
-                ),
-            }
-            for session in spec.sessions
-            if session.enabled
-        },
-    }
-
-
-def _channel_state(previous: dict[str, Any], resolved: ResolvedRuntime) -> dict[str, Any]:
-    bindings: dict[str, ChannelIds] = {}
-    previous_sessions = ((previous.get("channels") or {}).get("sessions") or {})
-    if isinstance(previous_sessions, dict):
-        for session_id in previous_sessions:
-            if isinstance(session_id, str) and (binding := _state_channel_binding(previous, session_id)):
-                bindings[session_id] = binding
-    bindings.update(resolved.channels)
-    return {
-        "sessions": {
-            session_id: {
-                "im": {"channel_id": ids.im},
-                "model": {"channel_id": ids.model},
-                "wal": {"channel_id": ids.wal},
-                "cmd": {"channel_id": ids.cmd},
-            }
-            for session_id, ids in bindings.items()
-        }
-    }
-
-
-def _secrets_state(spec: DesiredSpec, resolved: ResolvedRuntime) -> dict[str, Any]:
-    return {
-        "version": "v1",
-        "tokens": {
-            key: {"principal": spec.principals[key], "token": resolved.tokens[key]}
-            for key in _required_principal_refs(spec)
-        },
-    }
+def write_diagnostics(spec, plan):
+    """Export optional snapshots after a successful apply; never used for recovery."""
+    for path, data in ((spec.paths.desired_path, spec.normalized()), (spec.paths.plan_path, plan)):
+        try:
+            _atomic_write(path, _dump_yaml(data), 0o600)
+        except OSError as exc:
+            print(f"warning: could not write diagnostic snapshot {path}: {exc}", file=sys.stderr)

@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openevent-agent-demo"
+version = "0.2.0"
+description = "Chat Agent and runtime coordination for OpenEvent"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.10"
+dependencies = [
+    "PyYAML>=6.0",
+    "openevent-sdk>=0.13.0",
+    "openevent-modules-chat>=0.1.0",
+    "openevent-model-proxy>=0.1.1",
+    "openevent-modules-cmd>=0.3.0,<0.4.0",
+    "openevent-view>=0.1.0",
+]
+
+[project.scripts]
+chat-model-agent = "chat_model_agent.cli:main"
+openevent-read-object = "chat_model_agent.read_object:main"
+
+[tool.setuptools]
+packages = ["chat_model_agent", "runtime_reconciler"]
+include-package-data = false

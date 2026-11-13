@@ -1,560 +1,390 @@
-# Runtime Reconciler
+# Chat Runtime Reconciler
 
-[中文版](RUNTIME_RECONCILER_cn.md)
+> Implementation status: prompt-file loading, context byte-budget previews, the Chat text limit, and `agent.wal.v5` deployment configuration are implemented. See the [README](../README.md) for test coverage and external integration limits.
 
-Runtime Reconciler is the runtime-environment reconciliation script for the
-Agent demo. It reads a declarative YAML file, generates runtime configuration
-for OpenEvent, the IM P2P syncer, model-proxy, cmd-worker, and IM Model Agent,
-and with `--apply` reconciles OpenEvent tokens, channels, and local processes.
+Runtime prepares credentials, three shared auxiliary Channels, component configuration and local processes for one Chat Agent deployment.
+Chat Server creates browser sessions and Agent discovers them; Runtime does not maintain a session list or read Chat's session directory.
+The following specifies deployment configuration and execution flow.
+See the [Agent guide](CHAT_MODEL_AGENT.md#conversation-discovery) for conversation discovery and Agent configuration.
+The deployment spec accepts only `chat-runtime.v1`.
 
-It does not implement IM synchronization, model calls, or Agent business logic.
-Those responsibilities remain in their respective components. Reconciler only
-connects those components with one consistent set of principals, tokens,
-channels, and configuration files.
+## Entry points
 
-The `view` section in `openevent-stack/stack.yaml` is consumed by the
-`openevent-stack` scripts. Reconciler itself manages only the core
-components. `openevent-view` is a required component of the Agent demo; it
-depends on OpenEvent and is configured and started by `bootstrap.sh` /
-`start.sh` after OpenEvent is running.
-
-Local command support uses `openevent-modules-cmd` and `cmd-worker`. Reconciler
-generates `cmd-worker` configuration, creates or reuses per-session `cmd.v1`
-channels, and writes resolved cmd channel ids into Agent configuration.
-
-## CLI
+Run from the project directory:
 
 ```bash
-python3 scripts/reconcile_runtime.py --spec runtime.yaml --dry-run
-python3 scripts/reconcile_runtime.py --spec runtime.yaml --apply
-python3 scripts/reconcile_runtime.py --spec runtime.yaml --runtime-root openevent-stack --apply
-python3 scripts/reconcile_runtime.py --spec runtime.yaml --print-config agent
+python -B -m runtime_reconciler.cli --spec openevent-stack/stack.yaml --runtime-root "$PWD/openevent-stack/runtime" --dry-run
+python -B -m runtime_reconciler.cli --spec openevent-stack/stack.yaml --runtime-root "$PWD/openevent-stack/runtime" --apply
+python -B -m runtime_reconciler.cli --spec openevent-stack/stack.yaml --runtime-root "$PWD/openevent-stack/runtime" --start
 ```
 
-Arguments:
+The commands above and the stack scripts run Runtime source from the project directory.
+The local deployment also provides `openevent-stack/bootstrap.sh --dry-run|--apply`,
+`start.sh`, `stop.sh`, `status.sh` and `logs.sh [program]`.
+`--apply` reports progress through five main stages: checking configuration, preparing OpenEvent, resolving credentials and Channels, preparing service configuration, and updating services.
+Both `--apply` and `--start` identify services being started or stopped, indicate when waiting for a service to exit, and can report that a reused service is already running.
+Each progress line is flushed immediately, including when output is piped. Successful completion still prints a short success message;
+`bootstrap.sh --apply` and `start.sh` then show the actual process status of each service and the Chat and View access URLs.
+`--dry-run` and `--print-config` continue to output a YAML plan or configuration without progress messages.
+The Chat URL uses configured `chat.origin` when present, otherwise an HTTP address built from its listening host and port, with the page path `/api/chat/`.
+The View URL uses its listening host and port with the page path `/`. Wildcard listening addresses `0.0.0.0` and `::` are displayed as local addresses `127.0.0.1` and `[::1]`; other IPv6 addresses are also enclosed in brackets.
 
-| Argument | Description |
-| --- | --- |
-| `--spec` | Input YAML. Required. |
-| `--dry-run` | Parse, fill defaults, generate a preview plan and configuration summary only. Does not write configuration, connect to OpenEvent, create tokens/channels, or restart processes. |
-| `--apply` | Write configuration, start/restart OpenEvent, create or reuse tokens/channels, write final component configuration, and restart downstream components. |
-| `--runtime-root` | Override `runtime.root` from the input YAML. Relative paths are resolved from the repository root. |
-| `--print-config` | Print the dry-run parsed configuration for one component. One of `openevent`, `im_syncer`, `model_proxy`, `cmd_worker`, or `agent`. |
+Local stack scripts always use `openevent-stack/runtime/` as their runtime directory, with generated configuration, state, data, logs and PID files below it.
+Symlinks in the local stack directory path are consistently resolved to real paths, so startup, status checks and shutdown identify the same deployment.
+They explicitly pass `--runtime-root`, so changing `runtime.root` in the spec does not change their directory; the template omits that field.
+The direct commands above use an absolute path so they use the same directory as the local process scripts.
+Other deployments can use `runtime.root` or `--runtime-root` through the general command entry point,
+with their own process controller reading configuration from the selected directory.
 
-Exit codes:
+- `--dry-run` checks the user spec and existing deployment bindings, then previews configuration paths without OpenEvent calls or writing runtime configuration, bindings or secrets.
+  The plan's `channels` list only known IDs; the entire section is omitted when all Model/Cmd/WAL IDs are unknown. Unknown IDs are resolved automatically during `--apply`.
+  The plan has no `unresolved` list; `notes` explains that OpenEvent access tokens will be reused or created automatically during `--apply`, without requiring users to supply them manually.
+  Previews use no temporary IDs or tokens and do not pass unresolved configuration to component validators; a successful preview does not mean the complete component configuration has been validated.
+- `--apply` first checks the user spec, existing deployment bindings and OpenEvent configuration, which needs no Channel IDs or tokens.
+  It makes OpenEvent ready at the target addresses in the order below before preparing actual resources. After obtaining Channel IDs and valid tokens,
+  it runs the remaining component validators, commits the complete configuration, then continues startup. After successful initialization, repeated calls reuse bindings and valid credentials.
+  Component validation temporary files go under the current working directory's `build/validation/`.
+- `--write-diagnostics` is accepted only with `--apply` and exports the optional diagnostic files described below;
+  the local script accepts `openevent-stack/bootstrap.sh --apply --write-diagnostics`.
+- `--start` is only for deployments whose first initialization completed successfully. Changes to mutable settings, including credentials
+  or explicit OpenEvent tokens, require apply first. The process controller and names are fixed
+  as described below and cannot be replaced by apply.
+- `--runtime-root DIR` overrides the runtime directory.
+- `--print-config openevent|chat_server|model_proxy|cmd_worker|agent|view` prints a preview.
+  Explicit credentials remain in this output; unresolved fields are `null`. This preview cannot be used directly as runtime configuration.
 
-| Exit Code | Meaning |
-| --- | --- |
-| `0` | Success. |
-| `1` | Unclassified runtime error. |
-| `2` | Input YAML validation failed. |
-| `3` | Apply phase failed, for example OpenEvent is not ready or process startup failed. |
+Relative paths in a spec are resolved against its directory. Generated runtime paths are absolute.
+A `supervisor.ctl` without a slash is searched on PATH; otherwise it follows the same path resolution.
+Exit codes are 1 for unexpected failures, 2 for spec errors and 3 for reconciliation failures.
 
-## Input Example
+## Configuration
 
-The example keeps common fields. Fields marked "no" in the field tables can be
-deleted and will use defaults. `runtime.supervisor.ctl`, `view.port`, `tokens`,
-`im.sync.*`, `model.provider_name`, `model.timeout_ms`, `agent.name`,
-`agent.max_context_messages`, `agent.model_timeout_ms`,
-`agent.max_model_attempts`,
-`channels.visibility`, and
-`sessions[].enabled` are all optional.
+Minimal structure, with example tokens and keys replaced by deployment values:
 
 ```yaml
-version: v1
-
+version: chat-runtime.v1
 runtime:
-  name: openevent-stack
-  root: openevent-stack
+  name: my-chat
+  root: ./data
   supervisor:
-    ctl: ./openevent-stack/process.sh
-    programs:
-      openevent: openevent
-      im_syncer: im-p2p-syncer
-      model_proxy: model-proxy
-      cmd_worker: cmd-worker
-      agent: im-model-agent
-
+    ctl: supervisorctl
 openevent:
   grpc_addr: 127.0.0.1:9527
   admin_addr: 127.0.0.1:9528
-  max_payload_bytes: 16777216
-  storage:
-    path: openevent-stack/data/openevent
-
-view:
-  port: 8080
-
 principals:
-  p_im_worker: 90001
-  p_bot: 90002
-  p_model_proxy: 20001
-  p_cmd_worker: 30001
-  p_user: 10001
-
-tokens: {}
-
-im:
-  provider: lark
-  session_type: p2p
-  worker_principal: p_im_worker
-  users:
-    - principal: p_user
-      user_email: user@example.com
-      # Or use external_id/user_phone instead. --apply resolves email/phone to open_id.
-      # external_id: ou_replace_with_lark_user_open_id
-      # user_phone: "+8613800000000"
-  bot:
-    principal: p_bot
-    app_id: cli_replace_with_lark_app_id
-    app_secret: replace_with_lark_app_secret
-  sync:
-    history_retry_delay_ms: 1000
-    history_overlap_ms: 300000
-    history_lookback_ms: 300000
-    page_size: 50
-    event_queue_size: 1000
-
-model:
-  proxy_principal: p_model_proxy
-  provider_name: openai_main
-  base_url: https://api.openai.com
-  api_key: replace_with_model_api_key
-  model: gpt-4o-mini
-  timeout_ms: 65000
-
+  user: 10001
+  agent: 10002
+  model_proxy: 20001
+  cmd_worker: 30001
 cmd:
-  worker_principal: p_cmd_worker
-  max_concurrent_tasks: 8
+  max_concurrent_tasks: 4
   default_timeout_ms: 300000
-
+chat:
+  host: 127.0.0.1
+  port: 8081
+  origin: null
+  web_token: replace-with-web-token
+  max_user_message_bytes: 65536
+model:
+  provider_name: default
+  base_url: https://api.example.com
+  api_key: replace-with-model-key
+  model: example-model
 agent:
-  principal: p_bot
-  name: im-model-agent
-  system_prompt: "You are an assistant that talks with users through IM."
-  max_context_messages: 20
-  model_timeout_ms: 60000
-  max_model_attempts: 3
-  cmd_result_timeout_ms: 330000
-
-channels:
-  visibility: private
-
-sessions:
-  - session_id: s1
-    enabled: true
-    user:
-      principal: p_user
-    channels:
-      im: openevent-stack.im.s1
-      model: openevent-stack.llm.s1
-      wal: openevent-stack.wal.s1
-      cmd: openevent-stack.cmd.s1
+  system_prompt_file: ./prompts/system.txt
+  context_compression_prompt_file: ./prompts/context_compression.txt
+  context_max_input_bytes: 1048576
 ```
 
-## Input Fields
+The four principals must be distinct positive uint64 values. Only Chat Server receives the user credential;
+Agent, Model Proxy and Cmd Worker each use their own credential.
+The web token is separate from OpenEvent tokens. The model key only enters Model Proxy configuration.
 
-### Runtime
+This example uses the same total request budget as the [complete request examples](examples/README.md), together with
+Chat's default text limit and Agent's default tool-output allowance. Example checks cover text escaping and a tool returning
+both stdout and stderr; attachment descriptions, reply context, and error details still undergo complete-event admission.
+After changing prompts, the model name, or allowances, inspect the budget preview below. Text and output allowances count raw
+bytes and cannot be used directly as encoded model-event allowances.
 
-| Field | Required | Description |
+| Configuration | Meaning and default |
+| --- | --- |
+| `runtime.name` | Required stable deployment ID |
+| `runtime.root` | Runtime directory for the general entry point; defaults to `runtime/<name>`; local stack scripts always override it with `openevent-stack/runtime/` |
+| `runtime.supervisor.ctl` | Process control accepting `status/start/stop <program>`; supervisorctl; fixed after the first apply |
+| `runtime.supervisor.programs` | Optional initial logical-to-process name overrides, below; fixed after the first apply |
+| `openevent.storage.path` | `data/openevent` under the runtime directory |
+| `openevent.max_payload_bytes` | 16777216; generated configuration is also checked by module parsers. The same cap is passed to Agent, Model Proxy and Cmd; see [Agent configuration](CHAT_MODEL_AGENT.md#agent-configuration) for encoded-size checks |
+| `tokens` | Optional mapping keyed by user, agent, model_proxy, cmd_worker |
+| `chat.channels_dir` | `chat-sessions` under the runtime directory; managed exclusively by Chat Server |
+| `chat.host/port/origin` | Defaults to 127.0.0.1 / 8081; optional origin defaults to null; written to the same-named fields in `chat-server.json` |
+| `chat.max_user_message_bytes` | Optional, 65536 by default; positive integer, excluding booleans. Passed unchanged to the same-named Chat Server field, limiting UTF-8 bytes of individual new user-message text, excluding attachment files and quoted target text; Agent checks its complete model-request budget separately |
+| `model.provider_name` | default |
+| `model.response_header_ms/idle_ms` | Provider response header/idle timeouts; 60000 each |
+| `model.max_concurrency` | Model Proxy concurrency shared by all sessions; 4 |
+| `cmd.output_dir` | `cmd-output` under the runtime directory |
+| `cmd.max_concurrent_tasks/default_timeout_ms` | 4 / 300000 |
+| `channels.model/cmd/wal` | Use `auto` or omit a field to discover or create the Channel during initialization as described below, or supply an existing positive uint64 ID. The entire `channels` mapping may be omitted; `null` and numeric strings are rejected. After initialization, the permanent binding always applies |
+| `view.port` | 9999; View listens on 0.0.0.0 |
+| `agent.system_prompt_file` | Required UTF-8 file path for the complete system prompt; see below |
+| `agent.context_compression_prompt_file` | Required UTF-8 file path for the complete compression prompt; see below |
+| `agent.context_max_input_bytes` | Required, with no default; see [Agent context byte budget](CHAT_MODEL_AGENT.md#context-byte-budget) |
+| `agent.model_retry_interval_ms` | Optional; passed unchanged to Agent. See [Model Retry Interval](CHAT_MODEL_AGENT.md#model-retry-interval) for the default and waiting rules |
+| `rpc.max_retries/timeout_ms` | 3 / 10000; passed to Agent, while other components receive only supported public configuration fields. The RPC retry interval is fixed internally at 100 milliseconds to match the current Chat SDK and is not configurable |
+
+`runtime.startup_timeout_ms` has been removed from the configuration design and is not accepted; startup does not wait for Agent object references to become ready.
+
+Runtime options under `agent` follow [Chat Agent configuration](CHAT_MODEL_AGENT.md). The prompt file inputs below
+are read by Runtime into text fields in the generated Agent configuration; Agent does not receive the source paths.
+Runtime injects identities, the three Channels, model name and Provider; `work_root` defaults to `workdir` under the runtime directory.
+Runtime's `agent.object_target` defaults to the OpenEvent business address and only configures the object reader's
+environment in Cmd; it is not written to Agent configuration.
+Agent scheduling slots and Model Proxy execution concurrency are configured separately;
+see [Agent configuration](CHAT_MODEL_AGENT.md#agent-configuration) for the meaning of Agent slots.
+
+| Logical name | Default process | Configuration |
 | --- | --- | --- |
-| `version` | yes | Must be `v1`. |
-| `runtime.name` | yes | Runtime name. Written to normalized state and used in channel description metadata. |
-| `runtime.root` | no | Runtime directory. Defaults to `runtime/<runtime.name>`; `--runtime-root` has highest priority. |
-| `runtime.supervisor.ctl` | no | Process control command. Defaults to `supervisorctl`. `openevent-stack` uses the local `process.sh`. |
-| `runtime.supervisor.programs.openevent` | yes | OpenEvent process name. |
-| `runtime.supervisor.programs.im_syncer` | yes | IM P2P syncer process name. |
-| `runtime.supervisor.programs.model_proxy` | yes | model-proxy process name. |
-| `runtime.supervisor.programs.cmd_worker` | yes | cmd-worker process name. |
-| `runtime.supervisor.programs.agent` | yes | IM Model Agent process name. |
+| openevent | openevent | openevent-server.yaml |
+| model_proxy | model-proxy | model-proxy.yaml |
+| chat_server | chat-server | chat-server.json, including host, port, and origin |
+| view | openevent-view | openevent-view.yaml |
+| agent | chat-model-agent | chat-model-agent.json |
+| cmd_worker | cmd-worker | cmd-worker.yaml |
 
-### OpenEvent
+Configuration is stored under runtime `config/` with mode 0600.
+`state.yaml` uses `chat-runtime.state.v1`; `secrets.yaml` uses `chat-runtime.secrets.v1`.
+The Chat startup command passes only `--config`; listening parameters and the access URL displayed after startup are read from `chat-server.json`.
+Diagnostic files are not written by default. With `--write-diagnostics`, only after apply finishes starting every component
+and saves its successful state, Runtime exports `desired.normalized.yaml` (redacted configuration) and `plan.yaml`
+(the configuration write plan for this apply), both with mode 0600.
+The detailed plan, including fields such as `changed` and `sha256`, is exported only through this option and is not printed in normal success output.
+Diagnostic write failures only produce warnings on standard error and do not affect deployment success.
+These files are never used for startup, recovery or identifying an existing deployment.
+They are snapshots of that export: later runs without the option, or failed exports, may leave old contents. They can be deleted directly.
+`initialized: true` is saved only after the first apply finishes starting every component. If deployment state already
+exists but that initialization failed or was interrupted, another apply or start fails and preserves the existing state;
+this release does not resume partial initialization automatically. Operations decides which resources to retain, whether to rebuild, and the scope of any rebuild as described below.
+Before controlling any process, the first apply saves the resolved controller and full process name mapping
+as the state's `supervisor` binding. This binding remains fixed for the deployment; it can be selected again only after ending the old deployment and creating new state.
+Subsequent entry points reject a missing binding or changed settings before controlling processes;
+this release does not support migrating the controller or process names.
+State also stores `applied_spec_sha256`, a digest of the full effective configuration used by `--start`;
+comparison never relies on the redacted display file. After its preliminary checks, before stopping the first process or overwriting configuration,
+apply clears this digest, preserves the last fully committed component configuration records,
+and persists the components that need stopping and starting again or updating by merging them into existing `pending_restarts`.
+The configuration records and pending restarts together determine which running processes still need updates.
+Writing OpenEvent configuration early does not commit the full configuration. Once the remaining components pass validation
+and all configuration files have been written, the digest, new configuration records and remaining pending restarts are saved atomically;
+OpenEvent startup already completed in the earlier step is recorded as complete at this point.
+For a successfully initialized deployment, an update interrupted before this full commit requires apply again;
+after it, start may finish the pending restarts.
+State must contain `principals` and `work_root` matching the current configuration; a different deployment ID or missing permanent bindings also fails.
 
-| Field | Required | Default | Description |
-| --- | --- | --- | --- |
-| `openevent.grpc_addr` | yes | | Business gRPC address used by the SDK, IM syncer, model-proxy, and Agent. |
-| `openevent.admin_addr` | yes | | Admin gRPC address used by Reconciler to call `ListTokens` and `AddToken`. |
-| `openevent.storage.path` | yes | | Unified OpenEvent RocksDB directory. Metadata and messages use different Column Families in the same DB. Relative paths are resolved from the demo repository root. |
-| `openevent.max_payload_bytes` | no | `16777216` | Written to OpenEvent server, model-proxy, and cmd-worker configuration. |
+## Prompt files
 
-### Principals And Tokens
+`agent.system_prompt_file` and `agent.context_compression_prompt_file` require explicit nonempty paths.
+Resolve relative paths against the spec directory; absolute paths identify deployment files. The repository provides the
+[default system prompt](../openevent-stack/prompts/system.txt) and [default compression prompt](../openevent-stack/prompts/context_compression.txt) used by the example.
+For a spec in `openevent-stack/`, use the example's `./prompts/` paths directly. For a spec elsewhere, copy the files into its `prompts/` directory or explicitly select deployment paths.
+These are repository files, not implicit defaults when required paths are omitted. The `stack.yaml` template explicitly configures both file paths.
+The default system file contains complete business instructions and tool, summary and event-input, and attachment guidance. Code no longer appends another protocol prompt implicitly.
+Follow the [model input/output format](MODEL_IO.md) when editing prompts; [request examples](examples/README.md) include summaries and compression requests.
+See [Agent conversations and replies](CHAT_MODEL_AGENT.md#conversations-and-replies) for how task information in a summary relates to later result events;
+Runtime does not maintain a separate task input.
+The compression file is a separate complete prompt, not concatenated with the normal system file. Preserve UTF-8 text as read;
+the system file may be empty, while the compression file must contain non-whitespace text.
+There is no template substitution or parallel inline `agent.system_prompt` or compression-prompt input in the spec.
 
-OpenEvent has no separate principal creation API. A principal is an integer
-identity used in token bindings, channel members, and message publishers.
-Reconciler does not allocate principals automatically; they must be declared
-explicitly in `principals`.
+`--dry-run`, `--print-config`, `--apply`, and `--start` each read both files once while parsing the spec.
+Missing, unreadable, or non-UTF-8 files fail before state writes or process control. Preview, comparison, and generation within one operation use that same text snapshot.
+Previews read files without writing runtime data or calling OpenEvent; `--print-config agent` displays the complete resolved texts.
+`--dry-run` and `--print-config agent` also print a budget baseline calculated from configured `B` to standard error: the configured request cap,
+fixed overhead, history and single-event targets, and the current Chat text and per-stream raw tool-output limits.
+Use the prompt texts read for that operation, the model name, and tool definitions, following the
+[Agent's sole budget rules](CHAT_MODEL_AGENT.md#context-byte-budget). No Channel IDs, tokens, or OpenEvent calls are needed.
+Failure of the configuration itself to meet baseline requirements is a configuration error.
+This is an offline preview that does not account for Model publication capacity. The effective runtime budget and compression target are
+also constrained by OpenEvent's actual sending limits. A configured model-input cap larger than that capacity does not reject deployment,
+and no new configuration setting is introduced.
+Standard output for these two previews retains the YAML plan or configuration format. These derived values are only for preview, not new user settings or persistent state.
 
-`principals` is a global registry. The key is only a name inside this
-configuration file and does not express a role. Each module references the
-principals it needs by these names.
+Generated `chat-model-agent.json` contains `agent.system_prompt`, `agent.context_compression_prompt`, and the context byte budget.
+Agent reads only that generated configuration, without watching or rereading source prompt files. The effective configuration digest includes both texts
+and the budget, rather than treating paths or modification times as content. Changed text at the same path makes `--start` require apply first;
+a different path with identical text does not change the effective configuration. After successful initialization, changing only prompts or the budget
+updates Agent configuration and restarts Agent under the existing rules, without restarting unchanged dependencies.
+Texts frozen into prepared normal or compression requests remain fixed. Updates affect newly prepared requests, never retries or recovery of old inputs.
+The new configuration must also pass [Agent compatibility checks for history and unfinished requests](CHAT_MODEL_AGENT.md#context-byte-budget).
+Those checks distinguish configured-budget changes from current publication-capacity changes. Reduced sending capacity alone does not reject
+recovery of the entire Agent; continuing execution follows the public Agent rules.
 
-| Field | Required | Description |
-| --- | --- | --- |
-| `principals.<name>` | yes | OpenEvent principal integer. `<name>` can be freely chosen. |
-| `tokens.<name>` | no | Token for `principals.<name>`. If omitted, `--apply` uses an existing token or creates a new one. |
+Compression and normal inference share the existing model, Provider, wait timeout, and Agent scheduling slots.
+Only [Agent context byte budget](CHAT_MODEL_AGENT.md#context-byte-budget) defines the hard history target, single-event limit, and attempt allowance; Runtime adds no second set of options.
 
-`tokens.<name>` must refer to a name already declared in `principals`. If the
-same user principal has both `tokens.<name>` and `im.users[].token`, the two
-tokens must be identical.
+## Directory layout
 
-Token reconciliation order:
+Agent and Cmd Worker must run on the same host and access the same actual `work_root` through the same absolute path.
+Identical path strings that resolve to different directories do not meet this prerequisite. Default session working directories are
+`work_root/<channel_id>`, using numeric Chat Channel IDs; Agent gives Cmd the resolved absolute path.
+Restarts and repeated apply operations do not change existing sessions' working paths.
 
-1. If input `tokens.<name>` or `im.users[].token` is usable, use it directly.
-2. If `config/secrets.yaml` already has a usable token, reuse it.
-3. If OpenEvent `ListTokens` already has a usable token for the same principal,
-   adopt it.
-4. If no usable token exists, call
-   `AdminService.AddToken(target_principal)` to create one.
-
-Every created or adopted token is verified with `GetStatus(principal, token)`.
-Business configuration needs plaintext tokens. `config/state.yaml` stores only
-digests; `config/secrets.yaml` stores OpenEvent tokens that were automatically
-created or adopted.
-
-### IM
-
-The current implementation supports Feishu/Lark P2P. Both use the same Lark
-OpenAPI shape; the main difference is the open-platform domain and tenant
-region.
-
-| Field | Required | Default | Description |
-| --- | --- | --- | --- |
-| `im.provider` | no | `lark` | Supports `feishu` or `lark`. The example uses `lark`. |
-| `im.session_type` | no | `p2p` | Currently must be `p2p`. |
-| `im.worker_principal` | yes | | Name from `principals`; used as the IM P2P syncer worker principal. |
-| `im.bot.principal` | yes | | Name from `principals`; used as the IM bot principal. It must resolve to the same principal as `agent.principal`. |
-| `im.bot.app_id` | yes | | Feishu/Lark application ID. Also used to generate the bot mapping `external_user_id`. |
-| `im.bot.app_secret` | yes | | Feishu/Lark application secret. Written to `im-p2p-syncer.yaml`. |
-| `im.bot.api_base_url` | no | provider default | Not recommended in input YAML. Derived from `im.provider`: `https://open.feishu.cn` for `feishu`, `https://open.larksuite.com` for `lark`. |
-| `im.sync.history_retry_delay_ms` | no | `1000` | Retry delay after a Provider history fetch failure. |
-| `im.sync.history_overlap_ms` | no | `300000` | Overlap window for the history fetch watermark. |
-| `im.sync.history_lookback_ms` | no | `300000` | History lookback window on first startup. |
-| `im.sync.page_size` | no | `50` | Provider message page size. |
-| `im.sync.event_queue_size` | no | `1000` | Provider live-event queue capacity. |
-
-Feishu/Lark bot messages are mapped by application identity. Reconciler uses
-`im.bot.app_id` as the bot mapping `external_user_id`.
-
-`agent.principal` must resolve to the same principal as `im.bot.principal`. The
-IM worker, model-proxy, user principal, and bot/agent principal must be distinct
-from each other so one token does not gain unintended channel-operation
-boundaries.
-
-### Command Worker
-
-Command support uses `openevent-modules-cmd`. Reconciler generates
-`cmd-worker` configuration, creates or reuses per-session `cmd.v1` channels, and
-writes the resolved cmd channel ids into Agent configuration.
-
-| Field | Required | Default | Description |
-| --- | --- | --- | --- |
-| `cmd.worker_principal` | yes | | Name from `principals`; used as the cmd-worker principal. |
-| `cmd.output_dir` | no | `<runtime.root>/data/cmd-worker-output` | Local output root for command stdout/stderr files. |
-| `cmd.max_concurrent_tasks` | no | `8` | Maximum number of concurrent local command tasks handled by cmd-worker. |
-| `cmd.default_timeout_ms` | no | `300000` | Default command timeout used when an Agent command request does not specify one. |
-
-#### IM Users
-
-`im.users[]` describes the relationship between Provider user identity and
-OpenEvent principal.
-
-| Field | Required | Description |
-| --- | --- | --- |
-| `im.users[].principal` | yes | Name from `principals`; this real user's OpenEvent principal. |
-| `im.users[].token` | no | OpenEvent token for this user principal. It can also be written in the corresponding `tokens.<name>`. |
-| `im.users[].external_id` | conditionally yes | Feishu/Lark user `open_id`. Exactly one of `external_id`, `user_phone`, or `user_email` is required. |
-| `im.users[].user_phone` | conditionally yes | User phone number. Exactly one of `external_id`, `user_phone`, or `user_email` is required. Resolved to `open_id` through Contact API during `--apply`. |
-| `im.users[].user_email` | conditionally yes | User email. Exactly one of `external_id`, `user_phone`, or `user_email` is required. Resolved to `open_id` through Contact API during `--apply`. |
-
-If `user_phone` or `user_email` is used, Reconciler calls the Provider Contact
-API, so `app_id/app_secret` must be able to access the corresponding user
-information. `--dry-run` does not access the Provider and only generates a
-placeholder external id.
-
-#### IM Channel Resolution
-
-IM channel does not need an extra configuration layer. Each session's
-`sessions[].channels.im` is the OpenEvent IM channel name. To take over an
-existing channel manually, configure `sessions[].channel_ids.im`.
-
-Reconciler does not expose Provider `chat_id`. It finds the `im.users[]` entry
-from each enabled session's `user.principal`, resolves the P2P conversation from
-the user's open_id/phone/email, and writes it to the generated
-`config/im-p2p-syncer.yaml`.
-
-Do not confuse the generated provider `session_id` with the Agent
-`sessions[].session_id`. The former is the Provider conversation ID; the latter
-is the Agent's internal stable business key.
-
-### Model
-
-| Field | Required | Default | Description |
-| --- | --- | --- | --- |
-| `model.proxy_principal` | yes | | Name from `principals`; used as the model-proxy worker principal. |
-| `model.provider_name` | no | `openai_main` | Written to model-proxy `default_provider`. |
-| `model.base_url` | yes | | OpenAI-compatible provider base URL. Do not append `/v1/chat/completions`; the Agent request path is already `/v1/chat/completions`. |
-| `model.api_key` | yes | | Model provider API key. Written to `model-proxy.yaml`. |
-| `model.model` | yes | | Model name used by the Agent when constructing request bodies. It is not written to model-proxy provider configuration. |
-| `model.timeout_ms` | no | `65000` | Total timeout for model-proxy calls to the provider. |
-
-Generated model-proxy configuration explicitly allows only
-`POST /v1/chat/completions` and `POST /v1/responses`. Requests to other provider
-methods or paths are rejected before an HTTP request is sent.
-
-### Agent
-
-| Field | Required | Default | Description |
-| --- | --- | --- | --- |
-| `agent.principal` | yes | | Name from `principals`; used as the Agent principal. It must resolve to the same principal as `im.bot.principal`. |
-| `agent.name` | no | `im-model-agent` | Agent name. |
-| `agent.system_prompt` | yes | | Agent system prompt. |
-| `agent.max_context_messages` | no | `20` | Context limit for prompts maintained by the Agent. |
-| `agent.model_timeout_ms` | no | `60000` | How long the Agent waits for a model result. |
-| `agent.max_model_attempts` | no | `3` | Maximum automatic attempts for one WAL; see the [Agent WAL protocol](AGENT_WAL_PROTOCOL.md) for retry and blocked semantics. |
-| `agent.cmd_result_timeout_ms` | no | `330000` | How long the Agent waits for a Cmd result before reconciling history and supplying a failed tool result to the model. |
-
-### Channels
-
-| Field | Required | Default | Description |
-| --- | --- | --- | --- |
-| `channels.visibility` | no | `private` | Supports `protected` or `private`. `public` is currently disallowed because `llm.v1` channels cannot be public. |
-
-Each enabled session has four channels.
-
-| Channel | Protocol | Members |
-| --- | --- | --- |
-| IM | `im.v1` | user, agent bot, IM sync worker |
-| Model | `llm.v1` | agent bot, model-proxy |
-| WAL | `agent.wal.v1` | agent bot |
-| Cmd | `cmd.v1` | agent bot, cmd-worker |
-
-### Sessions
-
-| Field | Required | Default | Description |
-| --- | --- | --- | --- |
-| `sessions[].session_id` | yes | | Stable business key for the Agent session. |
-| `sessions[].enabled` | no | `true` | Whether this session should generate configuration and channels. At least one enabled session is required. |
-| `sessions[].user.principal` | yes | | Must reference a name from `im.users[].principal`. |
-| `sessions[].channels.im` | yes | | OpenEvent IM channel name. |
-| `sessions[].channels.model` | no | `<runtime.name>.llm.<session_id>` | Model channel name. |
-| `sessions[].channels.wal` | no | `<runtime.name>.wal.<session_id>` | WAL channel name. |
-| `sessions[].channels.cmd` | no | `<runtime.name>.cmd.<session_id>` | Cmd channel name used by Agent local command calls. |
-| `sessions[].channel_ids.im` | no | | Selected IM channel id for an uninitialized session; after initialization it must be omitted or equal the bound id. |
-| `sessions[].channel_ids.model` | no | | Selected Model channel id for an uninitialized session; after initialization it must be omitted or equal the bound id. |
-| `sessions[].channel_ids.wal` | no | | Selected WAL channel id for an uninitialized session; after initialization it must be omitted or equal the bound id. |
-| `sessions[].channel_ids.cmd` | no | | Selected Cmd channel id for an uninitialized session; after initialization it must be omitted or equal the bound id. |
-
-Within one Agent configuration, enabled sessions must have unique `model`,
-`wal`, and `cmd` channel names. IM channel names must also be unique. Each
-enabled session writes one IM channel id, one Model channel id, one WAL channel
-id, and one Cmd channel id.
-
-## Generated Files
-
-By default, `--apply` writes generated configuration, state, plan, and secret
-files under `config/` in the runtime root:
+The local stack uses the following layout with default paths. Configuration path overrides only relocate the corresponding data.
 
 ```text
-config/openevent-server.yaml
-config/im-p2p-syncer.yaml
-config/model-proxy.yaml
-config/cmd-worker.yaml
-config/im-model-agent.yaml
-config/desired.normalized.yaml
-config/state.yaml
-config/secrets.yaml
-config/plan.yaml
-data/openevent/
-data/cmd-worker-output/
+openevent-stack/
+├── stack.yaml             # User-supplied deployment entry point
+├── prompts/               # Complete system/compression prompt files
+└── runtime/               # Generated deployment files and runtime data
+    ├── config/            # Component configuration, deployment state, credentials, and env.sh written during installation
+    ├── data/openevent/    # Persistent OpenEvent data: message history, objects, and related data
+    ├── logs/              # Service logs
+    ├── run/               # Process PIDs
+    ├── chat-sessions/     # Chat session configuration named <session_id>.json
+    ├── cmd-output/        # Command stdout/stderr retained by Cmd
+    └── workdir/           # Root of the Agent's default command working directories
+        └── <channel_id>/  # Numeric Chat Channel ID, such as 4
+            └── ...        # Files created or downloaded by commands
 ```
 
-File descriptions:
+Within the runtime directory, `workdir/4/` holds local command files for Channel 4. Session configuration is in the sibling `chat-sessions/`, and OpenEvent stores chat history.
+Renaming a session only changes its display name in the Chat session configuration; the numeric directory name stays the same.
+A command with an explicit `workdir` uses that path. See the [Chat application guide](https://github.com/openevent-official/openevent-modules-chat/blob/main/docs/APP_USAGE.md)
+for session-name storage and page operations.
 
-| File | Description |
-| --- | --- |
-| `config/openevent-server.yaml` | OpenEvent server configuration, including gRPC/admin addresses and the unified RocksDB path from `openevent.storage.path`. |
-| `config/im-p2p-syncer.yaml` | IM syncer configuration, including Feishu/Lark credentials, user/bot mappings, and principal tokens. |
-| `config/model-proxy.yaml` | model-proxy configuration, including provider base URL/API key, OpenEvent token, channel ids, and request limits. |
-| `config/cmd-worker.yaml` | cmd-worker configuration, including OpenEvent token, cmd channel ids, output directory, concurrency, and timeout settings. |
-| `config/im-model-agent.yaml` | Agent configuration, including Agent token, model name, and IM/Model/WAL/Cmd channel ids. |
-| `config/desired.normalized.yaml` | Desired state after defaults are expanded. Sensitive values are redacted. |
-| `config/state.yaml` | Configuration digests, token digests, permanent channel bindings for every initialized session, and the latest apply status and phase. |
-| `config/secrets.yaml` | Plaintext OpenEvent tokens that were automatically created or adopted. |
-| `config/plan.yaml` | Actions and configuration summary for this apply. |
+The environment installation script's `--workdir runtime` selects `runtime/` under the project root: `runtime/venv/` contains the Python environment,
+and `runtime/sources/` contains component checkouts and their build artifacts. This is separate from `openevent-stack/runtime/` and does not control the runtime data paths above.
+See [environment setup](UBUNTU_ENVIRONMENT.md#preparation-and-installation) for the installation workspace.
 
-When a new runtime root is created, permissions are `0700`. Generated
-configuration, state, secrets, and plan files are written with `0600`.
-Configuration files contain OpenEvent tokens, Feishu/Lark app secrets, and model
-API keys, and must not be committed.
+## Tokens and resource bindings
 
-## Apply Flow
+For each identity, Runtime checks explicit tokens and then local secrets using `GetStatus`.
+Only `UNAUTHENTICATED` proves the token invalid. Timeouts, network failures and permission errors fail apply without creating a replacement.
+Runtime calls `AddToken` only when both sources are missing or explicitly invalid.
+It reads `AddTokenResponse.token`, persists the new token, then validates it before passing it to components. It never calls `ListTokens`.
+The local secrets file is updated only when an identity-to-token mapping changes; successful validation or reuse of the same credentials does not write it again.
 
-`--apply` records five checkpoints in `config/state.yaml`:
+All sessions share private Model, Cmd and WAL Channels. Members are respectively Agent with Model Proxy,
+Agent with Cmd Worker, and Agent alone; their protocols are `llm.v1`, `cmd.v3` and `agent.wal.v5`.
+The [WAL protocol](AGENT_WAL_PROTOCOL.md) defines the WAL rules.
+Other Model/Cmd validation follows their public contracts. An explicit or already bound Cmd Channel can have an arbitrary description.
+Model/Cmd/WAL resources automatically created by Runtime store a stable deployment_id in description metadata.
+First deployment only requires the deployment configuration and `--apply`: Runtime starts OpenEvent, prepares tokens and auxiliary Channels, then starts the remaining components.
+After validation, Runtime writes the same Cmd ID into Agent and cmd-worker configuration, then starts cmd-worker before Agent as described below.
 
-| Phase | Completed work |
-| --- | --- |
-| `parsed` | The input YAML was parsed, defaults were filled, and fields were validated. |
-| `openevent_ready` | `config/openevent-server.yaml` was written, OpenEvent was started or restarted when needed, and its business and admin ports became available. |
-| `resources_resolved` | Provider identities and sessions, OpenEvent tokens, and IM/Model/Cmd/WAL channels were resolved or created. |
-| `config_committed` | All downstream configurations were rendered and validated, then normalized desired state, component configurations, secrets, plan, and state were written. |
-| `processes_running` | Changed downstream processes were restarted in dependency order, missing processes were started, and supervisor reported every configured program as `RUNNING`. |
+Model/Cmd/WAL initialization uses explicit IDs first, otherwise stable metadata discovery. Multiple candidates fail; creation requires no candidates.
+Automatic Cmd discovery only matches this deployment's metadata, not ordinary Cmd Channels with the same name or members.
+All three IDs are saved as one group after validation; partial results cannot start Agent. Per-Channel pending markers
+and partial IDs are not persisted for resuming initialization. After successful initialization, the three IDs are permanently
+bound. Renames, additional sessions and temporary access failures cannot replace them.
+Conflicting explicit IDs, missing resources and incompatible resources fail. A new deployment uses new state and WAL.
 
-`last_apply.status` is `in_progress`, `complete`, or `failed`. `last_apply.phase`
-is the last completed checkpoint. On failure, `last_apply.failed_phase` identifies
-the checkpoint that was being attempted. Timestamps record when the apply began,
-was last updated, and completed or failed.
+### Handling initialization failure
 
-An apply is `complete` only at `processes_running`. This phase confirms a
-supervisor observation, not end-to-end health: it does not prove that Provider
-credentials, model requests, IM delivery, or the complete event path work.
+Initialization succeeds only when the first apply finishes starting every component and saves the successful state.
+It involves local files, OpenEvent resources and multiple processes, rather than one transaction that can be rolled back as a unit.
+When a step fails, previously created tokens, Channels, written data and started processes may still exist.
+An entry-point error does not mean those actions did not happen or that already started business tasks have stopped.
+Runtime stops further reconciliation and preserves existing records; it does not automatically delete data, roll back resources
+or continue partial initialization. A preliminary validation failure before deployment state is generated can be retried directly after correcting the configuration.
 
-Restart order:
+Operations decides the next step from the actual processes, saved state and resources in OpenEvent. When data must be retained
+or existing resources were adopted, operators can preserve the state for investigation and repair, or isolate the old deployment
+and create an independent new one. This release has no automatic import or repair entry point for partial initialization;
+retaining data alone does not enable another apply/start to resume. A new deployment uses new state and WAL, without arbitrarily
+rebinding old session history to the new deployment. If the deployment and its resources are confirmed disposable, operators may
+instead end the old deployment, stop the relevant processes, clean up and rebuild. Shutdown and publication handoff still follow
+the prerequisite in the next section. Runtime does not decide resource ownership or the scope of deletion for operations.
 
-```text
-openevent -> model_proxy -> cmd_worker -> im_syncer -> agent
-```
+When choosing cleanup, distinguish these consequences:
 
-Agent starts last so IM syncer, model-proxy, and cmd-worker receive their
-start/restart commands first. This ordering does not itself prove readiness.
+- Deleting only local state or configuration does not undo remote resources, committed events or command effects, and does not restore the deployment.
+- Deleting OpenEvent storage removes its Channels, tokens, event history and objects. Explicit Channel IDs and tokens in the old configuration become invalid;
+  retaining the original `stack.yaml` therefore does not guarantee an unchanged rerun. Prepare resources and credentials again before rebuilding,
+  or change Channel settings that permit automatic creation to `auto`.
+- The local stack generates `config/`, `data/`, `logs/`, `run/`, `workdir/`, `cmd-output/` and `chat-sessions/` under `openevent-stack/runtime/`;
+  actual data can also reside at other configured paths. This is a list for locating data, not a requirement to delete every directory.
+  `openevent-stack/runtime/config/env.sh` stores installation paths, and deployment scripts and the installed environment can be reused;
+  check the entry configuration against the resources retained or rebuilt.
 
-## Token Reconciliation
+These boundaries concern failed first initialization only. Failed configuration updates after successful initialization
+retain runtime data and continue according to the commit boundaries below.
 
-Reconciler does not delete old tokens. It only uses, adopts, or creates tokens.
+## Startup, updates and shutdown
 
-Input tokens are optional. In fully automatic mode, keep `tokens: {}` empty;
-`--apply` creates tokens for the relevant principals through the OpenEvent Admin
-API and writes them to `config/secrets.yaml`. Later runs prefer to reuse usable
-tokens from `config/secrets.yaml`.
+Deployment prerequisite: before a new Agent recovers, operations guarantees all OpenEvent publication RPCs issued by the old Agent have ended and cannot commit late.
+Already submitted model or command business tasks need not have finished.
 
-Token usage:
+Apply runs in this order:
 
-| Token | Used By |
-| --- | --- |
-| Principal referenced by `im.worker_principal` | `im-p2p-syncer.yaml.worker.token` |
-| Principal referenced by `agent.principal` / `im.bot.principal` | `im-model-agent.yaml.agent.token`, IM syncer bot principal token, and the operator token Reconciler uses to create/maintain Agent channels |
-| Principal referenced by `model.proxy_principal` | `model-proxy.yaml.token` |
-| Principal referenced by `cmd.worker_principal` | `cmd-worker.yaml.token` |
-| Principal referenced by `im.users[].principal` | IM syncer uses it to publish inbound `sync.record` as the user principal |
+1. Validate the user spec and existing bindings, then generate and validate the OpenEvent target configuration independently; no Channel IDs or tokens are needed yet.
+2. If dependencies need updating, stop Agent and wait for it to exit before changing any dependency's runtime configuration or process.
+   When OpenEvent needs updating, also stop this deployment's Model Proxy, Chat Server, View and Cmd Worker, which use it.
+   Then write the validated OpenEvent configuration, start or restart OpenEvent as needed, and wait for the business and admin ports in the target configuration.
+   Restart decisions use the last fully committed configuration records and pending restarts in state; a file already containing target values does not prove the process uses them.
+   OpenEvent keeps running when its configuration is unchanged, no restart is pending and its process is running; start it if it is not running.
+3. Connect to the ready target addresses, validate or prepare tokens, and resolve and validate the three auxiliary Channels.
+   With real IDs and valid tokens, generate and validate the remaining component configurations, then commit the complete configuration and remaining pending restarts.
+4. Start or restart Model Proxy, Chat Server, View and Cmd Worker as needed, then start Agent last.
 
-## Channel Reconciliation
+Changing OpenEvent business or admin ports therefore switches OpenEvent before connecting to the new addresses; apply never waits for new ports that have not yet been started.
+Failure at any step stops reconciliation without starting later components or Agent, or reporting the complete apply as successful.
+Operations chooses how to handle failed first initialization as described above. For updates to successfully initialized deployments,
+if OpenEvent has switched but the full configuration has not been committed, preserve the state and rerun apply;
+no automatic rollback is performed.
+Agent recovers its history before dispatching new work. Cmd obtains attachment credentials from each run request and
+can process submitted tasks independently, without an Agent credential lookup service or recovery/dispatch handshake files.
+Process control status must report RUNNING; process status does not verify the complete model and tool workflows.
+Local status scans reuse the expected configuration path within each scan while still checking each PID, process liveness, and command line.
 
-`session_id` is the permanent binding key for the IM, Model, WAL, and Cmd
-channels. A session becomes initialized after all four channels have been
-resolved and validated and their complete mapping is written to
-`config/state.yaml` during `config_committed`. The four ids are committed as one
-set; a partial mapping does not initialize a session.
+Cmd Worker reads the object service address from `cmd_environment` in the generated deployment state `state.yaml`,
+then sets `OPENEVENT_OBJECT_TARGET`. Failure to read this value fails startup.
+Its PATH includes the deployment Python bin directory, making the installed `openevent-read-object` command available.
+Default session working directories follow the deployment prerequisites and path rules in [Directory layout](#directory-layout).
+Agent documentation defines the in-memory attachment mapping and command-result semantics.
 
-Channel reconciliation has two lifecycle paths:
+After successful initialization, repeated apply restarts only changed components, components and Agent stopped for dependency updates, and continues existing pending restarts.
+If a change becomes known only after resolving real resources and generating complete component configuration, Agent must still stop before committing dependency configuration and updating processes.
+Agent resumes dispatch only after recovery, preventing new dispatch while dependencies are being updated.
+Restarts still required after the full configuration commit remain in state `pending_restarts` until all subsequent processes have started successfully.
+Apply or start resumes these items according to the commit boundary above, instead of treating updated files as proof that running processes use the new configuration.
+`--start` neither resolves resources again nor changes configuration: first ensure OpenEvent is running with the committed
+configuration and its target addresses are ready, then start the other dependencies and complete their pending restarts,
+and finally start Agent. Removing OpenEvent from the pending restart list does not skip its running-status check.
+Changes to the listening parameters or origin in Chat configuration, or to the worker object-reading environment, also restart their component.
+New browser sessions do not trigger apply or change worker configuration. Unchanged running processes without pending restarts are not restarted.
 
-1. Uninitialized: for each channel type, try the explicit id from the input
-   YAML, a channel with the same name, and then a channel whose protocol and
-   stable description business fields match. Create a channel only when no
-   candidate is reusable. An explicit id is an instruction, not a hint: if it
-   is missing, inaccessible, or incompatible, apply fails without falling back
-   to discovery or creation.
-2. Initialized: the four ids stored in `config/state.yaml` are the only
-   authoritative mapping. Explicit ids may be omitted; when provided, they
-   must equal the stored values. If any id differs or any bound channel is
-   missing, inaccessible, or incompatible, apply fails. Reconciler does not
-   discover or create a replacement.
+Normal shutdown sends Agent SIGTERM, waits for it to finish draining and exit, then stops workers and other dependencies.
+The local process script validates the PID before sending a signal and imposes no overall time limit while waiting for Agent to exit.
+Other components have ten seconds to exit after SIGTERM; if still running, they receive SIGKILL, followed by up to
+two more seconds to confirm exit. If a stop signal fails while the process is still alive, or another component's exit
+remains unconfirmed after forced termination, the stop command fails and preserves the PID record.
+Stack shutdown stops at that failure without closing dependencies; startup cleanup and restart likewise cannot launch
+a replacement process after such a failure. Restart after forced termination still follows the operations prerequisite
+above and Agent's history recovery.
+Stopping only Agent does not make it send business cancellations; workers that remain running can continue processing submitted tasks.
+After Cmd restarts, accepted commands without a final result receive
+`RECOVERY_FAILED` and are not rerun, following [Cmd recovery rules](https://github.com/openevent-official/openevent-modules-cmd/blob/main/docs/CONFIGURATION.md#recovery-and-exit).
+Agent alone defines failure freezing, cancellation, RPC retries and model history.
 
-Disabling a session, temporarily removing it from the desired configuration,
-or later re-enabling it does not release the binding. `config/state.yaml` must
-retain the complete mapping for every initialized session, not only currently
-enabled sessions. Replacing any channel requires a new `session_id`; the
-original `session_id` has no unbind or rebind operation.
+## Dependencies and validation
 
-Reusable conditions:
-
-- `protocol` matches.
-- `visibility` matches and is not forbidden by the protocol.
-- `description` is valid JSON and stable business fields match.
-- Channel creator must be the principal resolved from `agent.principal`.
-- Required members already exist, or the `agent.principal` token is usable and
-  can add missing members through `AddMember`.
-
-When only required members are missing, Reconciler may add them under the
-conditions above; this does not change channel identity. Reconciler does not
-modify the `protocol`, `description`, `visibility`, or `creator` of old channels,
-because the current OpenEvent API has no channel update operation. It also does
-not delete old channels or historical events.
-
-Stable description fields:
-
-| Channel | Stable Fields |
-| --- | --- |
-| IM | `version=v1`, `provider`, `session_id`, `session_type`, `metadata.runtime_name`, `metadata.agent_session_id` |
-| Model | `version=v1`, `metadata.runtime_name`, `metadata.agent_session_id`, `metadata.model_proxy_principal` |
-| WAL | `version=v1`, `session_id`, `im_channel_id`, `model_channel_id`, `metadata.runtime_name` |
-| Cmd | `version=v1`, `metadata.runtime_name`, `metadata.agent_session_id`, `metadata.cmd_worker_principal` |
-
-WAL resolution depends on the final IM and Model channel ids because both are
-stored in its description. Cmd has no ordering dependency on WAL; no stronger
-creation order is part of the contract.
-
-## Derived Configuration Notes
-
-This table records only mappings that are not obvious from the input field
-names. Each component's own documentation remains authoritative for its config
-schema and runtime behavior.
-
-| Component | Generated Contract |
-| --- | --- |
-| IM syncer | `worker.principal/token` comes from `im.worker_principal`. `principal_tokens` contains enabled users and the bot, not the worker. Every enabled session creates one user mapping and one bot mapping; user `external_user_id` is explicit or resolved from phone/email, while the bot uses `im.bot.app_id`. |
-| model-proxy | Protocol is `llm.v1`; `channels` contains enabled Model channel ids. Provider config receives `model.base_url/api_key/timeout_ms`; `model.model` goes to Agent config instead. |
-| cmd-worker | Protocol is `cmd.v1`; principal/token and enabled Cmd channel ids are resolved from the desired state. `output_dir` defaults to `<runtime_root>/data/cmd-worker-output`; Agent never executes shell commands directly. |
-| Agent | Principal/token and all four resolved channel ids are generated per enabled session. There is no `from_seq`; Agent restores its position from OpenEvent history. |
-
-## Troubleshooting
-
-Common checks:
+Deployment uses installed `openevent-sdk>=0.13.0` with `AddTokenResponse.token` and `batch_get_object_metadata`, plus Chat, `openevent-model-proxy>=0.1.1`,
+`openevent-modules-cmd>=0.3.0,<0.4.0` (Cmd 0.3.x) and `openevent-view>=0.1.0` distributions.
+View is a required dependency of this deployment and is declared by this package.
+Chat SDK must support `get_turn_content`, `TurnWriter.reset`, restoring a writer from its start position, chain tail and effective content list,
+as well as cancellation with `start_seq` and `serialize_payload`;
+Model SDK must support streaming; Cmd SDK must support explicit publication UUIDs and attachment credentials through `object_keys`.
+Equal version numbers do not prove equal capabilities: installation replaces each project package using its current successful build and checks actual public APIs.
+SDK checkout paths are not added to imports. OpenEvent configuration is validated independently first; Chat, Model, Cmd, Agent and View parsers validate their generated configuration.
 
 ```bash
-python3 scripts/reconcile_runtime.py --spec openevent-stack/stack.yaml --dry-run
-python3 scripts/reconcile_runtime.py --spec openevent-stack/stack.yaml --print-config im_syncer
-python3 scripts/reconcile_runtime.py --spec openevent-stack/stack.yaml --print-config model_proxy
-python3 scripts/reconcile_runtime.py --spec openevent-stack/stack.yaml --print-config cmd_worker
-python3 scripts/reconcile_runtime.py --spec openevent-stack/stack.yaml --print-config agent
+make test PYTHON=/absolute/path/to/python TEST_ARGS='-p test_reconcile_runtime.py'
+make test PYTHON=/absolute/path/to/python TEST_ARGS='-p test_stack_scripts.py'
 ```
 
-The local `openevent-stack` runtime directory also provides:
+To measure local status-query time:
 
 ```bash
-./openevent-stack/bootstrap.sh --dry-run
-./openevent-stack/bootstrap.sh --apply
-./openevent-stack/status.sh
-./openevent-stack/logs.sh model-proxy
-./openevent-stack/logs.sh cmd-worker
+make benchmark-stack-status PYTHON=/absolute/path/to/python
 ```
 
-Troubleshooting files:
-
-| File | What To Check |
-| --- | --- |
-| `config/plan.yaml` | Token creation/adoption, channel creation/reuse, configuration writes, and restart actions for this run. |
-| `config/state.yaml` | Current token and configuration digests, permanent channel bindings for initialized sessions, and `last_apply` status, completed phase, or failed phase. |
-| `config/secrets.yaml` | OpenEvent tokens that were automatically created or adopted. Keep it secret. |
-| `config/*.yaml` component configuration | Final real configuration passed to each component. |
-| `logs/*.log` | Logs for components started by local `openevent-stack/process.sh`. |
-| `workdir/` | Current working directory for processes started by `openevent-stack/process.sh`; also the default command working directory for Agent `exec` calls when `workdir` is omitted. |
-
-Common errors:
-
-| Error | Handling |
-| --- | --- |
-| `version must be v1` | Top-level `version` in the input YAML must be `v1`. |
-| `principals.<name> must be a positive integer` | Principals must be explicitly configured as positive integers. |
-| `im.users[] must provide external_id, user_phone, or user_email` | Each IM user must provide exactly one of Provider user `open_id`, phone, or email. |
-| `sessions[].channels.im must be a string` | The session IM channel name must be a string. |
-| `OpenEvent admin endpoint is not ready` | OpenEvent is not started, the port is wrong, the server binary path is wrong, or configuration is invalid. |
-| `created token is not usable for principal ...` | Usually caused by multiple leftover OpenEvent processes on the same port, so Admin and business gRPC requests reach different instances. `openevent-stack/process.sh start openevent` cleans stale processes with the same configuration. |
-| `supervisor start/restart failed` | Check that `runtime.supervisor.ctl` and `runtime.supervisor.programs.*` can start the corresponding processes. |
-
-## Dependency Contracts
-
-Generated configuration is validated with the config parsers installed in the
-current Python environment. OpenEvent and each worker's public documentation
-remain authoritative for their own APIs, protocols, and config schema;
-Reconciler owns only the input-to-config mapping described here. Agent behavior
-and WAL fields are defined locally by [IM_MODEL_AGENT.md](IM_MODEL_AGENT.md) and
-[AGENT_WAL_PROTOCOL.md](AGENT_WAL_PROTOCOL.md).
+This target runs three read-only queries each for `status chat-server` and `status all`, reports their median times, and saves results under `build/benchmarks/`. It does not start or stop services.

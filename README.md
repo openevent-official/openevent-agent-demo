@@ -1,28 +1,50 @@
 # OpenEvent Agent Demo
 
+> Implementation status: event input, asynchronous tools, context compression, oversized-message rejection, prompt-file configuration, and WAL v5 are implemented. See [validation scope](#validation-scope) for completed checks and unverified behavior.
+
 [中文版](README_cn.md)
 
-OpenEvent Agent Demo shows how to compose OpenEvent, the IM module, the
-model-proxy module, and OpenEvent View into one local Agent runtime. The demo
-connects a P2P IM conversation to an OpenAI-compatible model provider while all
-inputs, model requests, model results, command calls, replies, and Agent WAL
-records flow through OpenEvent channels.
+This project combines OpenEvent, Chat, Model Proxy, Cmd, and OpenEvent View into a runnable Chat Agent.
+Users ask questions, attach files, or cancel replies in Chat. The Agent streams replies, runs commands when needed,
+and records recovery facts through OpenEvent. Conversations are discovered dynamically from Chat;
+creating a conversation requires neither a per-session configuration nor another deployment apply.
+User messages are complete `turn.single` events; Agent replies still stream. New user messages can trigger inference while tools run,
+with model calls and actual tool execution serialized separately within each conversation. Summaries compress old events for later inputs.
+Model summaries retain necessary task information while execution records preserve full tool parameters.
+History meeting its size target guarantees room for one compliant input; later tool results still enter event history in order.
+See the [Agent guide](docs/CHAT_MODEL_AGENT.md#conversations-and-replies) for behavior and allowances.
+
+Conversation discovery uses system messages from Fetch across all readable Channels. Adoption conditions, Chat's joining-order prerequisite,
+and restart behavior are specified in the [Agent guide](docs/CHAT_MODEL_AGENT.md#conversation-discovery).
+The [WAL protocol](docs/AGENT_WAL_PROTOCOL.md) defines persistent fields. Documentation maintains the current scheme,
+without compatibility or migration designs for old code.
+Text display batches complete model fragments without splitting them and records their sources as seq ranges.
+See [WAL display sources](docs/AGENT_WAL_PROTOCOL.md#5-effects-and-display-sources)
+for the contract.
+The current WAL is `agent.wal.v5`, with model I/O version `3`, without old-format compatibility or migration.
+The public format specification, default prompt files, request examples, implementation, and deployment template use the same configuration and protocols.
+
+The Agent entry point is `chat-model-agent`, using configuration version `chat-agent.v1`.
+Deployment uses installed distributions of `openevent-sdk >= 0.13.0`, Chat, Model Proxy, Cmd, and View.
 
 ## Quick Start
 
-1. Build the Ubuntu 24.04 local runtime and activate the venv:
+Prepare the environment on Ubuntu 24.04 and activate the venv:
 
 ```bash
 scripts/bootstrap_ubuntu_venv.sh --workdir runtime
 source runtime/venv/bin/activate
 ```
 
-For system package details, `--skip-apt`, custom repository URLs, and common
-failures, see [docs/UBUNTU_ENVIRONMENT.md](docs/UBUNTU_ENVIRONMENT.md).
-
-2. Fill in real IM and model provider values in
-   [openevent-stack/stack.yaml](openevent-stack/stack.yaml).
-3. Validate and apply the stack template:
+The script fetches the latest dependency code by default and installs this project's current workspace;
+see the [environment guide](docs/UBUNTU_ENVIRONMENT.md) for version selection and updates.
+Set the model provider, user and Agent identities, Chat web token, and service ports in
+[openevent-stack/stack.yaml](openevent-stack/stack.yaml).
+That configuration also specifies both complete prompt file paths and the context byte budget; see [Runtime prompt files](docs/RUNTIME_RECONCILER.md#prompt-files).
+Default texts are provided in [system.txt](openevent-stack/prompts/system.txt) and [context_compression.txt](openevent-stack/prompts/context_compression.txt).
+Read the [model input/output format](docs/MODEL_IO.md) before writing or editing prompts.
+Runtime prepares tokens and all three auxiliary Channels and generates component configuration.
+Existing Channels can be explicitly selected as described in [Runtime configuration](docs/RUNTIME_RECONCILER.md). Then run:
 
 ```bash
 ./openevent-stack/bootstrap.sh --dry-run
@@ -30,121 +52,92 @@ failures, see [docs/UBUNTU_ENVIRONMENT.md](docs/UBUNTU_ENVIRONMENT.md).
 ./openevent-stack/status.sh
 ```
 
-## Full Stack Runtime
+Open the configured Chat page and create a conversation. The model receives attachment object IDs;
+when it needs their contents, it selects the needed attachments in `exec.object_ids` and invokes
+`openevent-read-object <object_id>`. See the [Agent guide](docs/CHAT_MODEL_AGENT.md) for usage.
 
-`openevent-stack/` is the local template for running the full OpenEvent Agent
-demo stack. Configuration templates and scripts live directly in that
-directory.
+Stop all services:
 
-Current components:
+```bash
+./openevent-stack/stop.sh
+```
 
-- `openevent` server
-- `im-p2p-syncer`
-- `model-proxy`
-- `cmd-worker`
-- `im-model-agent`
-- `openevent-view`
+## Build, Install, and Test
 
-Local command support depends on `openevent-modules-cmd`, which provides the
-`openevent.cmd_sdk` package and the `cmd-worker` process. The stack installs and
-starts `cmd-worker`, creates or reuses per-session `cmd.v1` channels, generates
-`cmd-worker` configuration, and lets the Agent call local shell commands through
-OpenEvent.
+Use a Python environment with the SDK and the Chat, Model Proxy, Cmd, and View distributions installed:
 
-Adjust these files for the local environment before applying the stack:
+```bash
+make build PYTHON=python3
+make install PYTHON=python3
+make test PYTHON=python3
+```
 
-- `openevent-stack/stack.yaml`
+Building also requires `setuptools >= 68` and `wheel`. `make build` builds under `build/` and writes the current wheel
+to `dist/`. `make install` rebuilds, then checks the wheel's declared dependencies and installs only missing or
+incompatible ones. After that succeeds, it force-replaces only this project's installed package, even when its version
+is unchanged. Dependency resolution or download failures stop before replacing the installed project package.
+Generated files, caches, and test data stay under `build/`; Python bytecode is not generated in source directories.
 
-`scripts/bootstrap_ubuntu_venv.sh` writes local path overrides to
-`openevent-stack/config/env.sh`. The tracked `openevent-stack/env.sh` remains a
-portable default template.
+`make test-install` checks installation order and same-version replacement offline in temporary virtual environments
+under `build/`; it requires Python's `venv` support and does not require the OpenEvent components.
 
-`bootstrap.sh --apply` uses `scripts/reconcile_runtime.py` to generate final
-configuration for the core components, start or restart core processes, and
-create or reuse OpenEvent tokens/channels. `openevent-view` is a required
-component of the Agent demo. It depends on OpenEvent and starts only after the
-core flow has completed.
+For cross-module changes, use `make test-current-dependencies`: explicitly select the five dependency source directories,
+rebuild and install them in a separate environment, then run tests.
+See [development validation](docs/UBUNTU_ENVIRONMENT.md#development-validation) for arguments and the environment-only target.
+An older installed package with the same version does not establish compatibility with current source code.
 
-Daily operation usually needs only these scripts:
+For WAL indexes and Runtime local state writes only, run `make test-unit PYTHON=python3`.
+This target uses the same dependency environment and runs only a subset of local tests; it does not replace the full dependency and integration checks in `make test`.
 
-| Script | Purpose |
-| --- | --- |
-| `openevent-stack/bootstrap.sh` | Initialize or refresh the full runtime configuration. `--dry-run` validates and prints the plan. `--apply` starts OpenEvent, creates or reuses tokens and channels, writes final configuration, starts or restarts core processes, then starts view after OpenEvent is running and prints process status. |
-| `openevent-stack/start.sh` | Start processes from already generated configuration in order: OpenEvent, model-proxy, cmd-worker, IM syncer, Agent, then view after OpenEvent. Prints process status. Does not create tokens or channels. |
-| `openevent-stack/stop.sh` | Stop all local processes in reverse order. |
-| `openevent-stack/status.sh` | Show all local process status. |
-| `openevent-stack/logs.sh` | Without arguments, list log files. With a process name, follow that process log, for example `./openevent-stack/logs.sh model-proxy`. |
+Installation provides two commands:
 
-These helper files are normally only needed for configuration or
-troubleshooting:
+```bash
+chat-model-agent --config /etc/openevent-agent/agent.json
+openevent-read-object 12345
+```
 
-| File | Purpose |
-| --- | --- |
-| `openevent-stack/env.sh` | Portable local-path defaults. Generated machine-specific overrides live in `openevent-stack/config/env.sh`. It does not hold component runtime parameters. |
-| `openevent-stack/stack.yaml` | Declarative template for the whole stack: ports, OpenEvent storage paths, principals, IM provider, model provider, session/channel names, and view port. |
-| `openevent-stack/common.sh` | Shared paths, directories, and `PYTHONPATH` setup for all scripts. |
-| `openevent-stack/process.sh` | Local process manager. It acts as a simple `supervisorctl` replacement for `reconcile_runtime.py` and is also called by `start` / `stop` / `status`. It cleans stale duplicate processes with the same configuration to avoid multiple instances on the same port causing token/channel state inconsistency. |
-| `openevent-stack/render-view-config.sh` | Generate `config/openevent-view.yaml` from `stack.yaml`. This is an internal step before `bootstrap.sh` / `start.sh` starts view; view depends on OpenEvent and is not started separately. |
+The latter obtains attachment credentials from its Cmd task environment, supplied with the run request, and uses the object service address configured by Runtime. It does not require Agent to be online.
+See the [Agent guide](docs/CHAT_MODEL_AGENT.md) for details.
 
-Generated configuration, state, plan, and secret files are written to
-`openevent-stack/config/`.
+## Validation Scope
 
-Other runtime artifacts are written under `openevent-stack/` by default:
+Automated validation includes unit tests, Runtime and process-script tests, and Agent integration tests using the real Chat, Model, and Cmd SDKs with an in-memory event service.
+Coverage includes new input while tools run, cancellation isolation between replies, compaction checkpoints and recovery,
+history targets across multiple batches, independent rejection of oversized messages, failure pauses and new-input resumption,
+and recovery using frozen budgets. These tests run through the project's `make` targets and do not call an external model Provider.
 
-- `data/`
-- `logs/`
-- `run/`
-- `workdir/`
+On 2026-11-13, a request containing the actual Agent prompts, tool schemas, and historical input was tested against a real external model Provider,
+which returned HTTP 200 and a complete streaming response. This check established that the Provider accepted and completed that request;
+it did not exercise the full Agent and OpenEvent event-processing path or execute model tools.
+Production end-to-end validation of Chat, Agent, OpenEvent, Model Proxy, and Cmd remains incomplete.
 
-Processes started by `openevent-stack/process.sh` run with
-`openevent-stack/workdir/` as their current working directory. The Agent `exec`
-tool follows the `cmd.v1` rule: when a tool call omits `workdir`, the command
-runs in the `cmd-worker` current working directory, so the default command
-working directory is `openevent-stack/workdir/`.
+## Daily Operation
+
+`openevent-stack/` contains the local full-stack template and scripts. Use `bootstrap.sh` to apply configuration,
+`start.sh` / `stop.sh` to manage processes, `status.sh` to inspect status, and `logs.sh <process-name>` to follow logs.
+The [Runtime Reconciler guide](docs/RUNTIME_RECONCILER.md) owns deployment configuration, startup ordering,
+shared auxiliary Channel bindings, and restart requirements; this README does not maintain another set of those rules.
 
 ## Documentation
 
-This repository's main documents:
-
 | Document | Purpose |
 | --- | --- |
-| [docs/UBUNTU_ENVIRONMENT.md](docs/UBUNTU_ENVIRONMENT.md) | Ubuntu 24.04 environment and venv preparation |
-| [docs/RUNTIME_RECONCILER.md](docs/RUNTIME_RECONCILER.md) | Declarative runtime configuration, generated files, token/channel reconciliation |
-| [docs/IM_MODEL_AGENT.md](docs/IM_MODEL_AGENT.md) | Agent configuration and continuous-processing overview |
-| [docs/AGENT_WAL_PROTOCOL.md](docs/AGENT_WAL_PROTOCOL.md) | WAL fields, stable IDs, publish reconciliation, retry/blocked, and recovery protocol |
+| [Environment setup](docs/UBUNTU_ENVIRONMENT.md) | Ubuntu setup, dependency installation, and troubleshooting |
+| [Runtime Reconciler](docs/RUNTIME_RECONCILER.md) | Full deployment configuration, generated files, token/channel and process coordination |
+| [Chat Agent](docs/CHAT_MODEL_AGENT.md) | Agent configuration, tools, cancellation, and behavior after failures |
+| [Model input/output format](docs/MODEL_IO.md) | Events, summaries, compression requests, tools and responses, default prompts, and complete examples |
+| [Agent WAL protocol](docs/AGENT_WAL_PROTOCOL.md) | Persistent fields, stable keys, and source-event references |
 
-Related project documentation:
-
-| Topic | Project document |
-| --- | --- |
-| OpenEvent gRPC API and proto | `openevent-sdk` `docs/API.md`, `proto/openevent.proto` |
-| OpenEvent server build/configuration | `openevent` `README.md`, `docs/CONFIG.md` |
-| IM payload protocol | `openevent-modules-im` `docs/IM_PROTOCOL.md` |
-| IM SDK and P2P syncer | `openevent-modules-im` `docs/IM-PROTOCOL-SDK.md`, `docs/IM-P2P-SYNCER.md` |
-| LLM payload protocol | `openevent-modules-model-proxy` `docs/LLM_PROTOCOL.md` |
-| model-proxy worker and SDK | `openevent-modules-model-proxy` `docs/CONFIGURATION.md`, `docs/SDK_USAGE.md` |
-| Command protocol, SDK, and worker | `openevent-modules-cmd` `docs/CMD_PROTOCOL.md`, `docs/CONFIGURATION.md`, `docs/SDK_USAGE.md` |
-| OpenEvent View | `openevent-view` `README.md` |
-
-## Test
-
-Use the repository test entry point:
-
-```bash
-make test
-```
-
-Tests use packages installed in the current Python environment, including
-`openevent-modules-cmd`. If a dependency package is missing, install it in that
-environment first.
+The corresponding modules own the public Chat, LLM, and command protocols. The Agent consumes those interfaces
+without redefining their underlying protocols.
 
 ## Repository Layout
 
 | Path | Purpose |
 | --- | --- |
-| `im_model_agent/` | Agent process implementation |
-| `scripts/reconcile_runtime.py` | Declarative runtime configuration and channel/token reconciliation |
-| `scripts/bootstrap_ubuntu_venv.sh` | Ubuntu 24.04 venv environment preparation |
-| `openevent-stack/` | Local full-stack configuration template and process scripts |
-| `docs/` | Agent-specific protocol, runtime, and environment documents |
-| `tests/` | Unit tests and stack-script checks |
+| `chat_model_agent/` | Chat Agent and object-reading command |
+| `runtime_reconciler/` | Declarative configuration, channel/token and process coordination |
+| `scripts/` | Environment preparation script |
+| `openevent-stack/` | Local deployment template and process scripts |
+| `docs/` | Project runtime and protocol documentation |
+| `tests/` | Agent, Runtime, and script tests |

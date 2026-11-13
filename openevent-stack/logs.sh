@@ -4,7 +4,7 @@ set -euo pipefail
 # List logs, or follow one log with: logs.sh <program>.
 
 # shellcheck source=common.sh
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/common.sh"
 
 program="${1:-}"
 lines="${TAIL_LINES:-120}"

@@ -1,197 +1,84 @@
 from __future__ import annotations
+from chat_model_agent.rpc import RETRY_INTERVAL_MS
 
-from typing import Any
+def validate_openevent_config(config):
+    """Validate the generated fields against OpenEvent's public config contract."""
+    from .model import SpecError
+    for section, field in (("grpc", "listen_addr"), ("admin", "listen_addr"), ("storage", "path")):
+        value = config[section][field]
+        if not isinstance(value, str) or not value.strip():
+            raise SpecError(f"OpenEvent {section}.{field} must be non-empty")
+    if config["grpc"]["listen_addr"] == config["admin"]["listen_addr"]:
+        raise SpecError("OpenEvent business and admin listen addresses must differ")
+    limit = config["limits"]["max_payload_bytes"]
+    if type(limit) is not int or not 1 <= limit <= 62914560:
+        raise SpecError("OpenEvent max_payload_bytes must be in 1..62914560")
 
-from .model import DesiredSpec, PROTOCOL_CMD, ResolvedRuntime, SpecError
+def render_openevent_config(spec):
+    return {"grpc": {"listen_addr": spec.openevent["grpc_addr"]}, "admin": {"listen_addr": spec.openevent["admin_addr"]},
+            "storage": {"path": spec.openevent["storage_path"]}, "limits": {"max_payload_bytes": spec.openevent["max_payload_bytes"]}}
 
-
-def render_configs(spec: DesiredSpec, resolved: ResolvedRuntime) -> dict[str, dict[str, Any]]:
+def render_configs(spec, resolved):
+    p, t, channels, addr = spec.principals, resolved.tokens, resolved.channels, spec.openevent["grpc_addr"]
+    agent = {key: value for key, value in spec.agent.items() if key != "object_target"}
     return {
-        "openevent": {
-            "path": "openevent-server.yaml",
-            "data": render_openevent_config(spec),
-        },
-        "im_syncer": {"path": "im-p2p-syncer.yaml", "data": _render_im_syncer(spec, resolved)},
-        "model_proxy": {"path": "model-proxy.yaml", "data": _render_model_proxy(spec, resolved)},
-        "cmd_worker": {"path": "cmd-worker.yaml", "data": _render_cmd_worker(spec, resolved)},
-        "agent": {"path": "im-model-agent.yaml", "data": _render_agent(spec, resolved)},
+        "openevent": {"path": "openevent-server.yaml", "data": render_openevent_config(spec)},
+        "chat_server": {"path": "chat-server.json", "data": {
+            "host": spec.chat["host"], "port": spec.chat["port"], "origin": spec.chat.get("origin"),
+            "openevent_target": addr, "channels_dir": spec.chat["channels_dir"], "web_token": spec.chat["web_token"],
+            "user_principal": str(p["user"]), "user_openevent_token": t["user"], "agent_principal": str(p["agent"]),
+            "rpc_timeout_ms": spec.rpc["timeout_ms"], "max_retries": spec.rpc["max_retries"],
+            "max_user_message_bytes": spec.chat["max_user_message_bytes"],
+        }},
+        "model_proxy": {"path": "model-proxy.yaml", "data": {
+            "protocol": "llm.v1", "open_event": {"addr": addr, "rpc_timeout_ms": spec.rpc["timeout_ms"]},
+            "worker": {"max_concurrency": spec.model["max_concurrency"], "max_retries": spec.rpc["max_retries"], "retry_interval_ms": RETRY_INTERVAL_MS},
+            "principal": p["model_proxy"], "token": t["model_proxy"], "channels": [channels.model],
+            "max_payload_bytes": spec.openevent["max_payload_bytes"],
+            "default_provider": spec.model["provider_name"],
+            "providers": {spec.model["provider_name"]: {
+                "type": "openai_compatible", "base_url": spec.model["base_url"], "api_key": spec.model["api_key"],
+                "timeout": {"response_header_ms": spec.model["response_header_ms"], "idle_ms": spec.model["idle_ms"]},
+            }},
+        }},
+        "cmd_worker": {"path": "cmd-worker.yaml", "data": {
+            "open_event": {"addr": addr, "max_payload_bytes": spec.openevent["max_payload_bytes"]},
+            "principal": p["cmd_worker"], "token": t["cmd_worker"], "channel_ids": [channels.cmd],
+            "output_dir": spec.cmd["output_dir"], "max_concurrent_tasks": spec.cmd["max_concurrent_tasks"],
+            "default_timeout_ms": spec.cmd["default_timeout_ms"],
+        }},
+        "agent": {"path": "chat-model-agent.json", "data": {
+            "version": "chat-agent.v1", "deployment_id": spec.deployment_id,
+            "openevent": {"target": addr, "max_payload_bytes": spec.openevent["max_payload_bytes"]},
+            "agent": {**agent, "principal": p["agent"], "token": t["agent"], "user_principal": p["user"],
+                      "model": spec.model["model"], "model_provider": spec.model["provider_name"]},
+            "model_proxy": {"principal": p["model_proxy"]}, "cmd_worker": {"principal": p["cmd_worker"]},
+            "channels": channels.as_dict(), "rpc": spec.rpc,
+        }},
+        "view": {"path": "openevent-view.yaml", "data": {
+            "version": "v1", "server": {"host": "0.0.0.0", "port": spec.view["port"]},
+            "openevent": {"target": addr},
+        }},
     }
 
-
-def _render_im_syncer(spec: DesiredSpec, resolved: ResolvedRuntime) -> dict[str, Any]:
-    principal_tokens = []
-    token_by_principal: dict[int, str] = {
-        spec.im_bot_principal: resolved.tokens[spec.im_bot_principal_ref],
-    }
-    for session in spec.sessions:
-        if session.enabled:
-            token = resolved.tokens[session.user_principal_ref]
-            existing = token_by_principal.get(session.user_principal)
-            if existing is not None and existing != token:
-                raise SpecError(f"user principal {session.user_principal} resolves to multiple tokens")
-            token_by_principal[session.user_principal] = token
-    for principal in sorted(token_by_principal):
-        principal_tokens.append({"principal": principal, "token": token_by_principal[principal]})
-
-    mappings = []
-    for session in spec.sessions:
-        if not session.enabled:
-            continue
-        provider_session_id = resolved.im_provider_session_ids[session.session_id]
-        channel_id = resolved.channels[session.session_id].im
-        mappings.append(
-            {
-                "provider": spec.im_provider,
-                "identity_type": "user",
-                "external_user_id": resolved.im_user_external_ids[session.user_principal],
-                "principal": session.user_principal,
-                "session_id": provider_session_id,
-                "channel_id": channel_id,
-            }
-        )
-        mappings.append(
-            {
-                "provider": spec.im_provider,
-                "identity_type": "bot",
-                "external_user_id": spec.bot_app_id,
-                "principal": spec.im_bot_principal,
-                "session_id": provider_session_id,
-                "channel_id": channel_id,
-            }
-        )
-    return {
-        "version": "v1",
-        "worker": {
-            "principal": spec.im_worker_principal,
-            "token": resolved.tokens[spec.im_worker_principal_ref],
-        },
-        "openevent": {"target": spec.openevent_grpc_addr},
-        "principal_tokens": principal_tokens,
-        "providers": [
-            {
-                "name": spec.im_provider,
-                "sync": spec.im_sync,
-                "credentials": {"app_id": spec.bot_app_id, "app_secret": spec.bot_app_secret},
-                "options": {"api_base_url": spec.bot_api_base_url},
-            }
-        ],
-        "mappings": mappings,
-        "logging": {"level": "INFO"},
-    }
-
-
-def _render_model_proxy(spec: DesiredSpec, resolved: ResolvedRuntime) -> dict[str, Any]:
-    return {
-        "protocol": "llm.v1",
-        "open_event": {"addr": spec.openevent_grpc_addr},
-        "principal": spec.model_proxy_principal,
-        "token": resolved.tokens[spec.model_proxy_principal_ref],
-        "channels": [
-            resolved.channels[session.session_id].model
-            for session in spec.sessions
-            if session.enabled
-        ],
-        "max_payload_bytes": spec.openevent_max_payload_bytes,
-        "default_provider": spec.model_provider_name,
-        "providers": {
-            spec.model_provider_name: {
-                "type": "openai_compatible",
-                "base_url": spec.model_base_url,
-                "api_key": spec.model_api_key,
-                "timeout": {"total_ms": spec.model_timeout_ms},
-                "allowlist": {
-                    "methods": ["POST"],
-                    "paths": ["/v1/chat/completions", "/v1/responses"],
-                },
-            }
-        },
-    }
-
-
-def _render_cmd_worker(spec: DesiredSpec, resolved: ResolvedRuntime) -> dict[str, Any]:
-    return {
-        "protocol": PROTOCOL_CMD,
-        "open_event": {
-            "addr": spec.openevent_grpc_addr,
-            "max_payload_bytes": spec.openevent_max_payload_bytes,
-        },
-        "principal": spec.cmd_worker_principal,
-        "token": resolved.tokens[spec.cmd_worker_principal_ref],
-        "channel_ids": [
-            resolved.channels[session.session_id].cmd
-            for session in spec.sessions
-            if session.enabled
-        ],
-        "output_dir": str(spec.cmd_output_dir),
-        "max_concurrent_tasks": spec.cmd_max_concurrent_tasks,
-        "default_timeout_ms": spec.cmd_default_timeout_ms,
-    }
-
-
-def _render_agent(spec: DesiredSpec, resolved: ResolvedRuntime) -> dict[str, Any]:
-    return {
-        "version": "v1",
-        "agent": {
-            "name": spec.agent_name,
-            "principal": spec.agent_principal,
-            "token": resolved.tokens[spec.agent_principal_ref],
-            "system_prompt": spec.agent_system_prompt,
-            "max_context_messages": spec.agent_max_context_messages,
-            "model": spec.model_model,
-            "model_timeout_ms": spec.agent_model_timeout_ms,
-            "max_model_attempts": spec.agent_max_model_attempts,
-            "cmd_result_timeout_ms": spec.agent_cmd_result_timeout_ms,
-        },
-        "openevent": {"target": spec.openevent_grpc_addr, "subscribe": {"only_my_recipient": False}},
-        "model_proxy": {"principal": spec.model_proxy_principal},
-        "cmd_worker": {"principal": spec.cmd_worker_principal},
-        "im_sync_worker": {"principal": spec.im_worker_principal},
-        "sessions": [
-            {
-                "session_id": session.session_id,
-                "im_channel_id": resolved.channels[session.session_id].im,
-                "model_channel_id": resolved.channels[session.session_id].model,
-                "wal_channel_id": resolved.channels[session.session_id].wal,
-                "cmd_channel_id": resolved.channels[session.session_id].cmd,
-                "user_principal": session.user_principal,
-                "enabled": session.enabled,
-            }
-            for session in spec.sessions
-            if session.enabled
-        ],
-    }
-
-
-def render_openevent_config(spec: DesiredSpec) -> dict[str, Any]:
-    return {
-        "grpc": {"listen_addr": spec.openevent_grpc_addr},
-        "admin": {"listen_addr": spec.openevent_admin_addr},
-        "storage": {"path": str(spec.openevent_storage_path)},
-        "limits": {"max_payload_bytes": spec.openevent_max_payload_bytes},
-    }
-
-
-def _validate_openevent_config(openevent: dict[str, Any]) -> None:
-    for field, value in (
-        ("grpc.listen_addr", ((openevent.get("grpc") or {}).get("listen_addr"))),
-        ("admin.listen_addr", ((openevent.get("admin") or {}).get("listen_addr"))),
-        ("storage.path", ((openevent.get("storage") or {}).get("path"))),
-    ):
-        if not isinstance(value, str) or not value:
-            raise SpecError(f"generated OpenEvent config missing {field}")
-    max_payload = ((openevent.get("limits") or {}).get("max_payload_bytes"))
-    if not isinstance(max_payload, int) or isinstance(max_payload, bool) or max_payload <= 0:
-        raise SpecError("generated OpenEvent config limits.max_payload_bytes must be positive")
-
-
-def validate_configs(configs: dict[str, dict[str, Any]]) -> None:
-    _validate_openevent_config(configs["openevent"]["data"])
-    from im_model_agent.config import parse_config as parse_agent_config
-    from openevent.cmd_worker.config import parse_config as parse_cmd_config
-    from openevent.im_p2p_syncer.config import parse_config as parse_im_config
-    from openevent.model_proxy.config import parse_config as parse_model_config
-
-    parse_im_config(configs["im_syncer"]["data"])
-    parse_model_config(configs["model_proxy"]["data"])
-    parse_cmd_config(configs["cmd_worker"]["data"])
-    parse_agent_config(configs["agent"]["data"])
+def validate_configs(configs):
+    from chat_model_agent.config import parse_config as parse_agent
+    from openevent.model_proxy.config import parse_config as parse_model
+    from openevent.cmd_worker.config import parse_config as parse_cmd
+    import json
+    import tempfile
+    from pathlib import Path
+    from openevent.chat_app.config import ServerConfig
+    from openevent.view.config import parse_config as parse_view
+    validate_openevent_config(configs["openevent"]["data"])
+    parse_agent(configs["agent"]["data"])
+    parse_model(configs["model_proxy"]["data"])
+    parse_cmd(configs["cmd_worker"]["data"])
+    temporary_root = Path.cwd() / "build" / "validation"
+    temporary_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=temporary_root) as directory:
+        path = Path(directory) / "chat.json"
+        path.write_text(json.dumps(configs["chat_server"]["data"]), encoding="utf-8")
+        path.chmod(0o600)
+        ServerConfig.load(path)
+    parse_view(configs["view"]["data"])

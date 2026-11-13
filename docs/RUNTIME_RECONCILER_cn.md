@@ -1,511 +1,356 @@
-# Runtime Reconciler
+# Chat Runtime Reconciler
 
-[English version](RUNTIME_RECONCILER.md)
+> 实现状态：提示词文件加载、上下文字节预算预览、Chat 正文上限及 `agent.wal.v5` 部署配置已实现；测试范围与外部联调限制见 [README](../README_cn.md)。
 
-Runtime Reconciler 是 Agent demo 的运行环境协调脚本。它读取一个声明式 YAML，生成
-OpenEvent、IM P2P syncer、model-proxy、cmd-worker 和 IM Model Agent 的运行配置，并在
-`--apply` 时协调 OpenEvent token、channel 和本地进程。
+Runtime 为一套 Chat Agent 部署准备凭据、三个共享辅助 Channel、组件配置和本地进程。
+网页会话由 Chat Server 创建，Agent 自行发现；Runtime 不维护会话列表，不读取 Chat 的会话目录。
+下文规定部署配置与执行流程。
+会话发现与 Agent 配置见 [Agent 文档](CHAT_MODEL_AGENT_cn.md#会话发现)。
+部署规格只接受 `chat-runtime.v1`。
 
-它不实现 IM 同步、模型调用或 Agent 业务逻辑；这些逻辑仍由各组件负责。Reconciler
-只负责把这些组件按同一套 principal、token、channel 和配置文件连起来。
+## 入口
 
-`openevent-stack/stack.yaml` 中的 `view` 段由 `openevent-stack` 脚本消费。
-Reconciler 本身只管理核心组件；`openevent-view` 是 agent demo 的必须组件，
-依赖 OpenEvent，由 `bootstrap.sh`/`start.sh` 在 OpenEvent 已运行后生成配置并启动。
-
-本地命令能力使用 `openevent-modules-cmd` 和 `cmd-worker`。Reconciler 会生成
-`cmd-worker` 配置，创建或复用每个 session 的 `cmd.v1` channel，并把解析出的 cmd channel id
-写入 Agent 配置。
-
-## CLI
+在项目目录运行：
 
 ```bash
-python3 scripts/reconcile_runtime.py --spec runtime.yaml --dry-run
-python3 scripts/reconcile_runtime.py --spec runtime.yaml --apply
-python3 scripts/reconcile_runtime.py --spec runtime.yaml --runtime-root openevent-stack --apply
-python3 scripts/reconcile_runtime.py --spec runtime.yaml --print-config agent
+python -B -m runtime_reconciler.cli --spec openevent-stack/stack.yaml --runtime-root "$PWD/openevent-stack/runtime" --dry-run
+python -B -m runtime_reconciler.cli --spec openevent-stack/stack.yaml --runtime-root "$PWD/openevent-stack/runtime" --apply
+python -B -m runtime_reconciler.cli --spec openevent-stack/stack.yaml --runtime-root "$PWD/openevent-stack/runtime" --start
 ```
 
-参数：
+上述命令及 stack 脚本从项目目录运行 Runtime 源码。也可通过 `openevent-stack/bootstrap.sh --dry-run|--apply`、
+`start.sh`、`stop.sh`、`status.sh` 和 `logs.sh [program]` 操作本地部署。
+`--apply` 按五个主要阶段报告进展：检查配置、准备 OpenEvent、解析凭据和 Channel、准备服务配置、更新服务。
+`--apply` 和 `--start` 都会指出正在启动或停止的具体服务，停止时说明正在等待服务退出，也可提示复用的服务已经运行。
+每行进度立即刷新输出，即使通过管道读取也能及时看到。成功结束后仍打印简短成功提示；
+`bootstrap.sh --apply` 和 `start.sh` 随后显示各服务的实际进程状态，以及 Chat 和 View 的访问 URL。
+`--dry-run` 和 `--print-config` 仍输出 YAML 计划或配置，不加进度消息。
+Chat URL 优先使用配置的 `chat.origin`，未配置时按监听 host 和 port 生成 HTTP 地址，页面路径为 `/api/chat/`。
+View URL 使用其监听 host 和 port，页面路径为 `/`。通配监听地址 `0.0.0.0` 和 `::` 分别显示为本机地址 `127.0.0.1` 和 `[::1]`，其他 IPv6 地址也加方括号。
 
-| 参数 | 说明 |
-| --- | --- |
-| `--spec` | 输入 YAML。必填。 |
-| `--dry-run` | 只解析、填默认值、生成预览 plan 和配置摘要；不写配置、不连 OpenEvent、不创建 token/channel、不重启进程。 |
-| `--apply` | 写配置、启动/重启 OpenEvent、创建或复用 token/channel、写最终组件配置、重启下游组件。 |
-| `--runtime-root` | 覆盖输入 YAML 中的 `runtime.root`。相对路径按仓库根目录解析。 |
-| `--print-config` | 打印 dry-run 解析后的单个组件配置，可选 `openevent`、`im_syncer`、`model_proxy`、`cmd_worker`、`agent`。 |
+本地 stack 脚本固定使用 `openevent-stack/runtime/` 作为运行目录，生成的配置、状态、数据、日志和 PID 文件均放在其下。
+本地 stack 目录路径中的软链接统一解析为真实路径，使启动、状态查询和停止操作识别同一部署。
+脚本显式传入 `--runtime-root`，因此修改 spec 的 `runtime.root` 不会改变本地脚本的目录；模板不提供该字段。
+上面的直接调用使用绝对路径，确保与本地进程脚本使用同一目录。其他部署可以通过通用命令入口使用
+`runtime.root` 或 `--runtime-root` 选择目录，并让自己的进程管理器读取该目录中的配置。
 
-退出码：
+- `--dry-run` 检查用户配置及已有部署绑定并预览配置路径，不调用 OpenEvent，不写运行配置、资源绑定或 secrets。
+  计划中的 `channels` 只列出已知真实 ID；Model/Cmd/WAL ID 全部未知时，不输出整个 `channels` 段。未知 ID 在 `--apply` 时自动解析。
+  计划不列出 `unresolved` 清单；`notes` 统一说明 OpenEvent 访问凭据将在执行 `--apply` 时自动复用或创建，无需手工补齐。
+  预览不使用临时 ID 或 token，也不把未解析的配置交给组件校验器；预览成功不代表完整组件配置已经通过校验。
+- `--apply` 先检查用户配置、已有部署绑定和不依赖 Channel ID/token 的 OpenEvent 配置，
+  按下文顺序使 OpenEvent 在目标地址就绪，再准备真实资源。取得 Channel ID 和有效 token 后，
+  调用其余组件的配置校验器，通过后提交完整配置并继续启动。初始化成功后重复执行复用原绑定和有效凭据。
+  组件配置校验的临时文件位于当前工作目录的 `build/validation/`。
+- `--write-diagnostics` 仅与 `--apply` 一起使用，导出下文说明的可选诊断文件；
+  本地脚本用法为 `openevent-stack/bootstrap.sh --apply --write-diagnostics`。
+- `--start` 只用于已成功完成首次初始化的部署；允许修改的配置发生变化，包括凭据或显式 OpenEvent token，
+  均要求先 apply。进程管理入口和名称按下文固定，不能通过 apply 更换。
+- `--runtime-root DIR` 覆盖运行目录。
+- `--print-config openevent|chat_server|model_proxy|cmd_worker|agent|view` 输出预览配置；
+  显式提供的凭据仍出现在该输出中，未解析字段为 `null`；这份预览不能直接作为运行配置。
 
-| 退出码 | 含义 |
-| --- | --- |
-| `0` | 成功。 |
-| `1` | 未分类运行错误。 |
-| `2` | 输入 YAML 校验失败。 |
-| `3` | apply 阶段失败，例如 OpenEvent 未就绪或进程启动失败。 |
+spec 中的相对路径以 spec 文件所在目录为基准；所有生成配置中的运行路径均为绝对路径。
+`supervisor.ctl` 不含斜杠时按 PATH 查找，否则也按此基准解析。
+异常退出码为 1，spec 错误为 2，协调失败为 3。
 
-## 输入示例
+## 配置
 
-示例里保留的是常用配置；字段表中标为“否”的字段可以删掉并使用默认值。
-`runtime.supervisor.ctl`、`view.port`、`tokens`、`im.sync.*`、`model.provider_name`、
-`model.timeout_ms`、`agent.name`、`agent.max_context_messages`、`agent.model_timeout_ms`、
-`agent.max_model_attempts`、
-`channels.visibility` 和
-`sessions[].enabled` 都不是必填项。
+最小结构如下。示例 token 和模型 key 必须换成部署值：
 
 ```yaml
-version: v1
-
+version: chat-runtime.v1
 runtime:
-  name: openevent-stack
-  root: openevent-stack
+  name: my-chat
+  root: ./data
   supervisor:
-    ctl: ./openevent-stack/process.sh
-    programs:
-      openevent: openevent
-      im_syncer: im-p2p-syncer
-      model_proxy: model-proxy
-      cmd_worker: cmd-worker
-      agent: im-model-agent
-
+    ctl: supervisorctl
 openevent:
   grpc_addr: 127.0.0.1:9527
   admin_addr: 127.0.0.1:9528
-  max_payload_bytes: 16777216
-  storage:
-    path: openevent-stack/data/openevent
-
-view:
-  port: 8080
-
 principals:
-  p_im_worker: 90001
-  p_bot: 90002
-  p_model_proxy: 20001
-  p_cmd_worker: 30001
-  p_user: 10001
-
-tokens: {}
-
-im:
-  provider: lark
-  session_type: p2p
-  worker_principal: p_im_worker
-  users:
-    - principal: p_user
-      user_email: user@example.com
-      # Or use external_id/user_phone instead. --apply resolves email/phone to open_id.
-      # external_id: ou_replace_with_lark_user_open_id
-      # user_phone: "+8613800000000"
-  bot:
-    principal: p_bot
-    app_id: cli_replace_with_lark_app_id
-    app_secret: replace_with_lark_app_secret
-  sync:
-    history_retry_delay_ms: 1000
-    history_overlap_ms: 300000
-    history_lookback_ms: 300000
-    page_size: 50
-    event_queue_size: 1000
-
-model:
-  proxy_principal: p_model_proxy
-  provider_name: openai_main
-  base_url: https://api.openai.com
-  api_key: replace_with_model_api_key
-  model: gpt-4o-mini
-  timeout_ms: 65000
-
+  user: 10001
+  agent: 10002
+  model_proxy: 20001
+  cmd_worker: 30001
 cmd:
-  worker_principal: p_cmd_worker
-  max_concurrent_tasks: 8
+  max_concurrent_tasks: 4
   default_timeout_ms: 300000
-
+chat:
+  host: 127.0.0.1
+  port: 8081
+  origin: null
+  web_token: replace-with-web-token
+  max_user_message_bytes: 65536
+model:
+  provider_name: default
+  base_url: https://api.example.com
+  api_key: replace-with-model-key
+  model: example-model
 agent:
-  principal: p_bot
-  name: im-model-agent
-  system_prompt: "你是一个通过 IM 与用户对话的助手。"
-  max_context_messages: 20
-  model_timeout_ms: 60000
-  max_model_attempts: 3
-  cmd_result_timeout_ms: 330000
-
-channels:
-  visibility: private
-
-sessions:
-  - session_id: s1
-    enabled: true
-    user:
-      principal: p_user
-    channels:
-      im: openevent-stack.im.s1
-      model: openevent-stack.llm.s1
-      wal: openevent-stack.wal.s1
-      cmd: openevent-stack.cmd.s1
+  system_prompt_file: ./prompts/system.txt
+  context_compression_prompt_file: ./prompts/context_compression.txt
+  context_max_input_bytes: 1048576
 ```
 
-## 输入字段
+四个 principal 必须是互不相同的正 uint64。用户凭据只给 Chat Server；Agent、Model Proxy、Cmd Worker 各使用自己的凭据。
+web token 与 OpenEvent token 是不同凭据；模型 key 只进入 Model Proxy 配置。
 
-### Runtime
+本例的总请求预算与[完整请求示例](examples/README_cn.md)一致，配合 Chat 的默认正文上限及 Agent 的默认工具输出额度。
+示例校验包含正文转义和同一工具同时返回 stdout、stderr 的情况；附件描述、回复引用和错误详情仍按实际完整事件准入。
+更换提示词、模型名或额度后，应查看下文的预算预览；正文和输出额度按原始字节计量，不能直接当作模型事件的编码额度。
 
-| 字段 | 必填 | 说明 |
+| 配置 | 含义与默认值 |
+| --- | --- |
+| `runtime.name` | 必填、稳定的部署标识 |
+| `runtime.root` | 通用入口的运行目录，缺省 `runtime/<name>`；本地 stack 脚本固定覆盖为 `openevent-stack/runtime/` |
+| `runtime.supervisor.ctl` | 接受 `status/start/stop <program>` 的进程控制入口，默认 supervisorctl；首次 apply 后固定 |
+| `runtime.supervisor.programs` | 初次部署可覆盖逻辑名到进程名的映射，见下表；首次 apply 后固定 |
+| `openevent.storage.path` | 默认运行目录下 `data/openevent` |
+| `openevent.max_payload_bytes` | 默认 16777216；生成配置再由模块 parser 校验。相同额度传给 Agent、Model Proxy 和 Cmd；Agent 的编码大小检查见 [Agent 配置](CHAT_MODEL_AGENT_cn.md#agent-配置) |
+| `tokens` | 可选映射，键为 user、agent、model_proxy、cmd_worker |
+| `chat.channels_dir` | 默认运行目录下 `chat-sessions`，只由 Chat Server 管理 |
+| `chat.host/port/origin` | host 默认 127.0.0.1，port 默认 8081；origin 可选，默认 null；写入 `chat-server.json` 的同名字段 |
+| `chat.max_user_message_bytes` | 可选，默认 65536；正整数，不接受 boolean。原值传给 Chat Server 的同名字段，按单条用户正文的 UTF-8 字节数限制新发送，不计算附件文件或回复目标正文；Agent 的完整模型请求预算另行判断 |
+| `model.provider_name` | 默认 default |
+| `model.response_header_ms/idle_ms` | Provider 响应头/空闲超时，各默认 60000 |
+| `model.max_concurrency` | 所有会话共享的 Model Proxy 并发额度，默认 4 |
+| `cmd.output_dir` | 默认运行目录下 `cmd-output` |
+| `cmd.max_concurrent_tasks/default_timeout_ms` | 默认 4 / 300000 |
+| `channels.model/cmd/wal` | 填 `auto` 或省略表示首次初始化时按下文发现或创建；也可填写已有 Channel 的正 uint64 ID。整个 `channels` 映射可省略，不能填写 `null` 或数字字符串。初始化后始终沿用永久绑定 |
+| `view.port` | 默认 9999；View 监听 0.0.0.0 |
+| `agent.system_prompt_file` | 必填，完整系统提示词 UTF-8 文件路径，见下节 |
+| `agent.context_compression_prompt_file` | 必填，完整压缩提示词 UTF-8 文件路径，见下节 |
+| `agent.context_max_input_bytes` | 必填，无默认值；上下文字节预算，定义见 [Agent 配置](CHAT_MODEL_AGENT_cn.md#上下文字节预算) |
+| `agent.model_retry_interval_ms` | 可选，原值传给 Agent；默认值与等待规则见 [模型重试间隔](CHAT_MODEL_AGENT_cn.md#模型重试间隔) |
+| `rpc.max_retries/timeout_ms` | 默认 3 / 10000；传给 Agent，其他组件仅使用其公开支持的字段。RPC 重试间隔内部固定为 100 毫秒，与当前 Chat SDK 一致，不提供 RPC 间隔配置项 |
+
+`runtime.startup_timeout_ms` 已从配置设计删除，不再接受；启动流程不等待 Agent 对象引用就绪。
+
+`agent` 的运行选项遵循 [Chat Agent 配置](CHAT_MODEL_AGENT_cn.md)；两个提示词文件入口由下节定义，
+Runtime 读取正文后生成 Agent 配置中的文本字段，不把源文件路径交给 Agent。
+Runtime 注入身份、三条 Channel、模型名和 Provider，`work_root` 默认是运行目录下的 `workdir`。
+Runtime 的 `agent.object_target` 默认等于 OpenEvent 业务地址，仅用于 Cmd 中对象读取命令的环境，
+不写入 Agent 配置。Agent 的模型调度名额与 Model Proxy 的执行并发分别配置，
+Agent 名额的含义见 [Agent 配置](CHAT_MODEL_AGENT_cn.md#agent-配置)。
+
+| 逻辑名 | 默认进程名 | 配置 |
 | --- | --- | --- |
-| `version` | 是 | 必须为 `v1`。 |
-| `runtime.name` | 是 | 运行环境名。写入 normalized state，也用于 channel description metadata。 |
-| `runtime.root` | 否 | 运行目录。默认 `runtime/<runtime.name>`；`--runtime-root` 优先级最高。 |
-| `runtime.supervisor.ctl` | 否 | 进程控制命令。默认 `supervisorctl`。`openevent-stack` 使用本地 `process.sh`。 |
-| `runtime.supervisor.programs.openevent` | 是 | OpenEvent 进程名。 |
-| `runtime.supervisor.programs.im_syncer` | 是 | IM P2P syncer 进程名。 |
-| `runtime.supervisor.programs.model_proxy` | 是 | model-proxy 进程名。 |
-| `runtime.supervisor.programs.cmd_worker` | 是 | cmd-worker 进程名。 |
-| `runtime.supervisor.programs.agent` | 是 | IM Model Agent 进程名。 |
+| openevent | openevent | openevent-server.yaml |
+| model_proxy | model-proxy | model-proxy.yaml |
+| chat_server | chat-server | chat-server.json，包含 host、port、origin |
+| view | openevent-view | openevent-view.yaml |
+| agent | chat-model-agent | chat-model-agent.json |
+| cmd_worker | cmd-worker | cmd-worker.yaml |
 
-### OpenEvent
+配置保存在运行目录的 `config/`，权限为 0600。状态文件为 `state.yaml`，规格为
+`chat-runtime.state.v1`；secrets 为 `secrets.yaml`，规格为 `chat-runtime.secrets.v1`。
+Chat 启动命令只传 `--config`，监听参数和启动后显示的访问地址均从 `chat-server.json` 读取。
+默认不写诊断文件。指定 `--write-diagnostics` 后，仅在 apply 完成全部组件启动并保存成功状态后，
+以 0600 权限导出 `desired.normalized.yaml`（脱敏配置）和 `plan.yaml`（本次配置写入计划）。
+包含 `changed`、`sha256` 等字段的详细计划只通过该选项导出，不打印在普通成功输出中。
+诊断文件写入失败只在标准错误输出告警，不影响部署成功；它们不参与启动、恢复或已有部署的判断。
+这些文件只是导出时的快照；后续未指定该选项或导出失败时，已有文件可能仍是旧内容，可以直接删除。
+`initialized: true` 只在首次 apply 完成所有组件启动后保存。此前已生成状态但失败或中断的部署，
+再次 apply 或 start 会报错并保留现场；本版不自动续跑半初始化状态。运维按下文判断哪些资源需要保留、是否重建以及重建范围。
+首次 apply 在任何进程控制前，将解析后的进程管理入口和完整名称映射保存为 state 的 `supervisor` 绑定。
+这组绑定在本次部署期间保持固定；结束旧部署并建立新状态后才可重新选择。后续各入口发现绑定缺失或配置不同即报错，不执行进程控制；
+本版不提供更换进程管理入口或名称的迁移功能。
+state 还保存完整有效配置的摘要 `applied_spec_sha256`，供 `--start` 比较；不使用脱敏展示文件判断配置是否变化。
+apply 通过前置检查后，在首次停止进程或覆盖配置前，先清除旧摘要，保留上次完整提交的组件配置记录，
+并将本次需要停止后重新启动或更新的组件合入已有 `pending_restarts` 后持久保存。
+运行进程是否仍须更新由这些配置记录和待重启事项共同判断。
+提前写入 OpenEvent 配置不代表全套配置已提交。其余组件校验通过且所有配置文件写完后，
+摘要、新配置记录和剩余待重启事项一起原子保存；提前完成的 OpenEvent 启动在此时记为已完成。
+对已成功初始化的部署，更新在这次完整提交之前中断必须重新 apply；提交之后中断，start 可以继续完成待重启事项。
+state 中的 `principals` 和 `work_root` 必须存在并与本次配置一致；部署标识不一致或永久绑定缺失同样报错。
 
-| 字段 | 必填 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `openevent.grpc_addr` | 是 | | 业务 gRPC 地址，给 SDK、IM syncer、model-proxy 和 Agent 使用。 |
-| `openevent.admin_addr` | 是 | | 管理 gRPC 地址，Reconciler 用它调用 `ListTokens` 和 `AddToken`。 |
-| `openevent.storage.path` | 是 | | OpenEvent 统一 RocksDB 数据目录；metadata 和消息使用同一 DB 的不同 Column Family。相对路径按 demo 仓库根目录解析。 |
-| `openevent.max_payload_bytes` | 否 | `16777216` | 写入 OpenEvent server、model-proxy 和 cmd-worker 配置。 |
+## 提示词文件
 
-### Principals And Tokens
+`agent.system_prompt_file` 和 `agent.context_compression_prompt_file` 必须显式指定非空路径；
+相对路径以 spec 文件目录为基准，绝对路径用于部署环境。仓库已提供上例对应的
+[默认系统提示词](../openevent-stack/prompts/system.txt)和[默认压缩提示词](../openevent-stack/prompts/context_compression.txt)。
+spec 放在 `openevent-stack/` 时可直接使用上例的 `./prompts/` 路径；spec 位于其他目录时，复制提示词到其 `prompts/` 下或显式指定部署路径。
+这些文件随仓库提供，不会因省略必填路径而自动采用；`stack.yaml` 模板已显式配置两个文件入口。
+默认系统文件包含完整业务提示与工具、摘要和事件输入、附件使用说明；代码不再隐式追加另一段协议提示词。
+编辑提示词时遵循[模型输入输出格式](MODEL_IO_cn.md)，包含摘要和压缩请求的完整例子见[请求示例](examples/README_cn.md)。
+摘要中的任务信息与后续结果事件的关系见 [Agent 会话和回答](CHAT_MODEL_AGENT_cn.md#会话和回答)，Runtime 不维护另一份任务输入。
+压缩文件是独立的完整压缩提示，不与普通系统文件拼接。UTF-8 正文原样保留，系统文件允许为空，压缩文件必须有非空白内容。
+不做模板替换，不同时保留 spec 的内联 `agent.system_prompt` 或内联压缩提示词入口。
 
-OpenEvent 没有单独的 principal 创建接口。principal 是 token 绑定、channel 成员和消息发布者里的整数身份。
-Reconciler 不会自动分配 principal；必须在 `principals` 中显式声明。
+`--dry-run`、`--print-config`、`--apply` 和 `--start` 在解析 spec 时各读取两个文件一次。
+不存在、不可读或非 UTF-8 的文件在写状态、控制进程前报错；同一次操作的预览、比较与生成使用同一份正文快照。
+预览只读取文件，不写运行数据或调用 OpenEvent；`--print-config agent` 展示解析后的完整正文。
+`--dry-run` 与 `--print-config agent` 还在标准错误输出按配置 `B` 计算的预算基线：配置请求上限、固定开销、
+历史与单事件目标，以及当前 Chat 正文上限、工具每流原始输出上限。
+计算使用同一次操作读取的提示词正文、模型名和工具定义，遵循[Agent 的唯一预算规则](CHAT_MODEL_AGENT_cn.md#上下文字节预算)，
+不需要 Channel ID、token 或 OpenEvent 调用；配置自身无法满足基线要求时报告配置错误。
+这是尚未计入 Model 发布容量的离线预览。运行时的有效预算与压缩目标还会受 OpenEvent 实际发送额度限制，
+不因配置的模型输入上限大于该额度而拒绝部署，也不增加配置项。
+这两种预览的标准输出保持 YAML 计划或配置格式；这些推导值只用于预览，不增加用户配置项或持久状态。
 
-`principals` 是全局注册表，key 只是本配置文件内的名字，不表达功能。各模块需要的
-principal 在自己的配置区域里用这些名字引用。
+生成的 `chat-model-agent.json` 保存 `agent.system_prompt`、`agent.context_compression_prompt` 正文与上下文字节预算；
+Agent 运行时只读取生成配置，不监听或回读源提示词文件。有效配置摘要包含这两段正文和预算，不以路径或修改时间代替内容。
+同一路径正文改变后，`--start` 要求先 apply；仅换路径而正文相同不构成有效配置变化。
+成功部署后仅改提示词或预算，apply 更新 Agent 配置并按原规则重启 Agent，不需要重启未变化的依赖。
+正文保存到已经准备的普通或压缩请求后即固定；更新只影响后来新准备的请求，不能改写旧请求的重试与恢复输入。
+新配置还须通过 [Agent 的历史与未结束请求兼容检查](CHAT_MODEL_AGENT_cn.md#上下文字节预算)。
+该检查区分配置预算变化与当前发布容量变化；仅发送容量下降不因此拒绝整个 Agent 恢复，继续执行时按公开 Agent 规则处理。
 
-| 字段 | 必填 | 说明 |
-| --- | --- | --- |
-| `principals.<name>` | 是 | OpenEvent principal 整数。`<name>` 可自由命名。 |
-| `tokens.<name>` | 否 | 对应 `principals.<name>` 的 token。省略时 `--apply` 会采用已有 token 或创建新 token。 |
+压缩与普通推理共用现有模型、Provider、等待 timeout 和 Agent 调度名额；
+历史硬目标、单事件上限及重试额度只在 [Agent 上下文字节预算](CHAT_MODEL_AGENT_cn.md#上下文字节预算)定义，Runtime 不增加另一套选项。
 
-`tokens.<name>` 的 `<name>` 必须已经在 `principals` 中声明。
-如果同一个用户 principal 同时配置了 `tokens.<name>` 和 `im.users[].token`，两个 token 必须一致。
+## 目录结构
 
-token 协调顺序：
+Agent 与 Cmd Worker 必须部署在同一主机，并通过相同绝对路径访问同一份实际的 `work_root`。
+仅路径文字相同、实际目录不同，不满足此前提。默认会话工作目录为 `work_root/<channel_id>`，目录名为纯数字 Chat Channel ID；
+Agent 向 Cmd 提供解析后的绝对路径。重启或重复 apply 不改变已有会话的工作路径。
 
-1. 如果输入 `tokens.<name>` 或 `im.users[].token` 可用，直接使用。
-2. 如果 `config/secrets.yaml` 中已有 token 且仍可用，继续使用。
-3. 如果 OpenEvent `ListTokens` 中已有同 principal 的可用 token，采用它。
-4. 如果没有可用 token，调用 `AdminService.AddToken(target_principal)` 创建。
-
-所有 token 创建或采用后都会用 `GetStatus(principal, token)` 校验。业务配置中需要明文 token；
-`config/state.yaml` 只保存摘要，`config/secrets.yaml` 保存自动创建或采用的 OpenEvent token。
-
-### IM
-
-当前实现支持 Feishu/Lark P2P。两者使用同一套 Lark OpenAPI 形态，主要差异是开放平台域名和应用所属租户区域。
-
-| 字段 | 必填 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `im.provider` | 否 | `lark` | 支持 `feishu` 或 `lark`。示例使用 `lark`。 |
-| `im.session_type` | 否 | `p2p` | 目前必须是 `p2p`。 |
-| `im.worker_principal` | 是 | | 引用 `principals` 中的名字，作为 IM P2P syncer worker principal。 |
-| `im.bot.principal` | 是 | | 引用 `principals` 中的名字，作为 IM bot principal；必须和 `agent.principal` 解析到同一个 principal。 |
-| `im.bot.app_id` | 是 | | Feishu/Lark 应用 ID。也用于生成 bot mapping 的 `external_user_id`。 |
-| `im.bot.app_secret` | 是 | | Feishu/Lark 应用密钥。写入 `im-p2p-syncer.yaml`。 |
-| `im.bot.api_base_url` | 否 | provider 默认值 | 不建议在输入 YAML 暴露。由 `im.provider` 推导：`feishu` 为 `https://open.feishu.cn`，`lark` 为 `https://open.larksuite.com`。 |
-| `im.sync.history_retry_delay_ms` | 否 | `1000` | Provider 历史拉取失败后的重试间隔。 |
-| `im.sync.history_overlap_ms` | 否 | `300000` | 历史拉取水位的重叠窗口。 |
-| `im.sync.history_lookback_ms` | 否 | `300000` | 首次启动的历史回看窗口。 |
-| `im.sync.page_size` | 否 | `50` | Provider 消息分页大小。 |
-| `im.sync.event_queue_size` | 否 | `1000` | Provider 实时事件队列容量。 |
-
-Feishu/Lark bot 消息按应用身份映射。Reconciler 使用 `im.bot.app_id`
-作为 bot mapping 的 `external_user_id`。
-
-`agent.principal` 必须和 `im.bot.principal` 解析到同一个 principal。IM worker、
-model-proxy、用户 principal 和 bot/agent principal 必须彼此区分，避免一个 token 获得不该有的 channel 操作边界。
-
-### Command Worker
-
-命令能力使用 `openevent-modules-cmd`。Reconciler 会生成 `cmd-worker` 配置，
-创建或复用每个 session 的 `cmd.v1` channel，并把解析出的 cmd channel id 写入 Agent 配置。
-
-| 字段 | 必填 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `cmd.worker_principal` | 是 | | 引用 `principals` 中的名字，作为 cmd-worker principal。 |
-| `cmd.output_dir` | 否 | `<runtime.root>/data/cmd-worker-output` | 本地 stdout/stderr 输出根目录。 |
-| `cmd.max_concurrent_tasks` | 否 | `8` | cmd-worker 同时处理的本地命令任务上限。 |
-| `cmd.default_timeout_ms` | 否 | `300000` | Agent 命令请求未指定 timeout 时使用的默认命令超时。 |
-
-#### IM Users
-
-`im.users[]` 描述 Provider 用户身份和 OpenEvent principal 的关系。
-
-| 字段 | 必填 | 说明 |
-| --- | --- | --- |
-| `im.users[].principal` | 是 | 引用 `principals` 中的名字，表示这个真实用户在 OpenEvent 里的 principal。 |
-| `im.users[].token` | 否 | 这个用户 principal 的 OpenEvent token；也可以统一写在对应的 `tokens.<name>` 中。 |
-| `im.users[].external_id` | 条件必填 | Feishu/Lark 用户 `open_id`。与 `user_phone`、`user_email` 三选一。 |
-| `im.users[].user_phone` | 条件必填 | 用户手机号。与 `external_id`、`user_email` 三选一；`--apply` 时通过 Contact API 解析为 `open_id`。 |
-| `im.users[].user_email` | 条件必填 | 用户邮箱。与 `external_id`、`user_phone` 三选一；`--apply` 时通过 Contact API 解析为 `open_id`。 |
-
-如果使用 `user_phone` 或 `user_email`，Reconciler 会调用 Provider Contact API，所以 `app_id/app_secret`
-必须能访问对应用户信息。`--dry-run` 不会访问 Provider，只生成占位 external id。
-
-#### IM Channel Resolution
-
-IM channel 不需要单独配置一层。每个 session 的 `sessions[].channels.im`
-就是 OpenEvent IM channel 名称；如果要人工接管已有 channel，可以配置
-`sessions[].channel_ids.im`。
-
-Reconciler 不暴露 Provider `chat_id`。它会根据 enabled session 的 `user.principal`
-找到 `im.users[]`，再由用户 open_id/手机号/邮箱解析出 P2P 会话，最终写入生成后的
-`config/im-p2p-syncer.yaml`。
-
-不要把生成配置里的 provider `session_id` 和 Agent 的 `sessions[].session_id` 混用。前者是 Provider 会话 ID，后者只是 Agent 内部稳定业务键。
-
-### Model
-
-| 字段 | 必填 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `model.proxy_principal` | 是 | | 引用 `principals` 中的名字，作为 model-proxy worker principal。 |
-| `model.provider_name` | 否 | `openai_main` | 写入 model-proxy `default_provider`。 |
-| `model.base_url` | 是 | | OpenAI-compatible provider 根地址。不要把 `/v1/chat/completions` 拼进去；Agent 请求 path 已经是 `/v1/chat/completions`。 |
-| `model.api_key` | 是 | | 模型 provider API key。写入 `model-proxy.yaml`。 |
-| `model.model` | 是 | | Agent 构造模型请求时使用的模型名。不会写入 model-proxy provider 配置。 |
-| `model.timeout_ms` | 否 | `65000` | model-proxy 调 provider 的总超时。 |
-
-生成的 model-proxy 配置只显式允许 `POST /v1/chat/completions` 和
-`POST /v1/responses`。其他 Provider method 或 path 会在发送 HTTP 请求前被拒绝。
-
-### Agent
-
-| 字段 | 必填 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `agent.principal` | 是 | | 引用 `principals` 中的名字，作为 Agent principal；必须和 `im.bot.principal` 解析到同一个 principal。 |
-| `agent.name` | 否 | `im-model-agent` | Agent 名称。 |
-| `agent.system_prompt` | 是 | | Agent system prompt。 |
-| `agent.max_context_messages` | 否 | `20` | Agent 自维护 prompt 的上下文上限。 |
-| `agent.model_timeout_ms` | 否 | `60000` | Agent 等待模型结果的超时时间。 |
-| `agent.max_model_attempts` | 否 | `3` | 同一 WAL 的最大自动尝试次数；具体 retry 和 blocked 语义见 [Agent WAL 协议](AGENT_WAL_PROTOCOL_cn.md)。 |
-| `agent.cmd_result_timeout_ms` | 否 | `330000` | Agent 等待 Cmd result 的时间；超时并完成历史对账后向模型提供失败工具结果。 |
-
-### Channels
-
-| 字段 | 必填 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `channels.visibility` | 否 | `private` | 支持 `protected` 或 `private`。当前不允许 `public`，因为 `llm.v1` channel 不能公开。 |
-
-每个 enabled session 有四个 channel。
-
-| Channel | Protocol | 成员 |
-| --- | --- | --- |
-| IM | `im.v1` | user、agent bot、IM sync worker |
-| Model | `llm.v1` | agent bot、model-proxy |
-| WAL | `agent.wal.v1` | agent bot |
-| Cmd | `cmd.v1` | agent bot、cmd-worker |
-
-### Sessions
-
-| 字段 | 必填 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `sessions[].session_id` | 是 | | Agent session 的稳定业务键。 |
-| `sessions[].enabled` | 否 | `true` | 是否生成该 session 的配置和 channel。至少需要一个 enabled session。 |
-| `sessions[].user.principal` | 是 | | 必须引用 `im.users[].principal` 的名字。 |
-| `sessions[].channels.im` | 是 | | OpenEvent IM channel 名称。 |
-| `sessions[].channels.model` | 否 | `<runtime.name>.llm.<session_id>` | Model channel 名称。 |
-| `sessions[].channels.wal` | 否 | `<runtime.name>.wal.<session_id>` | WAL channel 名称。 |
-| `sessions[].channels.cmd` | 否 | `<runtime.name>.cmd.<session_id>` | Agent 本地命令调用使用的 Cmd channel 名称。 |
-| `sessions[].channel_ids.im` | 否 | | 未初始化 session 的指定 IM channel id；初始化后只能省略或与已绑定 id 相同。 |
-| `sessions[].channel_ids.model` | 否 | | 未初始化 session 的指定 Model channel id；初始化后只能省略或与已绑定 id 相同。 |
-| `sessions[].channel_ids.wal` | 否 | | 未初始化 session 的指定 WAL channel id；初始化后只能省略或与已绑定 id 相同。 |
-| `sessions[].channel_ids.cmd` | 否 | | 未初始化 session 的指定 Cmd channel id；初始化后只能省略或与已绑定 id 相同。 |
-
-同一份 Agent 配置中，enabled session 的 `model`、`wal` 和 `cmd` channel name 必须唯一。
-IM channel name 也必须唯一。每个 enabled session 最终会写入一个 IM channel id、
-一个 Model channel id、一个 WAL channel id 和一个 Cmd channel id。
-
-## 生成文件
-
-`--apply` 默认把生成配置、状态、计划和密钥文件都写入 runtime root 下的 `config/`：
+本地 stack 使用默认路径时，目录用途如下；配置中的路径覆盖只改变对应数据的位置。
 
 ```text
-config/openevent-server.yaml
-config/im-p2p-syncer.yaml
-config/model-proxy.yaml
-config/cmd-worker.yaml
-config/im-model-agent.yaml
-config/desired.normalized.yaml
-config/state.yaml
-config/secrets.yaml
-config/plan.yaml
-data/openevent/
-data/cmd-worker-output/
+openevent-stack/
+├── stack.yaml             # 用户填写的部署入口
+├── prompts/               # 完整系统和压缩提示词文件
+└── runtime/               # 生成的部署文件和运行数据
+    ├── config/            # 组件配置、部署状态、凭据和安装生成的 env.sh
+    ├── data/openevent/    # OpenEvent 持久数据：消息历史、对象等
+    ├── logs/              # 各服务日志
+    ├── run/               # 进程 PID
+    ├── chat-sessions/     # Chat 会话配置，文件名为 <session_id>.json
+    ├── cmd-output/        # Cmd 保存的命令 stdout/stderr
+    └── workdir/           # Agent 执行命令的默认工作目录根
+        └── <channel_id>/  # 纯数字 Chat Channel ID，例如 4
+            └── ...        # 命令创建或下载的文件
 ```
 
-文件说明：
+运行目录中的 `workdir/4/` 只保存 Channel 4 中命令使用的本地文件；会话配置位于同级的 `chat-sessions/`，聊天记录保存在 OpenEvent 中。
+会话重命名只改 Chat 会话配置中的显示名称，不改变数字目录名。命令显式传入 `workdir` 时使用该路径。
+会话名称的保存和页面操作见 [Chat 应用指南](https://github.com/openevent-official/openevent-modules-chat/blob/main/docs/APP_USAGE_cn.md)。
 
-| 文件 | 说明 |
-| --- | --- |
-| `config/openevent-server.yaml` | OpenEvent server 配置，包含 gRPC/admin 地址和 `openevent.storage.path` 指定的统一 RocksDB 路径。 |
-| `config/im-p2p-syncer.yaml` | IM syncer 配置，包含 Feishu/Lark 凭据、用户/bot mappings、principal tokens。 |
-| `config/model-proxy.yaml` | model-proxy 配置，包含 provider base URL/API key、OpenEvent token、channel ids 和请求限制。 |
-| `config/cmd-worker.yaml` | cmd-worker 配置，包含 OpenEvent token、cmd channel ids、输出目录、并发和超时设置。 |
-| `config/im-model-agent.yaml` | Agent 配置，包含 Agent token、模型名、IM/Model/WAL/Cmd channel ids。 |
-| `config/desired.normalized.yaml` | 展开默认值后的目标状态。敏感值会被 redacted。 |
-| `config/state.yaml` | 配置摘要、token 摘要、所有已初始化 session 的永久 channel 绑定，以及最近一次 apply 的状态和阶段。 |
-| `config/secrets.yaml` | 自动创建或采用的 OpenEvent 明文 token。 |
-| `config/plan.yaml` | 本次 apply 的 actions 和配置摘要。 |
+环境安装脚本的 `--workdir runtime` 使用项目根目录下的 `runtime/`：`runtime/venv/` 放 Python 环境，`runtime/sources/` 放各组件源码及其构建产物。
+它与 `openevent-stack/runtime/` 分开，不控制上面这些运行数据路径。安装工作区说明见 [环境准备](UBUNTU_ENVIRONMENT_cn.md#准备与安装)。
 
-新建 runtime root 时权限按 `0700` 创建；生成配置和 state/secrets/plan 按 `0600` 写入。
-配置文件包含 OpenEvent token、Feishu/Lark app secret 和模型 API key，不能提交。
+## Token 与资源绑定
 
-## Apply 流程
+每个身份按显式 token、本地 secrets 的顺序调用 `GetStatus` 验证。
+只有明确的 `UNAUTHENTICATED` 表示该 token 无效；超时、网络错误或权限错误使本次 apply 失败，
+不以此为理由创建新 token。两种来源都不存在或明确无效时才调用 `AddToken`。
+从 `AddTokenResponse.token` 取得新 token 后先持久保存，再验证并交给组件；不调用 `ListTokens`。
+本地凭据文件仅在身份与 token 的映射变化时更新；验证通过或再次采用相同凭据不重复保存。
 
-`--apply` 在 `config/state.yaml` 中记录五个检查点：
+所有会话共用 private 的 Model、Cmd、WAL Channel。成员分别为 Agent 与 Model Proxy、
+Agent 与 Cmd Worker、Agent 自己；协议分别为 `llm.v1`、`cmd.v3`、`agent.wal.v5`。
+WAL 规则以 [WAL 协议](AGENT_WAL_PROTOCOL_cn.md)为准。
+Model/Cmd 的其他校验采用各模块公开契约。显式指定或已经绑定的 Cmd Channel，其 description 可为任意文本。
+Runtime 自动创建的 Model/Cmd/WAL description 在 metadata 中保存稳定 deployment_id。
+首次部署只需填写部署配置并运行 `--apply`，由 Runtime 启动 OpenEvent、准备 token 和辅助 Channel，再启动其余组件。
+校验通过后，Runtime 将同一个 Cmd ID 写入 Agent 和 cmd-worker 配置，并按下节顺序先启动 cmd-worker，再启动 Agent。
 
-| 阶段 | 已完成的工作 |
-| --- | --- |
-| `parsed` | 输入 YAML 已解析，默认值已展开，字段已校验。 |
-| `openevent_ready` | 已写入 `config/openevent-server.yaml`，按需启动或重启 OpenEvent，并确认业务端口和管理端口可用。 |
-| `resources_resolved` | 已解析或创建 Provider 身份和会话、OpenEvent token，以及 IM/Model/Cmd/WAL channel。 |
-| `config_committed` | 已渲染并校验所有下游配置，并写入 normalized desired state、组件配置、secrets、plan 和 state。 |
-| `processes_running` | 已按依赖顺序重启配置变化的下游进程，启动缺失进程，并由 supervisor 确认所有配置的程序都处于 `RUNNING`。 |
+首次初始化时，Model/Cmd/WAL 先采用显式 ID，否则按稳定元数据查找；多候选即失败，没有候选才创建。
+自动发现 Cmd 只匹配本部署元数据，不认领只有相同名称或成员的普通 Cmd Channel。
+三条全部校验完成后作为一组保存，不能用部分结果启动 Agent；不保存逐条创建的未决标记或部分 ID 供续跑。
+初始化成功后，三条 ID 为永久绑定。改名、会话增加、暂时不可访问都不能更换它们。
+显式 ID 与原绑定冲突、资源丢失或不兼容时直接失败；新部署使用新状态和新 WAL。
 
-`last_apply.status` 取值为 `in_progress`、`complete` 或 `failed`。
-`last_apply.phase` 表示最后完成的检查点。失败时，`last_apply.failed_phase` 表示当时正在执行的
-检查点。时间戳分别记录 apply 开始、最近更新以及完成或失败的时间。
+### 初始化失败后的处理
 
-只有到达 `processes_running`，apply 才会记为 `complete`。这个阶段只证明 supervisor 观察到
-进程在运行，不等于端到端健康；它不能证明 Provider 凭据、模型请求、IM 投递或完整事件链路可用。
+首次 apply 完成所有组件启动并保存成功状态才算初始化成功。初始化涉及本地文件、OpenEvent 资源和多个进程，
+不是一次可以整体回滚的事务。某一步失败时，之前创建的 token、Channel、写入的数据和已启动的进程可能仍然存在；
+入口报错不表示这些动作没有发生，也不表示已启动的业务任务已经停止。
+Runtime 停止后续协调、保留已有记录，不自动删除数据、回滚资源或继续半初始化流程。
+前置校验失败且尚未生成部署状态时，修正配置后可直接重试。
 
-重启顺序：
+运维根据实际进程、保存的状态和 OpenEvent 中的资源决定下一步。需要保留已有数据或采用了既有资源时，
+可以保留现场排查、安排修复，或隔离旧部署并建立独立的新部署；本版没有自动导入或修复半初始化状态的入口，
+保留数据本身不会使再次 apply/start 获得续跑能力。新部署使用新状态和新 WAL，不把旧会话的历史随意绑定到新部署。
+如果确认本次部署及其资源均可丢弃，运维也可以结束旧部署、停止相关进程并清理后重建。
+停止与发布请求交接仍遵守下节的运行前提。Runtime 不替运维决定资源归属或删除范围。
 
-```text
-openevent -> model_proxy -> cmd_worker -> im_syncer -> agent
-```
+选择清理时，需要区分这些后果：
 
-Agent 最后启动，让 IM syncer、model-proxy 和 cmd-worker 先收到 start/restart 命令；这个顺序本身
-不证明它们已经 ready。
+- 只删除本地 state 或配置，不会撤销已创建的远端资源、已提交的事件或命令效果，也不等于恢复部署。
+- 删除 OpenEvent 存储会删除其中的 Channel、token、事件历史和对象。原配置中的显式 Channel ID 和 token 随之失效，
+  不能承诺保留原 `stack.yaml` 就能原样重跑；重建前应重新准备资源和凭据，或把允许自动创建的 Channel 配置改为 `auto`。
+- 本地 stack 在 `openevent-stack/runtime/` 下生成 `config/`、`data/`、`logs/`、`run/`、`workdir/`、`cmd-output/` 和 `chat-sessions/`；
+  实际数据也可能位于配置指定的其他路径。这是定位数据的清单，不是必须全部删除的步骤。
+  `openevent-stack/runtime/config/env.sh` 保存安装路径，部署脚本和已安装环境可以继续使用；入口配置按保留或重建后的资源重新核对。
 
-## Token 协调
+以上只说明首次初始化失败的边界。成功部署后的配置更新失败仍保留运行数据，按下节的提交边界继续更新。
 
-Reconciler 不删除旧 token。它只使用、采用或创建 token。
+## 启动、更新与停止
 
-输入 token 可选。全自动模式下，可以把 `tokens: {}` 留空；`--apply` 会通过 OpenEvent
-Admin API 为相关 principal 创建 token，并写入 `config/secrets.yaml`。后续再次运行时会优先复用
-`config/secrets.yaml` 里的可用 token。
+运行前提：恢复新 Agent 前，运维已保证旧 Agent 发出的 OpenEvent 发布 RPC 全部结束，不会迟到提交。
+这不要求已提交的模型或命令业务任务执行完毕。
 
-token 使用位置：
+apply 按以下顺序执行：
 
-| Token | 使用位置 |
-| --- | --- |
-| `im.worker_principal` 引用的 principal | `im-p2p-syncer.yaml.worker.token` |
-| `agent.principal` / `im.bot.principal` 引用的 principal | `im-model-agent.yaml.agent.token`、IM syncer bot principal token，以及 Reconciler 创建/维护该 Agent channel 的 operator token |
-| `model.proxy_principal` 引用的 principal | `model-proxy.yaml.token` |
-| `cmd.worker_principal` 引用的 principal | `cmd-worker.yaml.token` |
-| `im.users[].principal` 引用的 principal | IM syncer 用它以用户 principal 发布入站 `sync.record` |
+1. 校验用户配置和已有绑定，单独生成并校验 OpenEvent 目标配置；这一步不需要 Channel ID 或 token。
+2. 如果依赖需要更新，先停止 Agent 并等待退出，再修改任何依赖的运行配置或进程。
+   OpenEvent 需要更新时，还须停止本部署使用它的 Model Proxy、Chat Server、View 和 Cmd Worker。
+   随后写入已校验的 OpenEvent 配置，按需启动或重启 OpenEvent，再等待目标配置中的业务和管理端口就绪。
+   判断是否需要重启依据 state 中上次完整提交的配置记录和待重启事项；文件已经写成目标值不代表进程已使用它。
+   配置未变、没有待重启事项且正在运行的 OpenEvent 保持运行；未运行则启动。
+3. 连接已经就绪的目标地址，验证或准备 token、解析并校验三条辅助 Channel。
+   取得真实 ID 和有效 token 后，生成并校验其余组件配置，再提交完整配置和剩余待重启事项。
+4. 启动或按需重启 Model Proxy、Chat Server、View、Cmd Worker，最后启动 Agent。
 
-## Channel 协调
+因此修改 OpenEvent 业务或管理端口时，先切换 OpenEvent，再连接新地址；不会先等待尚未启动的新端口。
+任一步失败即停止协调，不继续启动后续组件或 Agent，不报告完整 apply 成功。
+首次初始化失败按上节由运维决定处理方式；已成功初始化的部署更新时，OpenEvent 已切换而完整配置尚未提交，
+保留现场并重新 apply，不自动回滚。
+Agent 自行恢复历史后才派发新任务。Cmd 从执行请求取得附件凭据，可以独立处理已经提交的任务；
+不需要等待 Agent 提供凭据查询服务，也没有恢复就绪和放行文件。
+进程控制入口的 status 必须返回 RUNNING；进程运行状态不代表模型和工具完整链路已通过验证。
+本地状态扫描在同次扫描中复用预期配置路径，仍逐个核对 PID、进程存活状态和命令行。
 
-`session_id` 是 IM、Model、WAL、Cmd 四个 channel 的永久绑定键。一个 session 的四个 channel 全部
-解析、校验并在 `config_committed` 阶段以完整映射写入 `config/state.yaml` 后，该 session 完成初始化。
-四个 id 必须作为一组提交；部分映射不代表初始化完成。
+Cmd Worker 从已生成部署状态 `state.yaml` 的 `cmd_environment` 读取对象服务地址，
+据此设置 `OPENEVENT_OBJECT_TARGET`；读取失败即启动失败。
+PATH 包含部署 Python 的 bin 目录，因此可以运行本项目安装的 `openevent-read-object`。
+默认会话工作目录遵循[目录结构](#目录结构)中的部署前提与路径规则。附件内存映射与命令结果语义见 Agent 文档。
 
-Channel 协调分为两个生命周期：
+成功初始化后，重复 apply 只重启配置发生变化的组件、因依赖更新已停止的组件和 Agent，并继续已有待重启事项。
+如果变化到取得真实资源、生成完整组件配置时才确定，也必须先停止 Agent，再提交依赖配置和更新进程。
+Agent 完成恢复后再派发，保证依赖更新期间没有新的派发。
+完整配置提交后仍需完成的重启保存在 state 的 `pending_restarts` 中；只有后续进程启动全部完成才清除。
+apply 或 start 按上述提交边界继续这些事项，不能因配置文件已更新就复用仍运行旧配置的进程。
+`--start` 不重新解析资源或修改配置：先确保已提交配置中的 OpenEvent 运行且目标地址就绪，
+再启动其余依赖并完成相应待重启事项，最后启动 Agent；OpenEvent 已从待重启清单移除也不能跳过运行检查。
+Chat 配置中的监听参数或 origin，以及 worker 对象读取环境的变化，也会触发对应组件重启。
+新网页会话不触发 apply，不改变 worker 配置。无配置变化且没有待重启事项时，不重新启动已运行的进程。
 
-1. 未初始化：每类 channel 按输入 YAML 中的显式 id、同名 channel、protocol 和 description 稳定
-   业务字段匹配的 channel 依次查找；没有可复用候选时创建。显式 id 是指令，不是提示：它不存在、
-   不可访问或不兼容时，apply 直接失败，不能回退到自动发现或创建。
-2. 已初始化：`config/state.yaml` 中保存的四个 id 是唯一权威映射。输入中的显式 id 可以省略；如果
-   提供，必须与保存值相同。任一 id 不同，或者已绑定 channel 缺失、不可访问或不兼容时，apply
-   直接失败；Reconciler 不再查找或创建替代 channel。
+正常停止先向 Agent 发 SIGTERM，等待其收尾和退出，再关闭 worker 与其他依赖。
+本地进程脚本在发送信号前核对 PID，等待 Agent 退出时不设置总时限。
+其他组件收到 SIGTERM 后等待十秒，仍未退出则发送 SIGKILL，再最多等待两秒确认退出。
+发送停止信号失败且进程仍存活，或其他组件强制结束后仍未确认退出时，停止命令报错并保留 PID 记录。
+整套停止在失败处中止，不继续关闭依赖；启动清理或重启遇到同样失败时，也不能启动替代进程。
+强制结束后的重启仍遵守上述运维前提，并由 Agent 恢复历史。
+只停止 Agent 时，Agent 不会因停机主动发送业务取消；仍在运行的 worker 可以继续处理已提交任务。
+Cmd 重启后，已接受且没有最终结果的命令按
+[Cmd 的恢复规则](https://github.com/openevent-official/openevent-modules-cmd/blob/main/docs/CONFIGURATION_cn.md#恢复与退出)
+补写 `RECOVERY_FAILED`，不重新执行。调用失败冻结、取消、RPC 重试和模型历史只由 Agent 规则定义。
 
-禁用 session、从目标配置中暂时移除 session，或随后重新启用，都不解除绑定。`config/state.yaml`
-必须保留所有已初始化 session 的完整映射，而不只保留当前 enabled session。需要更换任一 channel
-时，必须使用新的 `session_id` 创建新 session；原 `session_id` 不提供解绑或重绑操作。
+## 依赖与验证
 
-可复用条件：
-
-- `protocol` 匹配。
-- `visibility` 匹配且不是协议禁止值。
-- `description` 是合法 JSON，且稳定业务字段匹配。
-- channel creator 必须是 `agent.principal` 解析出的 principal。
-- 必需成员已经存在，或 `agent.principal` 的 token 可用且能通过 `AddMember` 补齐。
-
-只缺必需成员时，Reconciler 可以按上述条件补齐成员；这不改变 channel 身份。Reconciler 不会修改
-旧 channel 的 `protocol`、`description`、`visibility` 或 `creator`，因为当前 OpenEvent API 没有
-channel update。它也不会删除旧 channel 或历史事件。
-
-description 稳定字段：
-
-| Channel | 稳定字段 |
-| --- | --- |
-| IM | `version=v1`、`provider`、`session_id`、`session_type`、`metadata.runtime_name`、`metadata.agent_session_id` |
-| Model | `version=v1`、`metadata.runtime_name`、`metadata.agent_session_id`、`metadata.model_proxy_principal` |
-| WAL | `version=v1`、`session_id`、`im_channel_id`、`model_channel_id`、`metadata.runtime_name` |
-| Cmd | `version=v1`、`metadata.runtime_name`、`metadata.agent_session_id`、`metadata.cmd_worker_principal` |
-
-WAL 的解析依赖最终 IM 和 Model channel id，因为它的 description 会记录这两个 id。Cmd 和 WAL
-之间没有顺序依赖，设计不再规定更强的创建顺序。
-
-## 派生配置要点
-
-这里只记录无法从输入字段名直接看出的映射。各组件自己的文档仍是其配置 schema 和运行行为的
-权威来源。
-
-| 组件 | 生成契约 |
-| --- | --- |
-| IM syncer | `worker.principal/token` 来自 `im.worker_principal`；`principal_tokens` 包含 enabled user 和 bot，不包含 worker。每个 enabled session 生成一条 user mapping 和一条 bot mapping；user `external_user_id` 使用显式值或手机号/邮箱解析结果，bot 使用 `im.bot.app_id`。 |
-| model-proxy | protocol 固定为 `llm.v1`；`channels` 包含 enabled Model channel ids。provider 配置接收 `model.base_url/api_key/timeout_ms`；`model.model` 只进入 Agent 配置。 |
-| cmd-worker | protocol 固定为 `cmd.v1`；principal/token 和 enabled Cmd channel ids 从目标状态解析。`output_dir` 默认是 `<runtime_root>/data/cmd-worker-output`；Agent 不直接执行 shell。 |
-| Agent | 每个 enabled session 生成 principal/token 和四个最终 channel id。配置没有 `from_seq`；Agent 从 OpenEvent 历史恢复消费位置。 |
-
-## 排错
-
-常用检查：
+使用部署 Python 环境已安装的 `openevent-sdk>=0.13.0`、Chat、`openevent-model-proxy>=0.1.1`、
+`openevent-modules-cmd>=0.3.0,<0.4.0`（Cmd 0.3.x）和 `openevent-view>=0.1.0` 发行包；
+SDK 必须提供 `AddTokenResponse.token` 和 `batch_get_object_metadata`。
+View 是本部署必需组件，本项目的包依赖中已声明。
+Chat SDK 必须支持 `get_turn_content`、`TurnWriter.reset`、按创建位置、链尾和有效内容清单恢复 `TurnWriter`，
+以及带 `start_seq` 的取消调用和 `serialize_payload`；
+Model SDK 必须支持流式协议，Cmd SDK 必须支持指定发布 UUID 和通过 `object_keys` 传递附件凭据。
+版本号相同不表示能力相同，安装脚本使用本次构建产物替换各本项目包并检查实际公开 API。
+不从 SDK 子模块拼接源码路径。OpenEvent 配置先独立校验，其余配置分别由 Chat、Model、Cmd、Agent、View 的 parser 校验。
 
 ```bash
-python3 scripts/reconcile_runtime.py --spec openevent-stack/stack.yaml --dry-run
-python3 scripts/reconcile_runtime.py --spec openevent-stack/stack.yaml --print-config im_syncer
-python3 scripts/reconcile_runtime.py --spec openevent-stack/stack.yaml --print-config model_proxy
-python3 scripts/reconcile_runtime.py --spec openevent-stack/stack.yaml --print-config cmd_worker
-python3 scripts/reconcile_runtime.py --spec openevent-stack/stack.yaml --print-config agent
+make test PYTHON=/absolute/path/to/python TEST_ARGS='-p test_reconcile_runtime.py'
+make test PYTHON=/absolute/path/to/python TEST_ARGS='-p test_stack_scripts.py'
 ```
 
-`openevent-stack` 本地运行目录还提供：
+测量本地状态查询耗时：
 
 ```bash
-./openevent-stack/bootstrap.sh --dry-run
-./openevent-stack/bootstrap.sh --apply
-./openevent-stack/status.sh
-./openevent-stack/logs.sh model-proxy
-./openevent-stack/logs.sh cmd-worker
+make benchmark-stack-status PYTHON=/absolute/path/to/python
 ```
 
-排错文件：
-
-| 文件 | 看什么 |
-| --- | --- |
-| `config/plan.yaml` | 本次创建/采用 token、创建/复用 channel、写配置和重启动作。 |
-| `config/state.yaml` | 当前 token/config 摘要、已初始化 session 的永久 channel 绑定，以及 `last_apply` 状态、已完成阶段或失败阶段。 |
-| `config/secrets.yaml` | 自动创建或采用的 OpenEvent token。注意保密。 |
-| `config/*.yaml` 组件配置 | 最终传给各组件的真实配置。 |
-| `logs/*.log` | 本地 `openevent-stack/process.sh` 启动的组件日志。 |
-| `workdir/` | 本地 `openevent-stack/process.sh` 启动组件时使用的当前工作目录；Agent `exec` tool call 未传 `workdir` 时也默认在这里执行命令。 |
-
-常见错误：
-
-| 错误 | 处理 |
-| --- | --- |
-| `version must be v1` | 输入 YAML 顶层 `version` 必须是 `v1`。 |
-| `principals.<name> must be a positive integer` | principal 必须显式配置为正整数。 |
-| `im.users[] must provide external_id, user_phone, or user_email` | 每个 IM 用户必须提供 Provider 用户 `open_id`、手机号或邮箱三者之一。 |
-| `sessions[].channels.im must be a string` | session 的 IM channel 名称必须是字符串。 |
-| `OpenEvent admin endpoint is not ready` | OpenEvent 没启动、端口不对、server binary 路径不对，或配置写错。 |
-| `created token is not usable for principal ...` | 通常是同一端口上残留了多个 OpenEvent 进程，Admin 和业务 gRPC 请求落到了不同实例；`openevent-stack/process.sh start openevent` 会清理同配置的陈旧进程。 |
-| `supervisor start/restart failed` | 检查 `runtime.supervisor.ctl` 和 `runtime.supervisor.programs.*` 是否能启动对应进程。 |
-
-## 依赖契约
-
-生成配置使用当前 Python 环境中已安装组件的 config parser 校验。OpenEvent 和各 Worker 的 API、
-协议与配置 schema 仍以组件自己的公开文档为准；Reconciler 只负责本文定义的输入到配置映射。Agent
-行为和 WAL 字段由本项目的 [IM_MODEL_AGENT_cn.md](IM_MODEL_AGENT_cn.md) 与
-[AGENT_WAL_PROTOCOL_cn.md](AGENT_WAL_PROTOCOL_cn.md) 定义。
+该入口分别执行三次 `status chat-server` 和 `status all` 只读查询，报告各自耗时中位数，并将结果保存到 `build/benchmarks/`；不启动或停止服务。
