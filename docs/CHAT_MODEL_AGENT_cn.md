@@ -1,13 +1,13 @@
 # Chat Agent
 
-> 实现状态：本文的事件驱动会话、上下文压缩、过长消息拒绝及配置已实现；测试范围与外部联调限制见 [README](../README_cn.md)。
+> 实现状态：本文的事件驱动会话、上下文压缩、过长消息拒绝及配置已实现。
 
 [English version](CHAT_MODEL_AGENT.md)
 
 Chat Agent 在一个部署内服务指定用户与 Agent 之间的多个 Chat 会话。不同会话有各自的输入队列、工作目录
 和模型历史，共用部署绑定的 Model、Cmd 和 WAL Channel。完整部署入口见
 [Runtime Reconciler](RUNTIME_RECONCILER_cn.md)；本文规定 Agent 自身的运行配置并说明使用行为。
-持久字段和源事件引用统一见 [Agent WAL 协议](AGENT_WAL_PROTOCOL_cn.md)，当前协议为 `agent.wal.v5`，模型 I/O 版本为 `3`。
+持久字段和源事件引用统一见 [Agent WAL 协议](AGENT_WAL_PROTOCOL_cn.md)，当前协议为 `agent.wal.v5`，模型 I/O 版本为 `4`。
 模型输入、摘要、压缩请求、工具与输出格式统一见[模型输入输出格式](MODEL_IO_cn.md)；该文档也提供默认提示词与完整请求示例入口。
 同一会话按事件推进，模型调用与实际工具执行分别串行；等待工具不会阻止新用户消息触发模型。
 空闲或等待结果的会话不独占工作线程，增加会话不会增加工作线程数。
@@ -19,9 +19,8 @@ Chat Agent 在一个部署内服务指定用户与 Agent 之间的多个 Chat �
 
 ## 安装和启动
 
-部署环境必须已经安装满足声明的 `openevent-sdk >= 0.13.0`、`openevent-modules-chat`、
-`openevent-model-proxy >= 0.1.1`、`openevent-modules-cmd`、`openevent-view` 和 `PyYAML`。环境准备见
-[Ubuntu 环境文档](UBUNTU_ENVIRONMENT_cn.md)。本项目从当前源码构建并安装：
+在部署使用的 Python 环境中安装并启动 Agent。构建命令及依赖的安装方式见[构建与安装](../README_cn.md#构建与安装)。
+整套服务的准备步骤见 [Ubuntu 环境文档](UBUNTU_ENVIRONMENT_cn.md)，运行条件见 [Runtime 的依赖要求](RUNTIME_RECONCILER_cn.md#依赖)。
 
 ```bash
 make install PYTHON=python3
@@ -68,7 +67,7 @@ Agent 直接使用这两段 UTF-8 正文，不读取源提示词文件，也不�
 单独运行 Agent 时也须满足 [Runtime 的工作目录部署前提](RUNTIME_RECONCILER_cn.md#目录结构)。
 
 `openevent.max_payload_bytes` 可选，默认 `16777216`（16 MiB），取值为 `1..62914560` 的整数。
-它是目标 OpenEvent 服务端的 payload 额度；Runtime 自动写入服务端实际配置值，单独运行 Agent 时也应与目标服务端保持一致。
+它是目标 OpenEvent 服务端的 payload 额度。Runtime 写入服务端实际配置值，单独运行 Agent 时也应与目标服务端保持一致。Agent 将同一额度传给每个会话的 Chat SDK 客户端。
 Agent 按实际编码后的 payload 字节数检查自己构造的业务内容及 WAL 记录，包括 Chat 正文与固定通知、
 普通和压缩准备记录、工具准备/发送/完成记录及实际 Model、Cmd 请求；尚未分配的标识按最大合法编码宽度预留。
 另行检查包含附件凭据和封装的 64 MiB 传输上限。
@@ -288,7 +287,8 @@ Agent 回答仍然流式展示：先出现“Processing...”，再由模型正�
 上下文压缩只替换模型下一次阅读的旧事件表示，不删除 OpenEvent 原事件，也不改变工具的实际状态和归属。
 
 可重试的普通模型失败按 `max_model_attempts` 处理；压缩失败使用上节固定额度。
-失败耗尽、Provider 明确报上下文超限或历史压缩后仍无法准备合法输入时，保存最终失败原因，发布一次独立 Chat single，
+Model Proxy 返回 `infer.result` 状态码 `60009` 时，表示请求中固定的服务商名称未配置。Agent 将该次失败记为不可重试，错误日志记录原请求的 seq 和服务商名称。普通回答直接进入失败通知和暂停流程，压缩批次结束并按已有压缩失败流程回退。
+尝试额度耗尽、普通请求使用了未配置的服务商、Provider 明确报上下文超限或历史压缩后仍无法准备合法输入时，保存最终失败原因，发布一次独立 Chat single，
 回复目标沿用本次回答的固定目标，正文为“Processing failed: {reason}. This conversation is paused. Send a new message to retry or revise your request.”。
 原因采用 Agent 定义的固定英文短诊断，说明失败阶段和实际原因，例如“Normal inference timed out waiting for the model response”、
 “History compression timed out waiting for the model response”、“History compression produced a summary that exceeds the size limit”

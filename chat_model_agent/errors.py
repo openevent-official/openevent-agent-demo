@@ -5,6 +5,7 @@ from enum import Enum
 class FailureCode(Enum):
     TIMEOUT = "timeout"
     CONTEXT_LIMIT = "context_limit"
+    PROVIDER_NOT_CONFIGURED = "provider_not_configured"
     INVALID_TOOL_ARGUMENTS = "invalid_tool_arguments"
     INVALID_OUTPUT = "invalid_output"
     EVENT_TOO_LARGE = "event_too_large"

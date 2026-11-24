@@ -4,7 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import threading
 
-from .prompt import (assistant_event, tool_call_event, tool_result_event,
+from .budget import event_size
+from .prompt import (append_reply_reference, assistant_event, tool_call_event, tool_result_event,
                      user_cancelled_event, user_event)
 from .state import HistoryError
 from .tool_runner import ReadProgress
@@ -86,11 +87,12 @@ class ConversationIndex:
         self.projection_lock = threading.RLock()
         self.projection = _Projection()
 
-    def user(self, seq):
+    def user(self, seq, max_bytes=None):
+        """Return the complete user event, or None once its admission limit is exceeded."""
         with self.cache_lock:
             cached = self.users.get(seq)
         if cached is not None:
-            return cached
+            return cached if max_bytes is None or event_size(cached) <= max_bytes else None
         # The ordered reader has already confirmed this single and its reply
         # targets. The Chat SDK owns reconstruction of their final content.
         read = lambda terminal: self.engine.rpc.sdk(
@@ -99,14 +101,32 @@ class ConversationIndex:
         text = lambda value: "".join(part.text for part in value.content)
         attachments = lambda value: self.session._attachments(
             item.object_key for item in value.attachments)
-        refs = []
-        if turn.reply_to_seqs:
-            for target_seq in turn.reply_to_seqs:
-                target = read(target_seq)
-                refs.append({"role": "assistant" if target.turn_ref.principal == self.session.cfg.agent.principal else "user",
-                             "status": target.state, "text": text(target), "attachments": attachments(target)})
         event = user_event(seq, self.engine.event_header(self.cid, seq).ts_ms,
-                           text(turn), attachments(turn), refs or None)
+                           text(turn), attachments(turn))
+        targets = turn.reply_to_seqs or ()
+        if targets:
+            event["reply_context"] = []
+        remaining = max_bytes
+        if remaining is not None:
+            # Reserve the array commas now. event_size(ref) includes one comma.
+            remaining -= event_size(event) + max(0, len(targets) - 1)
+            if remaining < 0:
+                return None
+        for target_seq in targets:
+            target = read(target_seq)
+            ref = {
+                "role": "assistant" if target.turn_ref.principal == self.session.cfg.agent.principal else "user",
+                "status": target.state,
+                "text": text(target),
+                "attachments": attachments(target),
+            }
+            if target.error is not None:
+                ref["error"] = target.error
+            if remaining is not None:
+                remaining -= event_size(ref) - 1
+                if remaining < 0:
+                    return None
+            append_reply_reference(event, ref)
         with self.cache_lock:
             if (position(cursor(seq)) > self.covered
                     and self.journal.get(f"chat:{self.cid}:input:{seq}:reject") is None):

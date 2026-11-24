@@ -1,31 +1,59 @@
 # OpenEvent Agent Demo
 
-> Implementation status: event input, asynchronous tools, context compression, oversized-message rejection, prompt-file configuration, and WAL v5 are implemented. See [validation scope](#validation-scope) for completed checks and unverified behavior.
-
 [中文版](README_cn.md)
 
-This project combines OpenEvent, Chat, Model Proxy, Cmd, and OpenEvent View into a runnable Chat Agent.
-Users ask questions, attach files, or cancel replies in Chat. The Agent streams replies, runs commands when needed,
-and records recovery facts through OpenEvent. Conversations are discovered dynamically from Chat;
-creating a conversation requires neither a per-session configuration nor another deployment apply.
-User messages are complete `turn.single` events; Agent replies still stream. New user messages can trigger inference while tools run,
-with model calls and actual tool execution serialized separately within each conversation. Summaries compress old events for later inputs.
-Model summaries retain necessary task information while execution records preserve full tool parameters.
-History meeting its size target guarantees room for one compliant input; later tool results still enter event history in order.
-See the [Agent guide](docs/CHAT_MODEL_AGENT.md#conversations-and-replies) for behavior and allowances.
+OpenEvent Agent Demo is a runnable reference application for developers building agents on OpenEvent.
+It shows how a chat agent uses events to connect a web conversation, a model provider, and a Linux command worker.
+You can deploy the whole application or use its design as a starting point for your own agent.
 
-Conversation discovery uses system messages from Fetch across all readable Channels. Adoption conditions, Chat's joining-order prerequisite,
-and restart behavior are specified in the [Agent guide](docs/CHAT_MODEL_AGENT.md#conversation-discovery).
-The [WAL protocol](docs/AGENT_WAL_PROTOCOL.md) defines persistent fields. Documentation maintains the current scheme,
-without compatibility or migration designs for old code.
-Text display batches complete model fragments without splitting them and records their sources as seq ranges.
-See [WAL display sources](docs/AGENT_WAL_PROTOCOL.md#5-effects-and-display-sources)
-for the contract.
-The current WAL is `agent.wal.v5`, with model I/O version `3`, without old-format compatibility or migration.
-The public format specification, default prompt files, request examples, implementation, and deployment template use the same configuration and protocols.
+## Architecture
 
-The Agent entry point is `chat-model-agent`, using configuration version `chat-agent.v1`.
-Deployment uses installed distributions of `openevent-sdk >= 0.13.0`, Chat, Model Proxy, Cmd, and View.
+Each conversation has its own Chat Channel in OpenEvent. Across conversations, the deployment shares three
+other Channels. Model Proxy and Cmd Worker receive requests and return results on the Model and Cmd Channels,
+respectively. The Agent writes its decisions and references to source events to the WAL (write-ahead log) Channel.
+
+### OpenEvent Server
+
+The server stores messages from all Channels in one global sequence and enforces who can read and publish them.
+It also stores attachments as immutable objects. An Agent coming back online can read the retained events in order,
+including user messages that arrived while it was offline. [OpenEvent](https://github.com/openevent-official/openevent)
+
+### Chat
+
+Chat provides the browser page, HTTP server, and Chat SDK. When a user creates a conversation, Chat Server creates
+its Channel and stores the display name in its local session directory. It publishes user messages and attachment
+references to that Channel and serves the Agent's replies to the browser as they arrive. [Chat](https://github.com/openevent-official/openevent-modules-chat)
+
+### Chat Agent
+
+One Agent process discovers the Chat Channels it has joined and maintains separate model histories and tool queues
+for each conversation. It builds model inputs, streams answers to Chat, and feeds tool results into subsequent model calls. After a restart
+it uses WAL decisions together with the referenced Chat, Model, and Cmd events to recover each conversation's progress.
+[Chat Agent guide](docs/CHAT_MODEL_AGENT.md)
+
+### Model Proxy
+
+The Agent supplies the conversation context for a reply or a history summary. The proxy holds the provider credentials,
+calls the configured OpenAI-compatible model service, and publishes response fragments and the final status back
+to the Model Channel. [Model Proxy](https://github.com/openevent-official/openevent-modules-model-proxy)
+
+### Cmd
+
+Cmd Worker executes the Agent's shell requests on its Linux host, using the conversation's shared working directory
+by default. It reports the outcome on the Cmd Channel and keeps stdout and stderr in local files, so the Agent
+can request just the output range it needs. [Cmd](https://github.com/openevent-official/openevent-modules-cmd)
+
+### OpenEvent View
+
+View provides a separate, read-only web page and API for inspecting Channel metadata and message history. An operator
+can use their OpenEvent credentials to trace a model request or command result across the Channels they can read.
+[OpenEvent View](https://github.com/openevent-official/openevent-view)
+
+## Agent Behavior
+
+Start a conversation in the browser to ask a question or attach a file. Replies appear as they are generated.
+You can send a follow-up while a command is running, or cancel an individual reply that is still in progress.
+[Conversations and replies](docs/CHAT_MODEL_AGENT.md#conversations-and-replies)
 
 ## Quick Start
 
@@ -62,32 +90,37 @@ Stop all services:
 ./openevent-stack/stop.sh
 ```
 
-## Build, Install, and Test
+## Build and Install
 
-Use a Python environment with the SDK and the Chat, Model Proxy, Cmd, and View distributions installed:
+Run these commands from the project root. Make uses the current shell's `python3` by default. Set `PYTHON` to select another Python 3.10+ interpreter with pip.
+
+| Command | Purpose |
+| --- | --- |
+| `make build` | pip prepares the build tools in an isolated environment. A successful build places its wheel in `dist/`. This step requires only the build dependencies in [pyproject.toml](pyproject.toml). |
+| `make install` | Build a fresh wheel and install it into the selected Python environment. pip installs only missing or incompatible runtime dependencies and replaces the Demo itself even at the same version. Requires pip 22.3 or newer. |
+| `make clean` | Remove this project's build files, caches, and release packages. Keep Python environments, offline dependencies, and artifacts from other projects. |
+
+For example, this command installs the Demo into the deployment virtual environment.
 
 ```bash
-make build PYTHON=python3
-make install PYTHON=python3
-make test PYTHON=python3
+make install PYTHON=/opt/openevent/venv/bin/python
 ```
 
-Building also requires `setuptools >= 68` and `wheel`. `make build` builds under `build/` and writes the current wheel
-to `dist/`. `make install` rebuilds, then checks the wheel's declared dependencies and installs only missing or
-incompatible ones. After that succeeds, it force-replaces only this project's installed package, even when its version
-is unchanged. Dependency resolution or download failures stop before replacing the installed project package.
-Generated files, caches, and test data stay under `build/`; Python bytecode is not generated in source directories.
+Build intermediates and caches stay under `build/`. The build and install commands clear inherited
+`PYTHONPATH` and `PYTHONHOME`. If the selected Python can import
+user-site packages, it also supports `PIP_USER=1 make install`. Unset pip's `--python` and `--root` settings
+before installation. To install into a separate directory with `--target` or `--prefix`, run `make build`, then
+pass the exact path of the resulting wheel to `python3 -m pip install`.
 
-`make test-install` checks installation order and same-version replacement offline in temporary virtual environments
-under `build/`; it requires Python's `venv` support and does not require the OpenEvent components.
+In `pip.conf`, use `[global]` for a shared package source, or configure `[wheel]` for build dependencies and
+`[install]` for runtime dependencies. A dependency resolution or download failure stops installation before
+replacing the installed Demo. For an offline installation, place the build and runtime dependencies, including their
+transitive dependencies, in `build/wheelhouse/`. Choose wheels that match the target Python and platform, then run the
+following command.
 
-For cross-module changes, use `make test-current-dependencies`: explicitly select the five dependency source directories,
-rebuild and install them in a separate environment, then run tests.
-See [development validation](docs/UBUNTU_ENVIRONMENT.md#development-validation) for arguments and the environment-only target.
-An older installed package with the same version does not establish compatibility with current source code.
-
-For WAL indexes and Runtime local state writes only, run `make test-unit PYTHON=python3`.
-This target uses the same dependency environment and runs only a subset of local tests; it does not replace the full dependency and integration checks in `make test`.
+```bash
+PIP_NO_INDEX=1 PIP_FIND_LINKS=build/wheelhouse make install
+```
 
 Installation provides two commands:
 
@@ -98,18 +131,6 @@ openevent-read-object 12345
 
 The latter obtains attachment credentials from its Cmd task environment, supplied with the run request, and uses the object service address configured by Runtime. It does not require Agent to be online.
 See the [Agent guide](docs/CHAT_MODEL_AGENT.md) for details.
-
-## Validation Scope
-
-Automated validation includes unit tests, Runtime and process-script tests, and Agent integration tests using the real Chat, Model, and Cmd SDKs with an in-memory event service.
-Coverage includes new input while tools run, cancellation isolation between replies, compaction checkpoints and recovery,
-history targets across multiple batches, independent rejection of oversized messages, failure pauses and new-input resumption,
-and recovery using frozen budgets. These tests run through the project's `make` targets and do not call an external model Provider.
-
-On 2026-11-13, a request containing the actual Agent prompts, tool schemas, and historical input was tested against a real external model Provider,
-which returned HTTP 200 and a complete streaming response. This check established that the Provider accepted and completed that request;
-it did not exercise the full Agent and OpenEvent event-processing path or execute model tools.
-Production end-to-end validation of Chat, Agent, OpenEvent, Model Proxy, and Cmd remains incomplete.
 
 ## Daily Operation
 
@@ -140,4 +161,3 @@ without redefining their underlying protocols.
 | `scripts/` | Environment preparation script |
 | `openevent-stack/` | Local deployment template and process scripts |
 | `docs/` | Project runtime and protocol documentation |
-| `tests/` | Agent, Runtime, and script tests |

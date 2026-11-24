@@ -6,7 +6,7 @@ import os
 import sys
 
 from .dependencies import require_sdk
-from .objects import MAX_UINT64, ObjectIndex, ObjectIndexError
+from .objects import MAX_UINT64, ObjectIndexError, object_key
 
 
 # OpenEvent objects have a fixed 4 MiB limit; ReadObject clips to the actual size.
@@ -22,12 +22,13 @@ def command_object(object_id):
         keys = json.loads(os.environ["OPENEVENT_OBJECT_KEYS"])
         if not isinstance(keys, list):
             raise ValueError()
-        index = ObjectIndex()
-        for key in keys:
-            index.register(key)
+        for value in keys:
+            key = object_key(value)
+            if key["object_id"] == object_id:
+                return key
     except (KeyError, ValueError, TypeError, ObjectIndexError):
         raise ObjectReadError("invalid command object references") from None
-    return index.get(object_id)
+    raise ObjectReadError("object ID is not registered")
 
 
 def copy_object(client, key, output):
@@ -69,7 +70,7 @@ def main(argv=None):
         return 0
     except BrokenPipeError:
         return 1
-    except (ObjectIndexError, ObjectReadError) as error:
+    except ObjectReadError as error:
         failure = str(error)
     except Exception:
         pass

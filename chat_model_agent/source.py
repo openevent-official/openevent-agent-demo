@@ -57,7 +57,7 @@ def parsed_header(message, parsed, module):
                 or model.kind in {"infer.result", "infer.end"} and model.has_body):
             payload["body"] = None
     else:
-        fields = ("kind", "prev_seq", "status", "bytes", "target_seq", "stream",
+        fields = ("kind", "prev_seq", "status", "target_seq", "stream",
                   "offset", "nbytes", "timeout_ms", "exit_code", "ts_ms",
                   "content_encoding", "eof")
         payload = {key: getattr(parsed.payload, key) for key in fields

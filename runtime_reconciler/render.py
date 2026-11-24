@@ -29,6 +29,7 @@ def render_configs(spec, resolved):
             "user_principal": str(p["user"]), "user_openevent_token": t["user"], "agent_principal": str(p["agent"]),
             "rpc_timeout_ms": spec.rpc["timeout_ms"], "max_retries": spec.rpc["max_retries"],
             "max_user_message_bytes": spec.chat["max_user_message_bytes"],
+            "max_payload_bytes": spec.openevent["max_payload_bytes"],
         }},
         "model_proxy": {"path": "model-proxy.yaml", "data": {
             "protocol": "llm.v1", "open_event": {"addr": addr, "rpc_timeout_ms": spec.rpc["timeout_ms"]},

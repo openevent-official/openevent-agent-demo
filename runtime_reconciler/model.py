@@ -7,7 +7,7 @@ from .common import _sha256, _stable_json
 SPEC_VERSION = "chat-runtime.v1"
 STATE_VERSION = "chat-runtime.state.v1"
 SECRETS_VERSION = "chat-runtime.secrets.v1"
-PROTOCOL_MODEL, PROTOCOL_CMD, PROTOCOL_WAL = "llm.v1", "cmd.v3", "agent.wal.v5"
+PROTOCOL_MODEL, PROTOCOL_CMD, PROTOCOL_WAL = "llm.v1", "cmd.v4", "agent.wal.v5"
 PROCESS_START_ORDER = ("openevent", "model_proxy", "chat_server", "view", "cmd_worker", "agent")
 
 class ReconcileError(RuntimeError):

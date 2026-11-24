@@ -1,6 +1,6 @@
 # Agent WAL protocol agent.wal.v5
 
-> Implementation status: the current implementation uses `agent.wal.v5`. See the [README](../README.md) for test coverage and external integration limits.
+> Implementation status: the current implementation uses `agent.wal.v5`.
 
 [中文版本](AGENT_WAL_PROTOCOL_cn.md)
 
@@ -16,7 +16,7 @@ All Chat conversations in a deployment share one private WAL Channel. Its only m
 Agent principal. Its protocol is `agent.wal.v5`. Runtime creates this description:
 
 ```json
-{"version":"v5","updated_at_ms":1790000000000,"metadata":{"deployment_id":"demo"}}
+{"version":"v5","metadata":{"deployment_id":"demo"}}
 ```
 
 A deployment permanently binds its principals and Model, Cmd, and WAL Channels. Conversation records identify their
@@ -121,7 +121,7 @@ Seq values are global OpenEvent event positions; record keys refer to this WAL. 
 | `attempt.prepare` | `purpose`: `answer` or `compaction`; `owner`: the corresponding preparation record key; `number`: attempt index; `stream_id` |
 | `attempt.accept` | `attempt`; `request_seq`, `stream_id`, `terminal_seq`: the uniquely accepted model source. Ordinary attempts require full validation and confirmation of still-applicable Chat display; when a later effective cancellation has already closed the reply, omit further display while retaining the earlier result. Compaction attempts validate only the summary, without display, tool registration, or entry into ordinary answer history |
 | `attempt.timeout` | `attempt`: expired ordinary or compaction attempt; this record's seq is the expiry trigger position, not a final failure decision |
-| `attempt.fail` | `attempt`, positive integer `source_seq`, fixed short user-facing diagnostic string `reason`, boolean `retryable`. `source_seq` references the original model event, `attempt.timeout`, or owning local preparation fact that caused failure; `reason` identifies the failed stage and actual cause. `retryable` is false for local overflow of an already fixed input or an explicit model context-length error; rejection of an unprepared user input uses `input.reject`. Persisted decisions are not revoked by late output or configuration changes |
+| `attempt.fail` | `attempt`, positive integer `source_seq`, fixed short user-facing diagnostic string `reason`, boolean `retryable`. `source_seq` references the original model event, `attempt.timeout`, or owning local preparation fact that caused failure; `reason` identifies the failed stage and actual cause. [Model failure handling](CHAT_MODEL_AGENT.md#conversations-and-replies) determines `retryable`; rejection of an unprepared user input uses `input.reject`. Persisted decisions are not revoked by late output or configuration changes |
 | `effect.prepare` | Target `channel` and module fields from section 5 |
 | `effect.commit` | `seq`, `uuid`: the committed source business event. uuid may be null when the SDK returned seq before the source event was read |
 | `effect.error` | `effect_key`; SDK-reported `state` (`COMMITTED`, `NOT_COMMITTED`, or `UNKNOWN`); nullable `uuid` |
@@ -135,7 +135,7 @@ Seq values are global OpenEvent event positions; record keys refer to this WAL. 
 | `compaction.commit` | `attempt`: the uniquely accepted compaction attempt for this batch; sources, coverage, and configuration are obtained through that attempt's owning `compaction.prepare` |
 
 Ordinary `settings` contains `model`, nullable `provider`, the complete `system_prompt` text, `context_max_input_bytes`,
-the derived positive integer `context_history_max_bytes`, and `io_version=3`. Compaction settings use the complete
+the derived positive integer `context_history_max_bytes`, and `io_version=4`. Compaction settings use the complete
 `context_compression_prompt` text instead of `system_prompt`, with the other fields unchanged.
 `context_max_input_bytes` preserves the user's original configured cap `B`, not the effective cap reduced by current publication capacity.
 `context_history_max_bytes` preserves the positive integer target actually used for this preparation, not another user configuration option.
@@ -247,7 +247,7 @@ but cannot exceed the frozen processing cutoff or include or pass the first unco
 This permits direct coverage of confirmed historical output and cancellation facts without consuming new tasks early.
 Ordinary consumption comes from confirmed `answer.prepare` records within the snapshot; summary coverage comes from confirmed `compaction.commit` records.
 Restore them independently, without additional cursor records. The batch's `events` is nonempty and reconstructs complete events under the
-[model I/O v3 rules](MODEL_IO.md#42-summary-format-and-compaction-calls). Individual events are never split, and there is no separate tool-result compaction.
+[model I/O v4 rules](MODEL_IO.md#42-summary-format-and-compaction-calls). Individual events are never split, and there is no separate tool-result compaction.
 Complete events from one accepted output may belong to adjacent compaction batches, located by the existing seq/index cursors;
 whole-output acceptance and tool-preparation rules remain unchanged.
 Confirmed preparation fixes event sources, range, and configuration. A `compaction.commit` must reference an accepted attempt
@@ -341,7 +341,7 @@ Tool preparation contains no second copy of an OpenEvent message UUID.
 | `cancelled` | No additional fields; only for undispatched tools |
 
 Read results are reconstructed from per-page request commits and indexed Cmd results. First request, page count, and final
-result must agree with the decision; no per-page result array is stored. Read offsets advance by actual returned bytes.
+result must agree with the decision; no per-page result array is stored. Read offsets advance by the `nbytes` echoed in each successful Cmd result.
 Cancelled and timed-out results contain no unused page lists. Preparation, dispatch, and completion record sizes must all be
 checked before accepting ordinary model output.
 

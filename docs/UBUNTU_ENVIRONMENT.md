@@ -1,7 +1,6 @@
 # Ubuntu Environment Preparation
 
 The environment script prepares OpenEvent, Chat, Model Proxy, Cmd, View and this project's installed package for Chat Agent.
-It does not install IM packages, require Feishu/Lark credentials or convert old IM data.
 
 ## Preparation and installation
 
@@ -30,7 +29,8 @@ Only artifacts from the current successful build are installed. Each component's
 while third-party dependencies are installed only when missing or incompatible with package declarations.
 This project's package is built from the workspace containing the script, including uncommitted changes;
 the script does not pull or replace that workspace.
-The environment script installs build tools at or above the project's required minimum versions, retaining installed versions that already satisfy them.
+The environment script prepares build tools in the deployment venv for the full stack. To build or install the Demo on its own,
+see [Build and Install](../README.md#build-and-install).
 Temporary build files go under each project's `build/` and release artifacts under `dist/`.
 The environment script's own Python operations, including venv creation and build-tool installation, keep caches and
 temporary files in this project's `build/pip-cache/` and `build/tmp/`, even with a different `--workdir`;
@@ -42,8 +42,8 @@ URL/ref overrides are:
 `OPENEVENT_MODEL_PROXY_URL/REF`, `OPENEVENT_MODULES_CMD_URL/REF`, `OPENEVENT_VIEW_URL/REF`.
 All `*_REF` values default to `HEAD`, meaning the remote default branch's latest commit at each run.
 Set an explicit branch, tag or commit to choose another revision; selected versions must continue to meet the
-[Runtime dependency requirements](RUNTIME_RECONCILER.md#dependencies-and-validation).
-`PYTHON_BIN` selects the Python used to create the venv and `JOBS` controls build concurrency.
+[Runtime dependency requirements](RUNTIME_RECONCILER.md#dependencies).
+`PYTHON_BIN` selects the Python interpreter for the venv. This script builds the SDK from source, requires Python 3.10–3.12 and installs pip 22.3 or newer in the venv. `JOBS` controls build concurrency.
 
 Installation verifies module imports, the SDK, Chat `TurnWriter` construction from known state and `serialize_payload`,
 plus reset, streaming and explicit-UUID capabilities, without importing an SDK checkout through PYTHONPATH.
@@ -60,7 +60,6 @@ a Chat web token, a model Provider, and service addresses.
 Runtime starts OpenEvent from that configuration,
 prepares tokens and the Model, Cmd and WAL Channels, saves their bindings, and generates all component configuration.
 To adopt existing Channels, specify their IDs as described in Runtime configuration.
-Old IM spec/state files are rejected; use fresh Chat deployment state and WAL.
 
 ### Start the full deployment
 
@@ -81,7 +80,7 @@ Environment preparation does not automatically execute browser, model or command
 
 ## Updating a running deployment
 
-Stop the deployment before installing a new version of this project or its dependencies, then start it again.
+For a code update that keeps the deployment protocols unchanged, stop the services, install the packages, and start the services again.
 Installing packages alone does not switch running processes to the new code; with unchanged configuration,
 `apply` and `start` do not force those processes to restart either.
 
@@ -101,47 +100,5 @@ To update dependencies, replace the middle step with the relevant projects' `mak
 preparation script using the original workspace path. The script fetches their latest remote default-branch commits by default;
 explicit URL/REF options select different sources or revisions.
 If configuration also changes, finish with `openevent-stack/bootstrap.sh --apply` instead of `start.sh`.
-Normal upgrades retain existing deployment data. Stop confirmation and restart prerequisites follow the
+For stop confirmation and restart prerequisites, see the
 [Runtime guide](RUNTIME_RECONCILER.md#startup-updates-and-shutdown).
-
-## Development validation
-
-For cross-module protocol or SDK changes, use a separate test environment and explicitly select the five public source checkouts:
-
-```bash
-make test-current-dependencies PYTHON=python3 \
-  SDK_SOURCE=/path/to/openevent-sdk \
-  CHAT_SOURCE=/path/to/openevent-modules-chat \
-  MODEL_PROXY_SOURCE=/path/to/openevent-modules-model-proxy \
-  CMD_SOURCE=/path/to/openevent-modules-cmd \
-  VIEW_SOURCE=/path/to/openevent-view
-```
-
-The caller selects these paths; there are no default directories outside this repository. The target creates or reuses
-an isolated venv in this project's `build/dependency-test-env/`, invokes each source checkout's `make install` in order,
-then builds and installs this project before running `make test`.
-Each run uses code from its successful current builds, including uncommitted source changes. Each project package is
-replaced even if its version is unchanged; third-party dependencies are resolved from package declarations without
-forced reinstalls or blanket upgrades. Any build, installation, or test failure stops the workflow.
-It does not update source checkouts, start services, or modify the deployment venv.
-
-To prepare only the environment, use `prepare-test-env` with the same arguments. Then run selected tests repeatedly:
-
-```bash
-make test PYTHON=build/dependency-test-env/bin/python TEST_ARGS='-p test_chat_agent_*.py'
-```
-
-Preparation verifies that each module comes from an installed distribution inside this environment. The full target
-clears inherited `PYTHONPATH` and `PYTHONHOME`, so source paths cannot replace built dependencies. Each component's
-make targets still keep its own build caches and intermediate files under that component's `build/`.
-
-If current dependencies have already been installed separately, use the selected Python directly:
-
-```bash
-make test PYTHON=/absolute/path/to/python
-make install PYTHON=/absolute/path/to/python
-```
-
-Tests keep temporary files and logs under `build/`.
-After changing dependencies, prepare the separate environment again or run their `make install`; an unchanged
-distribution version is not a reason to retain old installed code. Update running deployments using the procedure above.

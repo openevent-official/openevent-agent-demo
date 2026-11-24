@@ -2,7 +2,7 @@
 
 [中文版](README_cn.md)
 
-These files contain complete `POST /v1/chat/completions` request bodies for model I/O v3, matching the current implementation's format. The examples have not been executed against a real external Provider.
+These files contain complete `POST /v1/chat/completions` request bodies for model I/O v4, matching the current implementation's format. The examples have not been executed against a real external Provider.
 The [public model I/O contract](../MODEL_IO.md) defines fields, tools, and compaction formats.
 
 ## Two consecutive ordinary inputs
@@ -24,10 +24,10 @@ Every compression batch consists of complete, consecutive events. The program ch
 
 These examples use `context_max_input_bytes=1048576` and assume sufficient default sending capacity, so the effective runtime cap equals the configured cap.
 With the current default prompts, tool definitions, and
-[budget rules](../CHAT_MODEL_AGENT.md#context-byte-budget), the complete request's fixed baseline is 7347 bytes, deriving
-`max_summary_bytes=520614`. The whole history and a single input each receive 520614 bytes, measured as their final request
+[budget rules](../CHAT_MODEL_AGENT.md#context-byte-budget), the complete request's fixed baseline is 7461 bytes, deriving
+`max_summary_bytes=520557`. The whole history and a single input each receive 520557 bytes, measured as their final request
 encoding contributions, with one extra array comma reserved per event. The history target includes summary text and retained old events;
-checking only the summary text is insufficient. `7347 + 520614 + 520614 = 1048575 <= 1048576`, so history meeting the target can accept one
+checking only the summary text is insufficient. `7461 + 520557 + 520557 = 1048575 <= 1048576`, so history meeting the target can accept one
 complete input at the admission limit. This is derived from configuration, not a separate summary setting; changes to prompts or
 tool definitions require recalculation. A batch summary meeting its cap may still require further compression until the whole old history meets the target.
 

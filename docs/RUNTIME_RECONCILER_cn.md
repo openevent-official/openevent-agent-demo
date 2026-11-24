@@ -1,6 +1,6 @@
 # Chat Runtime Reconciler
 
-> 实现状态：提示词文件加载、上下文字节预算预览、Chat 正文上限及 `agent.wal.v5` 部署配置已实现；测试范围与外部联调限制见 [README](../README_cn.md)。
+> 实现状态：提示词文件加载、上下文字节预算预览、Chat 正文上限及 `agent.wal.v5` 部署配置已实现。
 
 Runtime 为一套 Chat Agent 部署准备凭据、三个共享辅助 Channel、组件配置和本地进程。
 网页会话由 Chat Server 创建，Agent 自行发现；Runtime 不维护会话列表，不读取 Chat 的会话目录。
@@ -26,7 +26,7 @@ python -B -m runtime_reconciler.cli --spec openevent-stack/stack.yaml --runtime-
 `bootstrap.sh --apply` 和 `start.sh` 随后显示各服务的实际进程状态，以及 Chat 和 View 的访问 URL。
 `--dry-run` 和 `--print-config` 仍输出 YAML 计划或配置，不加进度消息。
 Chat URL 优先使用配置的 `chat.origin`，未配置时按监听 host 和 port 生成 HTTP 地址，页面路径为 `/api/chat/`。
-View URL 使用其监听 host 和 port，页面路径为 `/`。通配监听地址 `0.0.0.0` 和 `::` 分别显示为本机地址 `127.0.0.1` 和 `[::1]`，其他 IPv6 地址也加方括号。
+View URL 使用其监听 host 和 port，页面路径为 `/`。通配监听地址 `0.0.0.0` 和 `::` 分别显示为本机地址 `127.0.0.1` 和 `[::1]`，其他 IPv6 地址也加方括号。从其他机器访问时，把显示的本机地址换成服务器的公网 IP 或域名。
 
 本地 stack 脚本固定使用 `openevent-stack/runtime/` 作为运行目录，生成的配置、状态、数据、日志和 PID 文件均放在其下。
 本地 stack 目录路径中的软链接统一解析为真实路径，使启动、状态查询和停止操作识别同一部署。
@@ -56,6 +56,13 @@ spec 中的相对路径以 spec 文件所在目录为基准；所有生成配置
 
 ## 配置
 
+### 整套部署的消息大小上限可设为 16 KiB 至 60 MiB
+
+**`openevent.max_payload_bytes` 必须是 16384 到 62914560 之间的整数（字节），含两端。默认值是 16777216（16 MiB）。**
+Runtime 把同一个值交给 OpenEvent、Chat Server、Agent、Model Proxy 和 Cmd。下限来自 Cmd，上限来自 OpenEvent。
+
+### 配置示例与字段
+
 最小结构如下。示例 token 和模型 key 必须换成部署值：
 
 ```yaml
@@ -77,7 +84,7 @@ cmd:
   max_concurrent_tasks: 4
   default_timeout_ms: 300000
 chat:
-  host: 127.0.0.1
+  host: 0.0.0.0
   port: 8081
   origin: null
   web_token: replace-with-web-token
@@ -107,10 +114,10 @@ web token 与 OpenEvent token 是不同凭据；模型 key 只进入 Model Proxy
 | `runtime.supervisor.ctl` | 接受 `status/start/stop <program>` 的进程控制入口，默认 supervisorctl；首次 apply 后固定 |
 | `runtime.supervisor.programs` | 初次部署可覆盖逻辑名到进程名的映射，见下表；首次 apply 后固定 |
 | `openevent.storage.path` | 默认运行目录下 `data/openevent` |
-| `openevent.max_payload_bytes` | 默认 16777216；生成配置再由模块 parser 校验。相同额度传给 Agent、Model Proxy 和 Cmd；Agent 的编码大小检查见 [Agent 配置](CHAT_MODEL_AGENT_cn.md#agent-配置) |
+| `openevent.max_payload_bytes` | 见上方整套部署的消息大小上限。Agent 如何计算编码大小见 [Agent 配置](CHAT_MODEL_AGENT_cn.md#agent-配置) |
 | `tokens` | 可选映射，键为 user、agent、model_proxy、cmd_worker |
 | `chat.channels_dir` | 默认运行目录下 `chat-sessions`，只由 Chat Server 管理 |
-| `chat.host/port/origin` | host 默认 127.0.0.1，port 默认 8081；origin 可选，默认 null；写入 `chat-server.json` 的同名字段 |
+| `chat.host/port/origin` | Chat Web 默认监听所有 IPv4 接口（`0.0.0.0:8081`），origin 可选，默认 null。写入 `chat-server.json` 的同名字段 |
 | `chat.max_user_message_bytes` | 可选，默认 65536；正整数，不接受 boolean。原值传给 Chat Server 的同名字段，按单条用户正文的 UTF-8 字节数限制新发送，不计算附件文件或回复目标正文；Agent 的完整模型请求预算另行判断 |
 | `model.provider_name` | 默认 default |
 | `model.response_header_ms/idle_ms` | Provider 响应头/空闲超时，各默认 60000 |
@@ -123,7 +130,10 @@ web token 与 OpenEvent token 是不同凭据；模型 key 只进入 Model Proxy
 | `agent.context_compression_prompt_file` | 必填，完整压缩提示词 UTF-8 文件路径，见下节 |
 | `agent.context_max_input_bytes` | 必填，无默认值；上下文字节预算，定义见 [Agent 配置](CHAT_MODEL_AGENT_cn.md#上下文字节预算) |
 | `agent.model_retry_interval_ms` | 可选，原值传给 Agent；默认值与等待规则见 [模型重试间隔](CHAT_MODEL_AGENT_cn.md#模型重试间隔) |
-| `rpc.max_retries/timeout_ms` | 默认 3 / 10000；传给 Agent，其他组件仅使用其公开支持的字段。RPC 重试间隔内部固定为 100 毫秒，与当前 Chat SDK 一致，不提供 RPC 间隔配置项 |
+| `rpc.max_retries` | Agent、Chat Server 和 Model Proxy 调用 OpenEvent 遇到可重试错误时，默认最多重试 3 次。设为 0 表示只调用一次。这套部署中三者的 RPC 重试间隔固定为 100 毫秒。 |
+| `rpc.timeout_ms` | 默认 10000 毫秒。用于 Agent、Chat Server 和 Model Proxy 的单次 OpenEvent RPC，也用于 Runtime 在 `--apply` 期间管理 token 和 Channel 的业务及管理客户端。 |
+
+Cmd Worker 使用 Cmd 自己的 Fetch 重试设置和 SDK 默认的 RPC 超时。View 使用自身配置中的 OpenEvent RPC 超时。
 
 `runtime.startup_timeout_ms` 已从配置设计删除，不再接受；启动流程不等待 Agent 对象引用就绪。
 
@@ -236,19 +246,18 @@ openevent-stack/
 每个身份按显式 token、本地 secrets 的顺序调用 `GetStatus` 验证。
 只有明确的 `UNAUTHENTICATED` 表示该 token 无效；超时、网络错误或权限错误使本次 apply 失败，
 不以此为理由创建新 token。两种来源都不存在或明确无效时才调用 `AddToken`。
-从 `AddTokenResponse.token` 取得新 token 后先持久保存，再验证并交给组件；不调用 `ListTokens`。
+签发成功后，Runtime 立即持久保存 `AddTokenResponse.token` 并交给组件使用。
 本地凭据文件仅在身份与 token 的映射变化时更新；验证通过或再次采用相同凭据不重复保存。
 
 所有会话共用 private 的 Model、Cmd、WAL Channel。成员分别为 Agent 与 Model Proxy、
-Agent 与 Cmd Worker、Agent 自己；协议分别为 `llm.v1`、`cmd.v3`、`agent.wal.v5`。
+Agent 与 Cmd Worker、Agent 自己；协议分别为 `llm.v1`、`cmd.v4`、`agent.wal.v5`。
 WAL 规则以 [WAL 协议](AGENT_WAL_PROTOCOL_cn.md)为准。
-Model/Cmd 的其他校验采用各模块公开契约。显式指定或已经绑定的 Cmd Channel，其 description 可为任意文本。
-Runtime 自动创建的 Model/Cmd/WAL description 在 metadata 中保存稳定 deployment_id。
+显式指定或已绑定的频道按上述协议、可见性和成员校验。Model 和 Cmd 的 description 可为任意文本。
+Runtime 自动创建的三个频道分别命名为 `model`、`cmd` 和 `wal`，并在 description 的 `metadata.deployment_id` 中保存部署标识。
 首次部署只需填写部署配置并运行 `--apply`，由 Runtime 启动 OpenEvent、准备 token 和辅助 Channel，再启动其余组件。
 校验通过后，Runtime 将同一个 Cmd ID 写入 Agent 和 cmd-worker 配置，并按下节顺序先启动 cmd-worker，再启动 Agent。
 
-首次初始化时，Model/Cmd/WAL 先采用显式 ID，否则按稳定元数据查找；多候选即失败，没有候选才创建。
-自动发现 Cmd 只匹配本部署元数据，不认领只有相同名称或成员的普通 Cmd Channel。
+首次初始化时先采用显式 ID。自动查找时另按 `metadata.deployment_id` 匹配本部署，忽略频道名称。找到多个候选时初始化失败，没有候选才创建。
 三条全部校验完成后作为一组保存，不能用部分结果启动 Agent；不保存逐条创建的未决标记或部分 ID 供续跑。
 初始化成功后，三条 ID 为永久绑定。改名、会话增加、暂时不可访问都不能更换它们。
 显式 ID 与原绑定冲突、资源丢失或不兼容时直接失败；新部署使用新状态和新 WAL。
@@ -330,27 +339,12 @@ Cmd 重启后，已接受且没有最终结果的命令按
 [Cmd 的恢复规则](https://github.com/openevent-official/openevent-modules-cmd/blob/main/docs/CONFIGURATION_cn.md#恢复与退出)
 补写 `RECOVERY_FAILED`，不重新执行。调用失败冻结、取消、RPC 重试和模型历史只由 Agent 规则定义。
 
-## 依赖与验证
+## 依赖
 
-使用部署 Python 环境已安装的 `openevent-sdk>=0.13.0`、Chat、`openevent-model-proxy>=0.1.1`、
-`openevent-modules-cmd>=0.3.0,<0.4.0`（Cmd 0.3.x）和 `openevent-view>=0.1.0` 发行包；
-SDK 必须提供 `AddTokenResponse.token` 和 `batch_get_object_metadata`。
-View 是本部署必需组件，本项目的包依赖中已声明。
-Chat SDK 必须支持 `get_turn_content`、`TurnWriter.reset`、按创建位置、链尾和有效内容清单恢复 `TurnWriter`，
+部署 Python 环境使用已安装的 OpenEvent SDK、Chat、Model Proxy、Cmd 和 View，版本范围见[包声明](../pyproject.toml)。
+OpenEvent 服务端与 SDK 使用配套版本，SDK 提供 `AddTokenResponse.token` 和 `batch_get_object_metadata`。
+Chat SDK 必须支持客户端的 `max_payload_bytes`、`get_turn_content` 返回的终态错误、`TurnWriter.reset`、按创建位置、链尾和有效内容清单恢复 `TurnWriter`，
 以及带 `start_seq` 的取消调用和 `serialize_payload`；
 Model SDK 必须支持流式协议，Cmd SDK 必须支持指定发布 UUID 和通过 `object_keys` 传递附件凭据。
 版本号相同不表示能力相同，安装脚本使用本次构建产物替换各本项目包并检查实际公开 API。
 不从 SDK 子模块拼接源码路径。OpenEvent 配置先独立校验，其余配置分别由 Chat、Model、Cmd、Agent、View 的 parser 校验。
-
-```bash
-make test PYTHON=/absolute/path/to/python TEST_ARGS='-p test_reconcile_runtime.py'
-make test PYTHON=/absolute/path/to/python TEST_ARGS='-p test_stack_scripts.py'
-```
-
-测量本地状态查询耗时：
-
-```bash
-make benchmark-stack-status PYTHON=/absolute/path/to/python
-```
-
-该入口分别执行三次 `status chat-server` 和 `status all` 只读查询，报告各自耗时中位数，并将结果保存到 `build/benchmarks/`；不启动或停止服务。

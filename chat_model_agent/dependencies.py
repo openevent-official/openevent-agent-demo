@@ -21,7 +21,7 @@ def require_sdk():
         if Path(sdk.__file__).resolve() != expected:
             raise DependencyError("openevent.sdk must come from the installed distribution")
         for method in ("get_uuid", "get_seq_by_uuid", "get_status", "fetch", "get_channel",
-                       "list_channels", "publish_auto_seq", "get_object_metadata", "batch_get_object_metadata", "read_object"):
+                       "list_channels", "publish_auto_seq", "batch_get_object_metadata", "read_object"):
             if not callable(getattr(sdk.OpenEventClient, method, None)):
                 raise DependencyError("installed openevent-sdk does not provide the required public API")
         return sdk
@@ -37,7 +37,7 @@ def require_dependencies():
         ("openevent-modules-chat", "openevent.chat_sdk",
          ("create_client", "parse_message", "serialize_payload", "TextPart", "TurnRef", "TurnWriter", "ChatProtocolClient")),
         ("openevent-model-proxy", "openevent.model_proxy_sdk",
-         ("InferRequestInput", "InferAppend", "InferEnd", "InferCancelInput", "prepare_payload", "publish_infer_request", "publish_infer_cancel", "parse_message")),
+         ("InferRequestInput", "InferCancelInput", "prepare_payload", "publish_infer_request", "publish_infer_cancel", "parse_message")),
         ("openevent-modules-cmd", "openevent.cmd_sdk",
          ("create_client", "CmdRunRequestInput", "CmdKillRequestInput", "CmdOutputReadRequestInput", "parse_message", "dumps_payload")),
     )
@@ -55,12 +55,14 @@ def require_dependencies():
     if not callable(getattr(chat.TurnWriter, "reset", None)):
         raise DependencyError("installed Chat SDK must support TurnWriter.reset")
     try:
+        inspect.signature(chat.create_client).bind(None, principal=1, token="token", channel_id=1,
+                                                  max_payload_bytes=1)
         inspect.signature(chat.TurnWriter).bind(None, turn_id="turn", start_seq=1, last_seq=1,
                                                content_seqs=(1,))
         inspect.signature(chat.ChatProtocolClient.cancel_turn).bind(None, target_turn=None, start_seq=1)
         inspect.signature(chat.ChatProtocolClient.get_turn_content).bind(None, terminal_seq=1)
     except (AttributeError, TypeError, ValueError):
-        raise DependencyError("installed Chat SDK must support terminal content reads and current writer/cancel state") from None
+        raise DependencyError("installed Chat SDK must support payload limits, terminal content reads and current writer/cancel state") from None
     cmd = modules["openevent.cmd_sdk"]
     for name in ("publish_run_request", "publish_kill_request", "publish_output_read_request"):
         method = getattr(cmd.CmdProtocolClient, name, None)

@@ -29,7 +29,7 @@ Environment overrides:
   OPENEVENT_MODULES_CMD_REF      default: HEAD (remote default branch); accepts a branch, tag or commit
   OPENEVENT_VIEW_URL             default: https://github.com/openevent-official/openevent-view.git
   OPENEVENT_VIEW_REF             default: HEAD (remote default branch); accepts a branch, tag or commit
-  PYTHON_BIN                     default: python3
+  PYTHON_BIN                     Python 3.10–3.12 for source builds (default: python3)
   JOBS                           default: nproc result, or 2
 
 Dependencies are fetched again on every run. This project is built from the
@@ -85,10 +85,10 @@ check_python_version() {
   bootstrap_python "$python" - <<'PY'
 import sys
 
-if sys.version_info < (3, 10):
+if not (3, 10) <= sys.version_info[:2] <= (3, 12):
     raise SystemExit(
-        "Python 3.10+ is required. "
-        "Install Python 3.10 or newer and rerun with PYTHON_BIN=/path/to/python3.10."
+        "Building the Demo and OpenEvent SDK from source requires Python 3.10–3.12. "
+        "Select a supported interpreter with PYTHON_BIN."
     )
 PY
 }
@@ -312,7 +312,7 @@ log "creating Python venv: $VENV_DIR"
 bootstrap_python "$PYTHON_BIN" -m venv "$VENV_DIR" || fail "failed to create venv. Install python3-venv and rerun."
 VENV_PYTHON="$VENV_DIR/bin/python"
 
-run bootstrap_python "$VENV_PYTHON" -m pip install --no-compile pip 'setuptools>=68' wheel build
+run bootstrap_python "$VENV_PYTHON" -m pip install --no-compile 'pip>=22.3' 'setuptools>=68' wheel build
 
 run make -C "$SRC_DIR/openevent" BUILD_DIR=build BUILD_TYPE=Release JOBS="$JOBS" build
 SERVER_BIN="$SRC_DIR/openevent/build/openevent_server"

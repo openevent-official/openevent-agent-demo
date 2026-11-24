@@ -44,7 +44,7 @@ agent:
   model_retry_interval_ms: 1000
   cmd_result_timeout_ms: 330000
 chat:
-  host: 127.0.0.1
+  host: 0.0.0.0
   port: 8081
   max_user_message_bytes: 65536
   web_token: replace-with-web-token

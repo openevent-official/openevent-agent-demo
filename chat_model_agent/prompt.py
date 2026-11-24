@@ -11,7 +11,7 @@ from .errors import FailureCode, ModelOutputError
 
 UINT64_MAX = (1 << 64) - 1
 MAX_TOOL_OBJECT_IDS = 1024
-MODEL_IO_VERSION = 3
+MODEL_IO_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -96,16 +96,19 @@ def user_event(input_id, ts_ms, text, attachments, reply_context=None):
     if reply_context is not None:
         if not isinstance(reply_context, list) or not reply_context:
             raise ValueError("reply_context must be a nonempty array")
+        event["reply_context"] = []
         for ref in reply_context:
-            if not isinstance(ref, dict) or set(ref) != {"role", "status", "text", "attachments"}:
-                raise ValueError("invalid reply_context fields")
-            if (ref["role"] not in {"user", "assistant"}
-                    or ref["status"] != "completed"
-                    or not isinstance(ref["text"], str)):
-                raise ValueError("invalid reply_context")
-            _attachments(ref["attachments"])
-        event["reply_context"] = copy.deepcopy(reply_context)
+            append_reply_reference(event, ref)
     return event
+
+
+def append_reply_reference(event, ref):
+    if not isinstance(ref, dict) or ref.keys() - {"error"} != {"role", "status", "text", "attachments"}:
+        raise ValueError("invalid reply_context fields")
+    if ref["role"] not in {"user", "assistant"} or ref["status"] != "completed" or not isinstance(ref["text"], str):
+        raise ValueError("invalid reply_context")
+    _attachments(ref["attachments"])
+    event["reply_context"].append(copy.deepcopy(ref))
 
 
 def assistant_event(answer_id, ts_ms, assistant):
@@ -312,8 +315,10 @@ class CompletionAccumulator:
             raise ModelOutputError("tool_calls delta must be an array")
         if self._finish_reason is not None and (content or refusal or calls):
             raise ModelOutputError("content after finish_reason")
-        self._content.append(content or "")
-        self._refusal.append(refusal or "")
+        if content:
+            self._content.append(content)
+        if refusal:
+            self._refusal.append(refusal)
         for part in calls:
             if not isinstance(part, dict):
                 raise ModelOutputError("invalid tool delta")

@@ -1,6 +1,6 @@
 # Chat Runtime Reconciler
 
-> Implementation status: prompt-file loading, context byte-budget previews, the Chat text limit, and `agent.wal.v5` deployment configuration are implemented. See the [README](../README.md) for test coverage and external integration limits.
+> Implementation status: prompt-file loading, context byte-budget previews, the Chat text limit, and `agent.wal.v5` deployment configuration are implemented.
 
 Runtime prepares credentials, three shared auxiliary Channels, component configuration and local processes for one Chat Agent deployment.
 Chat Server creates browser sessions and Agent discovers them; Runtime does not maintain a session list or read Chat's session directory.
@@ -27,7 +27,7 @@ Each progress line is flushed immediately, including when output is piped. Succe
 `bootstrap.sh --apply` and `start.sh` then show the actual process status of each service and the Chat and View access URLs.
 `--dry-run` and `--print-config` continue to output a YAML plan or configuration without progress messages.
 The Chat URL uses configured `chat.origin` when present, otherwise an HTTP address built from its listening host and port, with the page path `/api/chat/`.
-The View URL uses its listening host and port with the page path `/`. Wildcard listening addresses `0.0.0.0` and `::` are displayed as local addresses `127.0.0.1` and `[::1]`; other IPv6 addresses are also enclosed in brackets.
+The View URL uses its listening host and port with the page path `/`. Wildcard listening addresses `0.0.0.0` and `::` are displayed as local addresses `127.0.0.1` and `[::1]`. Other IPv6 addresses are also enclosed in brackets. From another machine, replace the displayed loopback address with the server's public IP or hostname.
 
 Local stack scripts always use `openevent-stack/runtime/` as their runtime directory, with generated configuration, state, data, logs and PID files below it.
 Symlinks in the local stack directory path are consistently resolved to real paths, so startup, status checks and shutdown identify the same deployment.
@@ -59,6 +59,13 @@ Exit codes are 1 for unexpected failures, 2 for spec errors and 3 for reconcilia
 
 ## Configuration
 
+### Set the stack message size limit between 16 KiB and 60 MiB
+
+**`openevent.max_payload_bytes` must be an integer from 16384 to 62914560 bytes, inclusive. The default is 16777216 (16 MiB).**
+Runtime passes the same value to OpenEvent, Chat Server, Agent, Model Proxy and Cmd. Cmd sets the lower bound and OpenEvent sets the upper bound.
+
+### Configuration example and fields
+
 Minimal structure, with example tokens and keys replaced by deployment values:
 
 ```yaml
@@ -80,7 +87,7 @@ cmd:
   max_concurrent_tasks: 4
   default_timeout_ms: 300000
 chat:
-  host: 127.0.0.1
+  host: 0.0.0.0
   port: 8081
   origin: null
   web_token: replace-with-web-token
@@ -113,10 +120,10 @@ bytes and cannot be used directly as encoded model-event allowances.
 | `runtime.supervisor.ctl` | Process control accepting `status/start/stop <program>`; supervisorctl; fixed after the first apply |
 | `runtime.supervisor.programs` | Optional initial logical-to-process name overrides, below; fixed after the first apply |
 | `openevent.storage.path` | `data/openevent` under the runtime directory |
-| `openevent.max_payload_bytes` | 16777216; generated configuration is also checked by module parsers. The same cap is passed to Agent, Model Proxy and Cmd; see [Agent configuration](CHAT_MODEL_AGENT.md#agent-configuration) for encoded-size checks |
+| `openevent.max_payload_bytes` | See the stack message size limit above. For how Agent measures encoded size, see [Agent configuration](CHAT_MODEL_AGENT.md#agent-configuration). |
 | `tokens` | Optional mapping keyed by user, agent, model_proxy, cmd_worker |
 | `chat.channels_dir` | `chat-sessions` under the runtime directory; managed exclusively by Chat Server |
-| `chat.host/port/origin` | Defaults to 127.0.0.1 / 8081; optional origin defaults to null; written to the same-named fields in `chat-server.json` |
+| `chat.host/port/origin` | Chat Web listens on all IPv4 interfaces (`0.0.0.0:8081`) by default. The optional origin defaults to null. These values go into the same-named fields in `chat-server.json`. |
 | `chat.max_user_message_bytes` | Optional, 65536 by default; positive integer, excluding booleans. Passed unchanged to the same-named Chat Server field, limiting UTF-8 bytes of individual new user-message text, excluding attachment files and quoted target text; Agent checks its complete model-request budget separately |
 | `model.provider_name` | default |
 | `model.response_header_ms/idle_ms` | Provider response header/idle timeouts; 60000 each |
@@ -129,7 +136,10 @@ bytes and cannot be used directly as encoded model-event allowances.
 | `agent.context_compression_prompt_file` | Required UTF-8 file path for the complete compression prompt; see below |
 | `agent.context_max_input_bytes` | Required, with no default; see [Agent context byte budget](CHAT_MODEL_AGENT.md#context-byte-budget) |
 | `agent.model_retry_interval_ms` | Optional; passed unchanged to Agent. See [Model Retry Interval](CHAT_MODEL_AGENT.md#model-retry-interval) for the default and waiting rules |
-| `rpc.max_retries/timeout_ms` | 3 / 10000; passed to Agent, while other components receive only supported public configuration fields. The RPC retry interval is fixed internally at 100 milliseconds to match the current Chat SDK and is not configurable |
+| `rpc.max_retries` | Agent, Chat Server, and Model Proxy retry eligible OpenEvent RPC failures up to 3 times by default. Set to 0 for a single attempt. All three use a fixed 100 ms RPC retry interval in this stack. |
+| `rpc.timeout_ms` | Defaults to 10000 ms per OpenEvent RPC in Agent, Chat Server, and Model Proxy. Runtime also uses it for the event and admin clients that manage tokens and Channels during `--apply`. |
+
+Cmd Worker uses its own Fetch retry settings and the SDK's default RPC timeout. View uses the OpenEvent RPC timeout in its own configuration.
 
 `runtime.startup_timeout_ms` has been removed from the configuration design and is not accepted; startup does not wait for Agent object references to become ready.
 
@@ -259,19 +269,18 @@ See [environment setup](UBUNTU_ENVIRONMENT.md#preparation-and-installation) for 
 For each identity, Runtime checks explicit tokens and then local secrets using `GetStatus`.
 Only `UNAUTHENTICATED` proves the token invalid. Timeouts, network failures and permission errors fail apply without creating a replacement.
 Runtime calls `AddToken` only when both sources are missing or explicitly invalid.
-It reads `AddTokenResponse.token`, persists the new token, then validates it before passing it to components. It never calls `ListTokens`.
+After successful issuance, Runtime immediately persists `AddTokenResponse.token` and passes it to the components.
 The local secrets file is updated only when an identity-to-token mapping changes; successful validation or reuse of the same credentials does not write it again.
 
 All sessions share private Model, Cmd and WAL Channels. Members are respectively Agent with Model Proxy,
-Agent with Cmd Worker, and Agent alone; their protocols are `llm.v1`, `cmd.v3` and `agent.wal.v5`.
+Agent with Cmd Worker, and Agent alone; their protocols are `llm.v1`, `cmd.v4` and `agent.wal.v5`.
 The [WAL protocol](AGENT_WAL_PROTOCOL.md) defines the WAL rules.
-Other Model/Cmd validation follows their public contracts. An explicit or already bound Cmd Channel can have an arbitrary description.
-Model/Cmd/WAL resources automatically created by Runtime store a stable deployment_id in description metadata.
+Runtime checks the protocol, visibility and members above for explicit or already bound Channels. Model and Cmd descriptions can contain arbitrary text.
+Runtime names the three Channels it creates `model`, `cmd` and `wal` and stores the deployment ID in the description's `metadata.deployment_id` field.
 First deployment only requires the deployment configuration and `--apply`: Runtime starts OpenEvent, prepares tokens and auxiliary Channels, then starts the remaining components.
 After validation, Runtime writes the same Cmd ID into Agent and cmd-worker configuration, then starts cmd-worker before Agent as described below.
 
-Model/Cmd/WAL initialization uses explicit IDs first, otherwise stable metadata discovery. Multiple candidates fail; creation requires no candidates.
-Automatic Cmd discovery only matches this deployment's metadata, not ordinary Cmd Channels with the same name or members.
+Initialization uses an explicit ID when provided. Automatic discovery also matches the deployment's `metadata.deployment_id` and ignores Channel names. Multiple matches fail initialization. Runtime creates a Channel when there are no matches.
 All three IDs are saved as one group after validation; partial results cannot start Agent. Per-Channel pending markers
 and partial IDs are not persisted for resuming initialization. After successful initialization, the three IDs are permanently
 bound. Renames, additional sessions and temporary access failures cannot replace them.
@@ -365,26 +374,12 @@ After Cmd restarts, accepted commands without a final result receive
 `RECOVERY_FAILED` and are not rerun, following [Cmd recovery rules](https://github.com/openevent-official/openevent-modules-cmd/blob/main/docs/CONFIGURATION.md#recovery-and-exit).
 Agent alone defines failure freezing, cancellation, RPC retries and model history.
 
-## Dependencies and validation
+## Dependencies
 
-Deployment uses installed `openevent-sdk>=0.13.0` with `AddTokenResponse.token` and `batch_get_object_metadata`, plus Chat, `openevent-model-proxy>=0.1.1`,
-`openevent-modules-cmd>=0.3.0,<0.4.0` (Cmd 0.3.x) and `openevent-view>=0.1.0` distributions.
-View is a required dependency of this deployment and is declared by this package.
-Chat SDK must support `get_turn_content`, `TurnWriter.reset`, restoring a writer from its start position, chain tail and effective content list,
+The deployment Python environment uses installed OpenEvent SDK, Chat, Model Proxy, Cmd and View packages. See the [package requirements](../pyproject.toml) for supported versions.
+Use matching OpenEvent server and SDK versions. The SDK supplies `AddTokenResponse.token` and `batch_get_object_metadata`.
+Chat SDK must support the client’s `max_payload_bytes`, terminal errors from `get_turn_content`, `TurnWriter.reset`, restoring a writer from its start position, chain tail and effective content list,
 as well as cancellation with `start_seq` and `serialize_payload`;
 Model SDK must support streaming; Cmd SDK must support explicit publication UUIDs and attachment credentials through `object_keys`.
 Equal version numbers do not prove equal capabilities: installation replaces each project package using its current successful build and checks actual public APIs.
 SDK checkout paths are not added to imports. OpenEvent configuration is validated independently first; Chat, Model, Cmd, Agent and View parsers validate their generated configuration.
-
-```bash
-make test PYTHON=/absolute/path/to/python TEST_ARGS='-p test_reconcile_runtime.py'
-make test PYTHON=/absolute/path/to/python TEST_ARGS='-p test_stack_scripts.py'
-```
-
-To measure local status-query time:
-
-```bash
-make benchmark-stack-status PYTHON=/absolute/path/to/python
-```
-
-This target runs three read-only queries each for `status chat-server` and `status all`, reports their median times, and saves results under `build/benchmarks/`. It does not start or stop services.

@@ -39,18 +39,14 @@ class Rpc:
                     raise InfrastructureError(f"{name} failed ({status or type(error).__name__})") from error
                 self._pause()
 
-    def publish(self, uuid, operation):
-        """After an uncertain publish, spend the remaining budget on reconciliation."""
+    def publish_cmd(self, uuid, operation):
+        """After an uncertain Cmd publication, only look up its UUID."""
         uncertain = False
         for attempt in range(self.config.max_retries + 1):
             try:
                 if uncertain:
-                    seq = int(self.client.get_seq_by_uuid(uuid))
-                    if seq:
-                        return seq
-                else:
-                    value = operation()
-                    return int(getattr(value, "seq", value))
+                    return self.client.get_seq_by_uuid(uuid)
+                return operation()
             except Exception as error:
                 status = status_name(error)
                 if status not in RETRYABLE | {"ALREADY_EXISTS"} and not (uncertain and status == "NOT_FOUND"):
@@ -59,6 +55,23 @@ class Rpc:
             if attempt < self.config.max_retries:
                 self._pause()
         raise InfrastructureError(f"Publish result remains unknown for UUID {uuid}")
+
+    def publish_wal(self, uuid, operation):
+        """Retry the same WAL record and look up its sequence once committed."""
+        committed = False
+
+        def publish_or_lookup():
+            nonlocal committed
+            if not committed:
+                try:
+                    return operation().seq
+                except Exception as error:
+                    if status_name(error) != "ALREADY_EXISTS":
+                        raise
+                    committed = True
+            return self.client.get_seq_by_uuid(uuid)
+
+        return self.call("Publish WAL", publish_or_lookup)
 
     @staticmethod
     def sdk(name, operation):

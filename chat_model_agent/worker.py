@@ -17,6 +17,7 @@ from openevent.cmd_sdk import parse_message as parse_cmd
 from openevent.model_proxy_sdk import parse_message as parse_model
 from openevent.sdk.proto import openevent_pb2
 
+from .budget import ContextBudget
 from .objects import ObjectIndex
 from .rpc import InfrastructureError, Rpc
 from .scheduling import AsyncCondition, RpcPool
@@ -57,10 +58,9 @@ class ChatModelAgent:
         self.scanned_through = -1
         self.recovery_high = None
         self.recovery_pending = set()
-        self.recovery_indexes = {}
+        self.recovery_cmds = {}
         self.chat_candidates = {}
         self.chats = {}
-        self.sessions = {}
         self.started_sessions = set()
         self.tasks = set()
         self.reader_thread = None
@@ -104,7 +104,7 @@ class ChatModelAgent:
         cfg = self.config
         for cid, protocol, members in (
             (cfg.channels.model, "llm.v1", {cfg.agent.principal, cfg.model_proxy.principal}),
-            (cfg.channels.cmd, "cmd.v3", {cfg.agent.principal, cfg.cmd_worker.principal}),
+            (cfg.channels.cmd, "cmd.v4", {cfg.agent.principal, cfg.cmd_worker.principal}),
             (cfg.channels.wal, PROTOCOL, {cfg.agent.principal}),
         ):
             channel = self._channel(cid)
@@ -184,6 +184,7 @@ class ChatModelAgent:
                 if owner is not None:
                     self.cmd_owners[seq] = owner
             parsed = parsed_header(message, parsed, "cmd")
+            self._index_recovery_cmd(int(message.uuid), parsed)
         elif cid in self.chats:
             parsed = parse_chat(message)
             self.chats[cid].apply(parsed)
@@ -204,8 +205,6 @@ class ChatModelAgent:
         self.messages[seq] = EventHeader.from_message(message)
         self.parsed[seq] = parsed
         self.channels.setdefault(cid, []).append(seq)
-        if cid in self.recovery_indexes:
-            self._index_recovery_event(self.recovery_indexes[cid], cid, parsed)
 
     def _advance_cursor(self, next_seq):
         """Called under condition, after all sources before next_seq are applied."""
@@ -290,35 +289,24 @@ class ChatModelAgent:
             start = 0 if after is None else bisect_right(seqs, after)
             return [self.parsed[seq] for seq in seqs[start:]]
 
-    def _index_recovery_event(self, index, channel_id, event):
-        if event.principal != self.config.agent.principal:
-            return
-        if channel_id == self.config.channels.cmd:
-            identity = event.payload.kind, int(self.messages[event.seq].uuid)
-        else:
-            payload = event.payload.to_dict()
-            identity = (payload["kind"], payload["stream_id"],
-                        None if payload["kind"] == "infer.request" else payload.get("request_seq"))
-        index.setdefault(identity, []).append(event)
+    def _index_recovery_cmd(self, uuid, event):
+        candidates = self.recovery_cmds.get(uuid)
+        if candidates is not None:
+            candidates.append(event)
 
-    def _build_recovery_index(self, channel_id):
-        index = {}
-        for event in self.events_in(channel_id):
-            self._index_recovery_event(index, channel_id, event)
-        return index
-
-    def recovery_index(self, channel_id):
+    def cmd_headers(self, uuid, after):
         with self.condition:
-            index = self.recovery_indexes.get(channel_id)
-        # A new live conversation normally has no historical effects. If it
-        # does need a lookup, use current facts, never an expired startup cache.
-        return index if index is not None else self._build_recovery_index(channel_id)
+            candidates = self.recovery_cmds.get(uuid)
+            if candidates is not None:
+                return [event for event in candidates if event.seq > after]
+        return [event for event in self.events_in(self.config.channels.cmd, after=after)
+                if self.messages[event.seq].uuid == uuid]
 
     def finish_recovery(self, channel_id):
         with self.condition:
             self.recovery_pending.discard(channel_id)
             if not self.recovery_pending:
-                self.recovery_indexes.clear()
+                self.recovery_cmds.clear()
 
     def model_headers(self, stream_id, after_seq=0, through_seq=None):
         """Read only stream identities/status; safe in cooperative predicates."""
@@ -403,8 +391,8 @@ class ChatModelAgent:
 
     def recover(self):
         self.check_running()
-        from .budget import ContextBudget
-        ContextBudget.from_config(self.config.agent)
+        self.configured_budget = ContextBudget.from_config(self.config.agent)
+        self.budget = ContextBudget.for_runtime(self.config, self.configured_budget)
         self.validate_channels()
         cfg = self.config
         high = int(self.rpc.call("GetStatus", lambda: self.events.get_status(
@@ -415,12 +403,22 @@ class ChatModelAgent:
             self._fetch_page(through=high)
         self._validate_deployment()
         self.check_running()
-        self.recovery_pending = set(self.chats)
-        # The recovery worker builds these once before the reader starts;
-        # indexing the full shared histories must not hold up live ingestion.
-        self.recovery_indexes = ({cid: self._build_recovery_index(cid)
-                                  for cid in (cfg.channels.model, cfg.channels.cmd)}
-                                 if self.recovery_pending else {})
+        first_cmd_intent = None
+        for chat in self.chats:
+            # Each commit completes one prepare. Fully confirmed chats need no candidate index.
+            if (self.journal.count(channel=chat, kind="effect.prepare")
+                    == self.journal.count(channel=chat, kind="effect.commit")):
+                continue
+            for prepared in self.journal.select(channel=chat, kind="effect.prepare"):
+                if (prepared.data["module"] == "cmd"
+                        and self.journal.get(prepared.key.removesuffix(":prepare") + ":commit") is None):
+                    self.recovery_cmds[prepared.data["uuid"]] = []
+                    self.recovery_pending.add(chat)
+                    if first_cmd_intent is None or prepared.seq < first_cmd_intent:
+                        first_cmd_intent = prepared.seq
+        if first_cmd_intent is not None:
+            for event in self.events_in(cfg.channels.cmd, after=first_cmd_intent):
+                self._index_recovery_cmd(self.messages[event.seq].uuid, event)
         return high
 
     def _deployment(self):
@@ -455,20 +453,6 @@ class ChatModelAgent:
             return
         LOG.info("Agent stopped after confirming in-flight operations; business tasks may still run")
 
-    async def _start_session(self, cid):
-        with self.condition:
-            self.check_running()
-            if cid in self.started_sessions:
-                return
-        from .session import Conversation
-        session = self.sessions.get(cid) or await self.blocking(Conversation, self, cid)
-        with self.condition:
-            self.check_running()
-            self.sessions[cid] = session
-            self.started_sessions.add(cid)
-            task = asyncio.create_task(session.run(), name=f"chat-{cid}")
-            self.tasks.add(task)
-
     def _start_reader(self):
         with self.condition:
             self.check_running()
@@ -488,24 +472,10 @@ class ChatModelAgent:
                 self.fail(error)
 
     async def _coordinate(self):
+        from .session import Conversation
         try:
             self.check_running()
             await self.blocking(self.recover)
-            from .session import Conversation
-            # All recovered conversations exist in memory before any new WAL
-            # or business publication. Reconciliation runs with the reader live.
-            with self.condition:
-                self.check_running()
-                recovered_channels = tuple(self.chats)
-            sessions = {}
-            for cid in recovered_channels:
-                self.check_running()
-                # Chat client construction validates its Channel over RPC.
-                # Leave the shared lock available for stop requests.
-                sessions[cid] = await self.blocking(Conversation, self, cid)
-            with self.condition:
-                self.check_running()
-                self.sessions = sessions
             self._start_reader()
             self.check_running()
             cfg = self.config
@@ -517,7 +487,10 @@ class ChatModelAgent:
                     self.check_running()
                     pending = tuple(self.chats.keys() - self.started_sessions)
                 for cid in pending:
-                    await self._start_session(cid)
+                    self.check_running()
+                    session = Conversation(self, cid)
+                    self.tasks.add(asyncio.create_task(session.run(), name=f"chat-{cid}"))
+                    self.started_sessions.add(cid)
         except Stopped:
             pass
         except Exception as error:

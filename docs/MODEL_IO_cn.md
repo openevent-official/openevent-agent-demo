@@ -1,10 +1,10 @@
-# Chat Agent 模型输入输出格式 v3
+# Chat Agent 模型输入输出格式 v4
 
 [English version](MODEL_IO.md)
 
-> 实现状态：模型 I/O v3 的事件输入、输出解析、异步工具和上下文压缩已实现；测试范围与外部联调限制见 [README](../README_cn.md)。
-> 模型 I/O 版本：`3`。
-> 日期：2026-10-27
+> 实现状态：模型 I/O v4 的事件输入、输出解析、异步工具和上下文压缩已实现。
+> 模型 I/O 版本：`4`。
+> 日期：2026-11-23
 > 范围：模型可见事件、历史摘要及任务信息、三项工具和流式响应解释。
 
 ## 1. 文档边界
@@ -14,7 +14,7 @@
 WAL 字段、稳定键、事件来源、排序游标和压缩检查点见 [WAL 协议](AGENT_WAL_PROTOCOL_cn.md)；
 部署、对象读取环境、工作目录及提示词文件入口见 [Runtime](RUNTIME_RECONCILER_cn.md)。
 本文不定义另一套调度、持久化或恢复流程。
-`llm.v1`、`chat.v1`、`cmd.v3` 的原始协议由各模块维护，本文只定义 Agent 如何解释和提供其中的事实。
+`llm.v1`、`chat.v1`、`cmd.v4` 的原始协议由各模块维护，本文只定义 Agent 如何解释和提供其中的事实。
 
 模型只获得文本、附件元信息、可关联的任务与回答标识和工具结果。Channel、principal、token、完整 ObjectKey、
 WAL 键、重试与恢复状态、OpenEvent 消息 UUID、模型请求 ID 不进入输入。
@@ -107,17 +107,15 @@ Provider 原生 tool call ID 仍用于输出解析和源记录核对；输入回
 附件不作为视觉、音频等原生多模态输入发送；模型按第 3.3 节读取。
 媒体类型缺失时使用 `application/octet-stream`，不从文件名猜测；对象读取环境见 Runtime 文档。模型输入不包含对象下载凭据、完整 ObjectKey、缓存路径或外部存储地址。
 
-用户消息带回复引用时，`reply_context` 提供目标最终可见内容，不暴露引用 seq：
+用户消息带回复引用时，`reply_context` 提供目标的最终内容和显示错误。下面是一条正常回复和一条因过长而无法显示的回复。
 
 ```json
-{"reply_context":[{"role":"assistant","status":"completed","text":"日志检查完成。","attachments":[]}]}
+{"reply_context":[{"role":"assistant","status":"completed","text":"日志检查完成。","attachments":[]},{"role":"assistant","status":"completed","text":"","attachments":[],"error":"turn_too_long"}]}
 ```
 
 - 无回复时省略；非空时按用户消息的回复列表顺序排列，不递归展开目标的回复。
-- 每项恰好包含 `role`、`status`、`text`、`attachments`。`role` 由 Agent 映射为 `user` 或 `assistant`，
-  `status` 固定为 `completed`。回复目标按 Chat 协议的有效正常结束位置读取，取消目标不能被回复。
-- `text`、`attachments` 使用本节相同规则；目标在用户消息创建前已经正常结束，内容和终态不再变化；
-  Chat 错误结束的最终正文和附件为空。
+- 每项包含 `role`、`status`、`text`、`attachments`。`role` 由 Agent 映射为 `user` 或 `assistant`，`status` 固定为 `completed`。Agent 按 Chat 终态序号读取目标，该序号只在内部使用。已取消的消息不能被回复。
+- 正常结束的引用使用目标的最终正文和附件，省略 `error`。Chat 因内容清单过长而以错误结束时，引用包含 `"error":"turn_too_long"`、空正文和空附件。该字段随引用一起计入用户事件大小。
 - 引用附件也准备元信息与内部映射；引用内容是该用户消息的上下文，不另算新输入。
 
 ### 3.3 通过 Cmd 读取附件对象
@@ -243,66 +241,11 @@ Agent 自己因失败发布的 cancel 不生成用户取消事件；模型看过
 发给模型的 schema 省略 `maximum`；Agent 接受工具调用前仍按下文的 uint64 范围校验。
 每个函数参数 object 都拒绝未知字段；JSON integer 不包括 boolean。
 
-```json
-[
-  {
-    "type": "function",
-    "function": {
-      "name": "exec",
-      "description": "通过 Cmd 执行非交互式 shell 命令，实际结果随后作为 tool_result 事件提供。默认使用当前会话工作目录。不要用来发送 Chat 消息，也不要请求 stdin、交互程序或后台常驻任务。",
-      "parameters": {
-        "type": "object", "additionalProperties": false,
-        "properties": {
-          "command": {"type": "string", "minLength": 1, "description": "完整命令行，不含解释文字。"},
-          "workdir": {"type": "string", "minLength": 1, "description": "可选的绝对工作目录。省略时使用会话工作目录。"},
-          "timeout_ms": {"type": "integer", "minimum": 1, "description": "可选命令超时，单位毫秒。"},
-          "object_ids": {
-            "type": "array", "default": [],
-            "items": {"type": "integer", "minimum": 1},
-            "description": "只列出本次命令必须访问、且在当前输入中出现的附件 ID。最多 1024 个不同 ID；重复 ID 按首次出现顺序去重。省略或空数组表示不携带附件。"
-          }
-        },
-        "required": ["command"]
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
-      "name": "read_stdout",
-      "description": "读取已有 exec_result 对应的 stdout 字节范围，实际结果随后作为 tool_result 事件提供。exec_id 必须取自该结果；继续读取请显式推进 offset，相同参数重复调用仍读取相同范围。",
-      "parameters": {
-        "type": "object", "additionalProperties": false,
-        "properties": {
-          "exec_id": {"type": "integer", "minimum": 1},
-          "offset": {"type": "integer", "minimum": 0, "default": 0, "description": "起始字节位置，省略时从头读取。"},
-          "nbytes": {"type": "integer", "minimum": 1, "description": "必填的原始字节数；成功时精确读取本值与输出额度中较小的字节数，所读范围必须存在。"}
-        },
-        "required": ["exec_id", "nbytes"]
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
-      "name": "read_stderr",
-      "description": "读取已有 exec_result 对应的 stderr 字节范围，实际结果随后作为 tool_result 事件提供。exec_id 必须取自该结果；继续读取请显式推进 offset，相同参数重复调用仍读取相同范围。",
-      "parameters": {
-        "type": "object", "additionalProperties": false,
-        "properties": {
-          "exec_id": {"type": "integer", "minimum": 1},
-          "offset": {"type": "integer", "minimum": 0, "default": 0, "description": "起始字节位置，省略时从头读取。"},
-          "nbytes": {"type": "integer", "minimum": 1, "description": "必填的原始字节数；成功时精确读取本值与输出额度中较小的字节数，所读范围必须存在。"}
-        },
-        "required": ["exec_id", "nbytes"]
-      }
-    }
-  }
-]
-```
+三项工具发给模型时的完整 JSON 见[第一次输入示例的 `tools` 字段](examples/context-input-1.json)。
+`exec` 用 `command` 执行非交互命令；`read_stdout` 和 `read_stderr` 用 `exec_id`、`offset` 和 `nbytes` 读取该命令的输出。
 
 `exec` 省略 `workdir` 时，Agent 向 Cmd 显式传入当前会话 workdir，不依赖 Cmd worker 的默认目录。
-工具名与参数严格按上述 schema 校验；`workdir` 还必须满足绝对路径语义。
+工具名与参数按示例中的 schema 校验；`workdir` 还必须满足绝对路径语义。
 `timeout_ms` 和 `exec_id` 都限制在 Cmd 所接受的正 uint64 范围，不接受超界整数后再尝试发布。
 `exec.object_ids` 省略或为空数组时不携带附件；非空时按首次出现顺序去重，最多保留 1024 个不同的正 uint64 ID。
 每个 ID 必须有本次冻结输入范围内的原始附件来源：未压缩用户事件及其回复引用，或已采用摘要所覆盖的原用户事件及其回复引用。
@@ -378,7 +321,7 @@ Agent 自己等待工具结果超时后，按已确认的超时裁决生成 `sta
 - stdout/stderr 独立处理；不得给模型暴露 Cmd 输出文件的内部路径。
 
 `read_stdout`/`read_stderr` 从指定 `offset` 开始，成功时精确返回 `min(nbytes, max_tool_output_bytes)` 个原始字节。
-Agent 按配置的分块大小构造 Cmd 精确范围读取请求，后续位置按成功返回的字节数推进，直到读满本次允许的范围；
+Agent 按配置的分块大小构造 Cmd 精确范围读取请求，每页成功后按该页回显的 `nbytes` 推进，直到读满本次允许的范围。
 任何一页失败都使整次工具读取失败，不把此前已读的前缀当成成功结果。Agent 不按历史输出计数裁剪读取范围，
 也不在本地推断 EOF；空文件、起点到达或超过 EOF，以及有效范围越过 EOF，都按 Cmd 的实际结果返回工具错误。
 

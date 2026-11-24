@@ -19,6 +19,7 @@ INPUT_REJECTION = "Message is too long to process."
 _ANSWER_FAILURE_REASONS = {
     FailureCode.TIMEOUT: "Normal inference timed out waiting for the model response",
     FailureCode.CONTEXT_LIMIT: "Normal inference exceeded the model context limit",
+    FailureCode.PROVIDER_NOT_CONFIGURED: "Normal inference requested an unconfigured model provider",
     FailureCode.INVALID_TOOL_ARGUMENTS: "Normal inference returned invalid tool arguments",
     FailureCode.INVALID_OUTPUT: "Normal inference returned invalid model output",
     FailureCode.EVENT_TOO_LARGE: "Normal inference returned a complete event that exceeds the size limit",
@@ -30,6 +31,7 @@ _ANSWER_FAILURE_REASONS = {
 _COMPACTION_FAILURE_REASONS = {
     FailureCode.TIMEOUT: "History compression timed out waiting for the model response",
     FailureCode.CONTEXT_LIMIT: "History compression exceeded the model context limit",
+    FailureCode.PROVIDER_NOT_CONFIGURED: "History compression requested an unconfigured model provider",
     FailureCode.EVENT_TOO_LARGE: "History compression produced a summary that exceeds the size limit",
     FailureCode.INVALID_TOOL_ARGUMENTS: "History compression returned an invalid summary",
     FailureCode.INVALID_OUTPUT: "History compression returned an invalid summary",
@@ -100,12 +102,11 @@ class ContextBudget:
                                  context_max_input_bytes=agent.context_max_input_bytes)
 
     @classmethod
-    def for_runtime(cls, config):
+    def for_runtime(cls, config, configured):
         from openevent.model_proxy_sdk import InferRequestInput, prepare_payload
         from .display_limits import publication_payload_limit
 
         agent = config.agent
-        configured = cls.from_config(agent)
         empty = prepare_payload(InferRequestInput(stream_id="f" * 36, method="POST", path="/v1/chat/completions",
                                                   body={}, provider=agent.model_provider))
         # Replace the generated timestamp's width with the reserved uint64 width.

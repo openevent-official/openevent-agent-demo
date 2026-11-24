@@ -1,5 +1,4 @@
 from __future__ import annotations
-import time
 from .common import _json_obj, _stable_json
 from .model import ApplyError, ChannelIds, PROTOCOL_MODEL, PROTOCOL_CMD, PROTOCOL_WAL
 from .state import load_state, save_state
@@ -9,26 +8,19 @@ PROTOCOLS = {"model": PROTOCOL_MODEL, "cmd": PROTOCOL_CMD, "wal": PROTOCOL_WAL}
 def _description(spec, kind):
     description = {"metadata": {"deployment_id": spec.deployment_id}}
     if kind == "wal":
-        description.update(version="v5", updated_at_ms=int(time.time() * 1000))
+        description["version"] = "v5"
     return description
 
 def _belongs_to_deployment(channel, spec):
-    description = _json_obj(getattr(channel, "description", "")) or {}
+    description = _json_obj(channel.description) or {}
     metadata = description.get("metadata")
     return isinstance(metadata, dict) and metadata.get("deployment_id") == spec.deployment_id
 
-def _valid(channel, spec, kind):
-    members = {spec.principals["agent"]}
-    if kind != "wal":
-        members.add(spec.principals["model_proxy" if kind == "model" else "cmd_worker"])
-    desc = None if kind == "cmd" else _json_obj(getattr(channel, "description", ""))
+def _valid(channel, protocol, members):
     return (
-        str(getattr(channel, "protocol", "")) == PROTOCOLS[kind]
-        and int(getattr(channel, "visibility", -1)) == 2
+        channel.protocol == protocol
+        and channel.visibility == 2
         and set(channel.members) == members
-        and (kind == "cmd" or isinstance(desc, dict))
-        and (kind != "wal" or desc.get("version") == "v5")
-        and (kind != "model" or (set(desc) == {"metadata"} and isinstance(desc["metadata"], dict)))
     )
 
 def _resolve_channels(spec, runtime, tokens, previous):
@@ -39,7 +31,10 @@ def _resolve_channels(spec, runtime, tokens, previous):
     visible = None
     result = {}
     principal, token = spec.principals["agent"], tokens["agent"]
-    for kind in PROTOCOLS:
+    for kind, protocol in PROTOCOLS.items():
+        members = {principal}
+        if kind != "wal":
+            members.add(spec.principals["model_proxy" if kind == "model" else "cmd_worker"])
         explicit = spec.channels.get(kind)
         remembered = bound.get(kind) if bound else None
         if remembered and explicit and remembered != explicit:
@@ -47,14 +42,14 @@ def _resolve_channels(spec, runtime, tokens, previous):
         channel_id = remembered or explicit
         if channel_id:
             channel = runtime.get_channel(principal, token, channel_id)
-            if channel is None or not _valid(channel, spec, kind):
+            if channel is None or not _valid(channel, protocol, members):
                 raise ApplyError(f"bound/explicit {kind} Channel is missing or incompatible")
         else:
             if visible is None:
                 visible = runtime.list_channels(principal, token)
             candidates = [
                 c for c in visible
-                if _valid(c, spec, kind)
+                if _valid(c, protocol, members)
                 and _belongs_to_deployment(c, spec)
             ]
             if len(candidates) > 1:
@@ -62,20 +57,11 @@ def _resolve_channels(spec, runtime, tokens, previous):
             if candidates:
                 channel = candidates[0]
             else:
-                members = [principal]
-                if kind != "wal":
-                    members.append(spec.principals["model_proxy" if kind == "model" else "cmd_worker"])
                 channel = runtime.create_channel(
-                    principal, token, name=f"{spec.deployment_id}.{kind}", visibility=2,
-                    protocol=PROTOCOLS[kind], description=_stable_json(_description(spec, kind)), members=members,
+                    principal, token, name=kind, visibility=2,
+                    protocol=protocol, description=_stable_json(_description(spec, kind)), members=members,
                 )
-                visible.append(channel)
-            channel_id = int(channel.channel_id)
-            if not _valid(channel, spec, kind):
-                raise ApplyError(f"created {kind} Channel violates its contract")
-        result[kind] = int(channel_id)
-    if len(set(result.values())) != 3:
-        raise ApplyError("auxiliary Channel IDs must be distinct")
+        result[kind] = channel.channel_id
     state["channels"] = result
     save_state(spec, state)
     return ChannelIds(**result)

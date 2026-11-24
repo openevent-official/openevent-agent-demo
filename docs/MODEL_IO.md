@@ -1,10 +1,10 @@
-# Chat Agent Model Input and Output Format v3
+# Chat Agent Model Input and Output Format v4
 
 [中文版](MODEL_IO_cn.md)
 
-> Implementation status: model I/O v3 event input, output parsing, asynchronous tools, and context compression are implemented. See the [README](../README.md) for test coverage and external integration limits.
-> Model I/O version: `3`.
-> Date: 2026-10-27
+> Implementation status: model I/O v4 event input, output parsing, asynchronous tools, and context compression are implemented.
+> Model I/O version: `4`.
+> Date: 2026-11-23
 > Scope: Model-visible events, history summaries and task information, the three tools, and response interpretation.
 
 ## 1. Document boundary
@@ -15,7 +15,7 @@ failure handling, and limits are described in [Chat Agent](CHAT_MODEL_AGENT.md).
 object access, and working directories are described in [Runtime](RUNTIME_RECONCILER.md).
 The [WAL protocol](AGENT_WAL_PROTOCOL.md) defines durable fields, stable keys, event sources, ordering cursors,
 and compaction checkpoints. This document does not define another scheduler or recovery algorithm.
-The underlying `llm.v1`, `chat.v1`, and `cmd.v3` protocols remain owned by their modules;
+The underlying `llm.v1`, `chat.v1`, and `cmd.v4` protocols remain owned by their modules;
 this contract defines how Agent interprets their facts and presents them to the model.
 
 The model receives only text, attachment metadata, identifiers that associate tasks and answers, and tool results.
@@ -140,19 +140,16 @@ The media-type fallback is `application/octet-stream`, not a value guessed from 
 object-reading environment settings are defined by Runtime.
 Input contains no object-download credentials, complete ObjectKeys, cache paths, or external storage addresses.
 
-When a user message has reply references, `reply_context` supplies each target's final visible content without exposing its reference seq:
+When a user message has reply references, `reply_context` supplies each target's final content and any display error. This example includes a normal reply and a reply that was too long to display.
 
 ```json
-{"reply_context":[{"role":"assistant","status":"completed","text":"日志检查完成。","attachments":[]}]}
+{"reply_context":[{"role":"assistant","status":"completed","text":"日志检查完成。","attachments":[]},{"role":"assistant","status":"completed","text":"","attachments":[],"error":"turn_too_long"}]}
 ```
 
 - Omit the field when there are no references. Otherwise preserve reply-list order and do not recursively expand
   the targets' own replies.
-- Every entry contains exactly `role`, `status`, `text`, and `attachments`. `role` is the Agent's mapped `user`
-  or `assistant`; `status` is always `completed`. Read reply targets at the effective normal terminal positions
-  defined by Chat; cancelled targets cannot be replied to.
-- `text` and `attachments` follow this section's rules. The target completed before the user message was created;
-  its content and terminal state no longer change. A Chat error end has empty final text and attachments.
+- Each entry contains `role`, `status`, `text`, and `attachments`. The Agent maps `role` to `user` or `assistant`. The status is always `completed`. The Agent uses the target's Chat terminal seq internally to read it. Cancelled turns cannot be reply targets.
+- A normal reply reference carries the target's final text and attachments and omits `error`. When Chat ends a turn because the content list is too long, the reference includes `"error":"turn_too_long"` with empty text and attachments. The user event's size includes this field.
 - Referenced attachments also require metadata and an internal mapping. Referenced content is context for this
   user message, not an additional new input.
 
@@ -319,67 +316,12 @@ The output-reading tools use explicit byte ranges rather than an implicit paging
 Schemas sent to the model omit `maximum`; Agent still validates the uint64 ranges below before accepting tool calls.
 Every function-argument object rejects unknown fields. JSON integer excludes boolean.
 
-```json
-[
-  {
-    "type": "function",
-    "function": {
-      "name": "exec",
-      "description": "Execute a non-interactive shell command through Cmd; its actual result is provided later as a tool_result event. The session working directory is the default. Do not use it to send Chat messages or request stdin, interactive programs, or persistent background tasks.",
-      "parameters": {
-        "type": "object", "additionalProperties": false,
-        "properties": {
-          "command": {"type": "string", "minLength": 1, "description": "Complete command line without explanatory text."},
-          "workdir": {"type": "string", "minLength": 1, "description": "Optional absolute working directory. Omission uses the session working directory."},
-          "timeout_ms": {"type": "integer", "minimum": 1, "description": "Optional command timeout in milliseconds."},
-          "object_ids": {
-            "type": "array", "default": [],
-            "items": {"type": "integer", "minimum": 1},
-            "description": "Only attachment IDs present in the current input and required by this command. At most 1024 distinct IDs; duplicates are removed in first-occurrence order. Omission or an empty array carries no attachment credentials."
-          }
-        },
-        "required": ["command"]
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
-      "name": "read_stdout",
-      "description": "Read a stdout byte range associated with an existing exec_result; the actual result is provided later as a tool_result event. exec_id must come from that result. Advance offset explicitly to continue; repeating the same arguments reads the same range.",
-      "parameters": {
-        "type": "object", "additionalProperties": false,
-        "properties": {
-          "exec_id": {"type": "integer", "minimum": 1},
-          "offset": {"type": "integer", "minimum": 0, "default": 0, "description": "Starting byte position; omission reads from the beginning."},
-          "nbytes": {"type": "integer", "minimum": 1, "description": "Required raw byte count. Success reads exactly the smaller of this value and the output allowance; the effective range must exist."}
-        },
-        "required": ["exec_id", "nbytes"]
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
-      "name": "read_stderr",
-      "description": "Read a stderr byte range associated with an existing exec_result; the actual result is provided later as a tool_result event. exec_id must come from that result. Advance offset explicitly to continue; repeating the same arguments reads the same range.",
-      "parameters": {
-        "type": "object", "additionalProperties": false,
-        "properties": {
-          "exec_id": {"type": "integer", "minimum": 1},
-          "offset": {"type": "integer", "minimum": 0, "default": 0, "description": "Starting byte position; omission reads from the beginning."},
-          "nbytes": {"type": "integer", "minimum": 1, "description": "Required raw byte count. Success reads exactly the smaller of this value and the output allowance; the effective range must exist."}
-        },
-        "required": ["exec_id", "nbytes"]
-      }
-    }
-  }
-]
-```
+The `tools` field in the [first input example](examples/context-input-1.json) contains the exact JSON sent to the model.
+`exec` runs the non-interactive `command`. `read_stdout` and `read_stderr` read its output using `exec_id`, `offset`, and `nbytes`.
 
 When `exec.workdir` is omitted, Agent explicitly passes the current session workdir to Cmd rather than relying
-on the worker's default directory. Names and arguments are validated against the schemas above;
-`workdir` must additionally be an absolute path.
+on the worker's default directory. Names and arguments are validated against the schemas in the example.
+`workdir` must be an absolute path.
 `timeout_ms` and `exec_id` are limited to Cmd's positive uint64 range; out-of-range integers are rejected before publication.
 Omitted or empty `exec.object_ids` carries no attachments. Otherwise IDs are deduplicated in first-occurrence
 order, retaining at most 1024 distinct positive uint64 values.
@@ -471,7 +413,7 @@ When a result includes `stdout` or `stderr`, its value must be an explicitly enc
 
 `read_stdout`/`read_stderr` start at the given `offset` and, on success, return exactly
 `min(nbytes, max_tool_output_bytes)` original bytes.
-Agent uses the configured chunk size to issue exact-range Cmd reads, advancing by actual successful byte counts
+Agent uses the configured chunk size to issue exact-range Cmd reads, advancing by each successful page's echoed `nbytes`
 until the effective range is filled. Failure of any page fails the whole tool read; the previously read prefix
 cannot be presented as a successful result.
 Agent neither shortens ranges using historical output counts nor infers EOF locally. Empty files, starts at

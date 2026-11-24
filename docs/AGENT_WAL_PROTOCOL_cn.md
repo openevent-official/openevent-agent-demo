@@ -1,6 +1,6 @@
 # Agent WAL 协议 agent.wal.v5
 
-> 实现状态：当前实现使用 `agent.wal.v5`；测试范围与外部联调限制见 [README](../README_cn.md)。
+> 实现状态：当前实现使用 `agent.wal.v5`。
 
 [English version](AGENT_WAL_PROTOCOL.md)
 
@@ -15,7 +15,7 @@ WAL 保存决定和来源，不复制完整模型请求、回答、工具输出�
 `protocol` 固定为 `agent.wal.v5`。Runtime 创建的 description：
 
 ```json
-{"version":"v5","updated_at_ms":1790000000000,"metadata":{"deployment_id":"demo"}}
+{"version":"v5","metadata":{"deployment_id":"demo"}}
 ```
 
 部署永久绑定同一组身份及 Model、Cmd、WAL Channel。会话记录用 Chat Channel ID 区分。
@@ -115,7 +115,7 @@ seq 均为 OpenEvent 全局事件序号，记录键均引用本 WAL。配置和�
 | `attempt.prepare` | `purpose`：`answer` 或 `compaction`；`owner`：对应准备记录的键；`number`：尝试序号；`stream_id` |
 | `attempt.accept` | `attempt`；`request_seq`、`stream_id`、`terminal_seq`：唯一接受的模型输出来源。普通尝试须先完整校验并确认仍适用的 Chat 展示；更晚的有效取消已关闭回复时不补展示，但保留在先结果。压缩尝试只校验摘要，不展示、不登记工具、不进入普通回答历史 |
 | `attempt.timeout` | `attempt`：到期的普通或压缩尝试；本记录的 seq 是到期触发位置，不是最终失败裁决 |
-| `attempt.fail` | `attempt`、正整数 `source_seq`、面向用户的固定短诊断字符串 `reason`、boolean `retryable`。`source_seq` 引用触发失败的原模型事件、`attempt.timeout` 或所属本地准备事实；`reason` 说明失败阶段及实际原因。已固定输入本地确定超限或明确的模型上下文超限时 `retryable` 为 false；尚未准备的单条拒绝用 `input.reject`。裁决保存后不因迟到输出或配置变化撤销 |
+| `attempt.fail` | `attempt`、正整数 `source_seq`、面向用户的固定短诊断字符串 `reason`、boolean `retryable`。`source_seq` 引用触发失败的原模型事件、`attempt.timeout` 或所属本地准备事实；`reason` 说明失败阶段及实际原因。`retryable` 的取值见[模型失败处理](CHAT_MODEL_AGENT_cn.md#会话和回答)；尚未准备的单条拒绝用 `input.reject`。裁决保存后不因迟到输出或配置变化撤销 |
 | `effect.prepare` | 目标 `channel` 及第 5 节的模块字段 |
 | `effect.commit` | `seq`、`uuid`：已提交的原始业务事件。SDK 已返回 seq、但尚未读到原事件时 uuid 可为 null |
 | `effect.error` | `effect_key`；SDK 提供的 `state`（`COMMITTED`、`NOT_COMMITTED`、`UNKNOWN`）；可为 null 的 `uuid` |
@@ -129,7 +129,7 @@ seq 均为 OpenEvent 全局事件序号，记录键均引用本 WAL。配置和�
 | `compaction.commit` | `attempt`：本批唯一接受的压缩尝试；来源、覆盖范围和配置沿该尝试回到所属 `compaction.prepare` |
 
 普通 `settings` 含 `model`、可为 null 的 `provider`、完整 `system_prompt` 正文、`context_max_input_bytes`、
-派生正整数 `context_history_max_bytes`、`io_version=3`。压缩 `settings` 使用完整 `context_compression_prompt` 正文代替 `system_prompt`，其余字段相同。
+派生正整数 `context_history_max_bytes`、`io_version=4`。压缩 `settings` 使用完整 `context_compression_prompt` 正文代替 `system_prompt`，其余字段相同。
 `context_max_input_bytes` 保存用户配置的原始上限 `B`，不写入当前发布容量裁剪后的有效上限。
 `context_history_max_bytes` 保存本次准备实际采用的正整数目标，不是新增用户配置项。
 正常情况下，普通与压缩准备保存同一套预算推导的 `T`，用于单事件准入、历史硬目标和摘要输出验收。
@@ -217,7 +217,7 @@ seq 均为 OpenEvent 全局事件序号，记录键均引用本 WAL。配置和�
 `range.through` 可以超过上次普通消费位置，但不能超过固定处理水位，也不能包含或跨过该快照中第一条尚未消费的
 有效用户输入或可触发推理的工具结果。由此可直接覆盖已确认的历史输出与取消事实，不提前消费新任务。
 普通消费位置取快照内已确认的 `answer.prepare`；摘要覆盖位置取已确认的 `compaction.commit`，分别恢复，不另存游标记录。
-本批 `events` 非空，按[模型 I/O v3](MODEL_IO_cn.md#42-摘要格式与压缩调用)重建完整事件，不能切割单个事件，也不另设工具结果压缩。
+本批 `events` 非空，按[模型 I/O v4](MODEL_IO_cn.md#42-摘要格式与压缩调用)重建完整事件，不能切割单个事件，也不另设工具结果压缩。
 同次接受输出中的多个完整事件可分属相邻压缩批次，由现有 seq、index 游标定位；完整输出的接受及工具准备规则不变。
 事件来源、范围与配置在准备确认后固定。`compaction.commit` 必须引用满足冻结输出目标的已接受尝试，
 覆盖至少一个完整事件并将覆盖位置推进至 `range.through`，可被普通输入或下一批压缩的 `summary` 引用。
@@ -297,7 +297,7 @@ exec 的附件 ID 只保存在 `arguments.object_ids`，按首次出现顺序去
 | `cancelled` | 无其他字段，只用于尚未发布的工具 |
 
 逐页请求提交记录和 Cmd 结果索引重建读取结果；首请求、页数和末结果须与裁决一致，不保存逐页结果数组。
-分页偏移按实际返回字节数推进。取消或超时结果不保存不参与结果构造的页列表。
+分页偏移按每个成功 Cmd 结果回显的 `nbytes` 推进。取消或超时结果不保存不参与结果构造的页列表。
 接受普通模型输出前，工具准备、发送及完成记录的大小都须检查。
 
 完整结果不能通过模型历史准入时，仍按真实来源保存 `exec` 或 `read`，同时固定 `rejection="result_too_large"`。

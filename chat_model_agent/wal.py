@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import inspect
 import threading
 import hashlib
 from copy import deepcopy
@@ -70,11 +69,10 @@ def parse(message):
 
 
 class Journal:
-    def __init__(self, rpc, principal, token, channel_id, *, confirm=None, blocking=None,
-                 load_event=None):
+    def __init__(self, rpc, principal, token, channel_id, *, confirm, blocking, load_event):
         self.rpc, self.principal, self.token, self.channel_id = rpc, principal, token, channel_id
         self.confirm = confirm
-        self.blocking = blocking or self._direct
+        self.blocking = blocking
         self.load_event = load_event
         self.records = {}
         self.ordered = {}
@@ -84,12 +82,19 @@ class Journal:
         if int(message.principal) != self.principal:
             raise WalError("foreign WAL writer")
         record = self._index_record(parse(message))
-        self._store(record)
+        with self.lock:
+            old = self.records.get(record.key)
+            if old is None:
+                # The reader appends the first observation of each key in source-seq order.
+                for kind in (None, record.kind):
+                    self.ordered.setdefault((record.chat_channel_id, kind), []).append(record)
+                self.records[record.key] = record
+            elif ((old.kind, old.chat_channel_id) != (record.kind, record.chat_channel_id)
+                  or not old.same_data(record)):
+                raise WalError(f"conflicting WAL key {record.key}")
         return record
 
     def _index_record(self, record):
-        if self.load_event is None or record.fingerprint is not None:
-            return record
         data = {key: value for key, value in record.data.items()
                 if key not in {"events", "arguments", "request"}}
         deferred = len(data) != len(record.data)
@@ -98,8 +103,7 @@ class Journal:
                         if key not in {"system_prompt", "context_compression_prompt"}}
             deferred |= len(settings) != len(data["settings"])
             data["settings"] = settings
-        return replace(record, data=data, deferred=deferred,
-                       fingerprint=record.fingerprint or _fingerprint(record.data))
+        return replace(record, data=data, deferred=deferred, fingerprint=_fingerprint(record.data))
 
     def materialize(self, record):
         """Load one temporary complete record, outside locks/backgrounded by caller."""
@@ -115,22 +119,6 @@ class Journal:
                 != (record.seq, record.kind, record.key, record.chat_channel_id)):
             raise WalError(f"WAL source conflicts with indexed fact: {record.key}")
         return loaded
-
-    def _store(self, record):
-        record = self._index_record(record)
-        with self.lock:
-            old = self.records.get(record.key)
-            if old and ((old.kind, old.chat_channel_id) != (record.kind, record.chat_channel_id)
-                        or not old.same_data(record)):
-                raise WalError(f"conflicting WAL key {record.key}")
-            if old is not None:
-                return old
-            # The sole reader observes facts in source-seq order. New keys
-            # append once; later identical records retain the first source.
-            for kind in (None, record.kind):
-                self.ordered.setdefault((record.chat_channel_id, kind), []).append(record)
-            self.records[record.key] = record
-            return record
 
     def get(self, key):
         with self.lock:
@@ -154,11 +142,6 @@ class Journal:
             selected = records[start:end]
             return selected if prefix is None else [record for record in selected if record.key.startswith(prefix)]
 
-    @staticmethod
-    async def _direct(operation, *args, **kwargs):
-        """Allow small in-memory test transports without creating an executor."""
-        return operation(*args, **kwargs)
-
     async def put(self, kind, key, channel, data):
         old = self.get(key)
         if old is not None:
@@ -167,18 +150,13 @@ class Journal:
             return old
         payload = encode(kind, key, channel, data)
         uuid = await self.blocking(self.rpc.call, "GetUUID", self.rpc.client.get_uuid)
-        seq = await self.blocking(self.rpc.publish, uuid, lambda: self.rpc.client.publish_auto_seq(
+        seq = await self.blocking(self.rpc.publish_wal, uuid, lambda: self.rpc.client.publish_auto_seq(
             principal=self.principal, token=self.token, channel_id=self.channel_id,
             uuid=uuid, payload=payload, recipients=()))
         record = Record(seq, kind, key, channel, json.loads(payload)["data"])
-        if self.confirm is not None:
-            # The reader observes the publication before any dependent effect.
-            # Never hold the journal lock while waiting for that reader.
-            confirmation = self.confirm(self.channel_id, seq)
-            if inspect.isawaitable(confirmation):
-                await confirmation
-        else:
-            return self._store(record)
+        # The reader observes the publication before any dependent effect.
+        # Wait outside the journal lock so the reader can record the message.
+        await self.confirm(self.channel_id, seq)
         with self.lock:
             old = self.records.get(key)
             if old is None:

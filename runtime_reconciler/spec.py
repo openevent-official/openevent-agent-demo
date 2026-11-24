@@ -26,9 +26,15 @@ def _fields(value, allowed, name):
 def parse_spec(path: Path, runtime_root_override=None):
     path = path.resolve()
     base_dir = path.parent
-    raw = _obj(yaml.safe_load(path.read_text(encoding="utf-8")), "spec")
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        mark = getattr(exc, "problem_mark", None)
+        location = f" at line {mark.line + 1}, column {mark.column + 1}" if mark else ""
+        raise SpecError(f"invalid YAML in {path.name}{location}") from None
+    raw = _obj(raw, "spec")
     if raw.get("version") != SPEC_VERSION:
-        raise SpecError(f"version must be {SPEC_VERSION}; old IM specs are not supported")
+        raise SpecError(f"version must be {SPEC_VERSION}")
     allowed = {"version", "runtime", "openevent", "principals", "tokens", "chat", "model", "cmd", "agent", "rpc", "channels", "view"}
     if set(raw) - allowed:
         raise SpecError("unknown spec fields: " + ", ".join(sorted(set(raw) - allowed)))
@@ -70,7 +76,7 @@ def parse_spec(path: Path, runtime_root_override=None):
         raise SpecError("unknown rpc field")
     for k, v in rpc.items():
         _integer(v, f"rpc.{k}", 0 if k == "max_retries" else 1)
-    chat = {"host": "127.0.0.1", "port": 8081, "max_user_message_bytes": 65536,
+    chat = {"host": "0.0.0.0", "port": 8081, "max_user_message_bytes": 65536,
             **_obj(raw.get("chat"), "chat")}
     _fields(chat, {"host", "port", "web_token", "channels_dir", "origin", "max_user_message_bytes"}, "chat")
     chat["web_token"] = _str(chat.get("web_token"), "chat.web_token")

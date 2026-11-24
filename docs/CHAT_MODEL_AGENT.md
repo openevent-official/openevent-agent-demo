@@ -1,6 +1,6 @@
 # Chat Agent
 
-> Implementation status: the event-driven conversations, context compression, oversized-message rejection, and configuration described here are implemented. See the [README](../README.md) for test coverage and external integration limits.
+> Implementation status: the event-driven conversations, context compression, oversized-message rejection, and configuration described here are implemented.
 
 [中文版](CHAT_MODEL_AGENT_cn.md)
 
@@ -8,7 +8,7 @@ Chat Agent serves multiple Chat conversations between the configured user and Ag
 Conversations have separate input queues, working directories, and model histories, while sharing the deployment's
 Model, Cmd, and WAL Channels. See [Runtime Reconciler](RUNTIME_RECONCILER.md) for full deployment setup.
 This document specifies Agent configuration and explains user-facing behavior.
-The [Agent WAL protocol](AGENT_WAL_PROTOCOL.md) owns persistent fields and source references; the current protocol is `agent.wal.v5`, with model I/O version `3`.
+The [Agent WAL protocol](AGENT_WAL_PROTOCOL.md) owns persistent fields and source references; the current protocol is `agent.wal.v5`, with model I/O version `4`.
 The [model input/output format](MODEL_IO.md) owns inputs, summaries, compression requests, tools, and outputs, with links to default prompts and complete request examples.
 Conversations advance through events, with model calls and actual tool execution serialized separately. Waiting for a tool does not prevent a new user message from triggering a model call.
 Idle conversations and those awaiting results do not hold worker threads; adding conversations does not increase the worker thread count.
@@ -22,9 +22,9 @@ for source fields.
 
 ## Installation and Startup
 
-The deployment environment must have compatible installed distributions of `openevent-sdk >= 0.13.0`,
-`openevent-modules-chat`, `openevent-model-proxy >= 0.1.1`, `openevent-modules-cmd`, `openevent-view`, and `PyYAML`.
-See the [Ubuntu environment guide](UBUNTU_ENVIRONMENT.md). Build and install this project's current source:
+Install and run the Agent in the deployment Python environment. For build commands and dependency installation, see
+[Build and Install](../README.md#build-and-install). For full stack setup and runtime requirements, see the
+[Ubuntu environment guide](UBUNTU_ENVIRONMENT.md) and [Runtime dependencies](RUNTIME_RECONCILER.md#dependencies).
 
 ```bash
 make install PYTHON=python3
@@ -73,7 +73,7 @@ Work directory paths must be absolute deployment data paths, independent of a de
 An independently started Agent must also satisfy the [Runtime work-directory deployment prerequisites](RUNTIME_RECONCILER.md#directory-layout).
 
 `openevent.max_payload_bytes` is optional and defaults to `16777216` (16 MiB), with an integer range of `1..62914560`.
-It represents the target OpenEvent server's payload cap. Runtime supplies the server's configured value; independently deployed Agents must also match their target server.
+It represents the target OpenEvent server's payload cap. Runtime supplies the server's configured value. Independently deployed Agents must also match their target server. The Agent passes the same cap to each conversation's Chat SDK client.
 Agent checks actual encoded payload bytes for business content it constructs and WAL records, including Chat text and fixed notices,
 ordinary and compaction preparation records, tool preparation/dispatch/completion records, and actual Model and Cmd requests.
 Reserve the maximum legal encoded width for identifiers not yet allocated, then separately check the 64 MiB transport limit including attachment credentials and framing.
@@ -341,7 +341,8 @@ synthetic tool acknowledgements do not drive the loop. Compression replaces only
 it never deletes source events or changes actual tool state and ownership.
 
 Retryable normal model failures use `max_model_attempts`; compression uses the fixed allowance above.
-Exhausted attempts, an explicit Provider context-limit error, or inability to prepare legal input after history compaction preserve the final failure reason
+Model Proxy returns an `infer.result` with status code `60009` when the provider named in the frozen request is unconfigured. Agent records a non-retryable failure and logs the original request seq and provider name. A normal answer proceeds to its failure notice and pause. A compression batch ends and follows the existing compression failure fallback.
+Exhausted attempts, an unconfigured provider for a normal request, an explicit Provider context-limit error, or inability to prepare legal input after history compaction preserve the final failure reason
 and publish one separate Chat single using the answer's fixed reply targets. Its text is “Processing failed: {reason}. This conversation is paused. Send a new message to retry or revise your request.”
 Use an Agent-defined fixed short English diagnostic identifying the failed stage and actual cause, such as “Normal inference timed out waiting for the model response”,
 “History compression timed out waiting for the model response”, “History compression produced a summary that exceeds the size limit”,

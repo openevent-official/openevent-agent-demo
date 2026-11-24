@@ -36,16 +36,10 @@ def apply_resolve(spec, previous=None):
         local_token = saved.get("token") if saved.get("principal") == principal else None
         for token in (spec.tokens.get(name), local_token):
             if token and runtime.token_usable(principal, token):
-                tokens[name] = token
                 break
         else:
             token = runtime.add_token(principal)
-            if not token:
-                raise ApplyError("AddToken returned an empty token")
-            save_token(name, principal, token)
-            if not runtime.token_usable(principal, token):
-                raise ApplyError(f"new token failed validation for {name}")
-            tokens[name] = token
-        save_token(name, principal, tokens[name])
+        save_token(name, principal, token)
+        tokens[name] = token
     channels = _resolve_channels(spec, runtime, tokens, previous)
     return ResolvedRuntime(tokens, channels)

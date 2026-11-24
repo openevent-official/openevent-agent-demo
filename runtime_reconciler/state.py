@@ -17,7 +17,7 @@ def load_state(path: Path, *, expected_version=STATE_VERSION, spec=None):
         return None
     data = yaml.safe_load(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict) or data.get("version") != expected_version:
-        raise ApplyError(f"unsupported state format in {path.name}; old IM state is not migrated")
+        raise ApplyError(f"unsupported state format in {path.name}")
     if spec and data.get("deployment_id") != spec.deployment_id:
         raise ApplyError("runtime state belongs to another deployment")
     if spec and data.get("principals") != spec.principals:
@@ -122,13 +122,11 @@ def write_runtime_files(spec, resolved, dry_run, *, prepared=None, completed=())
     state = load_state(spec.paths.state_path, spec=spec) or {}
     pending = (set(state.get("pending_restarts", ()))
                | {key for key, item in plan["configs"].items() if item["changed"]}) - set(completed)
-    state.pop("chat_launch", None)
     state.update({"channels": resolved.channels.as_dict(), "configs": plan["configs"],
                   "cmd_environment": environment,
                   "applied_spec_sha256": spec.fingerprint(),
                   "pending_restarts": sorted(pending)})
     save_state(spec, state)
-    (spec.paths.config_dir / "chat-launch.json").unlink(missing_ok=True)
     return plan
 
 

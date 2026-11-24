@@ -1,6 +1,7 @@
 """Read-only projections of module events; SDKs own payload parsing."""
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from bisect import bisect_right
 
@@ -131,7 +132,7 @@ class ModelView:
     chain_seq: int = 0
     head: bool = False
     terminal: object | None = None
-    chunks: list = field(default_factory=list)
+    pending_chunks: deque = field(default_factory=deque)
 
     def apply(self, event, agent_principal, model_principal):
         payload = event.payload
@@ -159,6 +160,6 @@ class ModelView:
                 if not self.head or payload.prev_seq != self.chain_seq:
                     raise HistoryError("broken model stream chain")
                 self.chain_seq = event.seq
-                self.chunks.append(event)
+                self.pending_chunks.append(event)
             elif kind == "infer.end":
                 self.terminal = event

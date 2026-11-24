@@ -186,7 +186,7 @@ class ToolRunner:
             attachments = ({"object_keys": [openevent_pb2.ObjectKey(**self.engine.objects.get(ident))
                             for ident in prepared.data["arguments"].get("object_ids", ())]}
                            if kind == "cmd.run.request" else {})
-            return self.engine.rpc.publish(data["uuid"], lambda: method(
+            return self.engine.rpc.publish_cmd(data["uuid"], lambda: method(
                 self.cfg.agent.principal, self.cfg.agent.token, self.cfg.channels.cmd,
                 cls(**data["request"]), uuid=data["uuid"], **attachments))
 
@@ -240,8 +240,7 @@ class ToolRunner:
             # Retain the accepted tool's event allowance when message capacity
             # falls. A deliberate change to the configured context budget still
             # bounds new verdicts; later model requests use current capacity.
-            from .budget import ContextBudget
-            target = min(self.target, ContextBudget.from_config(self.cfg.agent).target)
+            target = min(self.target, self.engine.configured_budget.target)
             if event_size(tool_result_event(prepared.data["task_id"], ts_ms, result)) > target:
                 if outcome not in {"exec", "read"}:
                     raise HistoryError("accepted tool's local error no longer fits its frozen budget")
@@ -301,7 +300,7 @@ class ToolRunner:
             "request": {"target_seq": request_seq, "ts_ms": self.engine.clock()}})
         def publish():
             self.engine.check_running()
-            return self.engine.rpc.publish(data["uuid"], lambda: self.client.publish_kill_request(
+            return self.engine.rpc.publish_cmd(data["uuid"], lambda: self.client.publish_kill_request(
                 self.cfg.agent.principal, self.cfg.agent.token, self.cfg.channels.cmd,
                 CmdKillRequestInput(**data["request"]), uuid=data["uuid"]))
         await self.conversation.effect(key, self.cfg.channels.cmd,
@@ -335,7 +334,7 @@ class ToolRunner:
                 # A fast worker can finish while effect.commit is still being
                 # confirmed. Publication follows its durable intent, so older
                 # Cmd history cannot contain this request.
-                matches = [event.seq for event in self.engine.events_in(self.cfg.channels.cmd, after=intent.seq)
+                matches = [event.seq for event in self.engine.cmd_headers(intent.data["uuid"], after=intent.seq)
                            if event.seq <= facts.read
                            and self._matches(event, intent.data["uuid"], intent.data["kind"])]
                 if not matches:
@@ -380,7 +379,7 @@ class ToolRunner:
             if event.payload.status != "SUCCESS":
                 progress.source_seq = event.seq
                 return first(event.seq)
-            progress.total_bytes += event.payload.bytes
+            progress.total_bytes += event.payload.nbytes
             progress.next_page += 1
             if progress.total_bytes >= limit:
                 progress.source_seq = event.seq
@@ -462,11 +461,10 @@ class ToolRunner:
             if (value.target_seq, value.stream, value.offset, value.nbytes) != (
                     params["target_seq"], params["stream"], params["offset"], params["nbytes"]):
                 raise HistoryError("Cmd output result does not echo its request")
-            if value.status == "SUCCESS":
-                total += value.bytes
             number += 1
             if value.status != "SUCCESS":
                 break
+            total += value.nbytes
         return await self._done(prepared, "read", request_seq=origin_seq,
                                 page_count=number, result_seq=result.seq)
 

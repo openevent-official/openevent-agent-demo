@@ -14,7 +14,7 @@ dependencies = [
     "openevent-sdk>=0.13.0",
     "openevent-modules-chat>=0.1.0",
     "openevent-model-proxy>=0.1.1",
-    "openevent-modules-cmd>=0.3.0,<0.4.0",
+    "openevent-modules-cmd>=0.4.0,<0.5.0",
     "openevent-view>=0.1.0",
 ]
 

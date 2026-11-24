@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import uuid
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
+from threading import Lock
 from weakref import WeakValueDictionary
 
 from openevent.chat_sdk import TextPart, TurnRef, TurnWriter, create_client as create_chat, serialize_payload
@@ -17,7 +19,7 @@ from openevent.model_proxy_sdk import (
 from .prompt import (MODEL_IO_VERSION, CompletionAccumulator, ModelOutputError,
                      assistant_event, parse_summary, user_cancelled_event)
 from .errors import FailureCode
-from .budget import (ContextBudget, INPUT_REJECTION, FAILURE_REASONS, body_size, event_size,
+from .budget import (INPUT_REJECTION, FAILURE_REASONS, body_size, event_size,
                      summary_size, history_size, build_normal_body, build_compaction_body,
                      failure_reason, failure_notice)
 from .history import ConversationIndex, position
@@ -28,6 +30,7 @@ from .rpc import InfrastructureError, RETRY_INTERVAL_MS
 from .worker import Stopped
 from .wal import encode
 
+LOG = logging.getLogger(__name__)
 PLACEHOLDER = "Processing..."
 FAILURE_NOTICE = failure_notice(failure_reason(FailureCode.REQUEST_FAILED))
 TOOL_COMPLETION = "Tool processing has ended."
@@ -38,7 +41,7 @@ class UserCancelled(Exception):
 
 
 class ModelInputError(ModelOutputError):
-    """The frozen input cannot be sent; retrying it cannot produce a new result."""
+    """The frozen request failed for a reason that rules out another attempt."""
 
     def __init__(self, message, *, code=FailureCode.REQUEST_TOO_LARGE):
         super().__init__(message, code=code)
@@ -56,7 +59,6 @@ class ModelResponse:
     view: ModelView
     cursor: int = 0
     accumulator: CompletionAccumulator = field(default_factory=CompletionAccumulator)
-    chunk_count: int = 0
     fragments: list[ContentFragment] = field(default_factory=list)
     summary_fragment_count: int = 0
     summary_bytes: int = 0
@@ -65,9 +67,10 @@ class ModelResponse:
     def completion(self, *, validate_fragments=None):
         if validate_fragments is not None:
             validate_fragments(self)
-        for event in self.view.chunks[self.chunk_count:]:
+        while self.view.pending_chunks:
+            event = self.view.pending_chunks[0]
             try:
-                part = self.accumulator.add_chunk(event.payload.to_dict()["body"])
+                part = self.accumulator.add_chunk(event.payload.body)
             except ModelOutputError as error:
                 error.source_seq = event.seq
                 raise
@@ -75,7 +78,7 @@ class ModelResponse:
                 self.fragments.append(ContentFragment(event.seq, part, time.monotonic()))
                 if validate_fragments is not None:
                     validate_fragments(self)
-            self.chunk_count += 1
+            self.view.pending_chunks.popleft()
         return self.accumulator
 
     def summary_size(self, limit):
@@ -101,24 +104,20 @@ class AnswerWorkflow:
     def __init__(self, engine, channel_id, *, owner=None, prepared=None):
         self.engine, self.cfg, self.cid = engine, engine.config, channel_id
         self.journal = engine.journal
+        self.budget = engine.budget
         if owner is None:
             self.index = ConversationIndex(self)
-            self.budget = ContextBudget.for_runtime(self.cfg)
             self.children = {}
             # Holders and queued acquirers keep their lock alive through the
             # handoff. The registries need not retain idle historical locks.
             self.effect_locks = WeakValueDictionary()
             self.close_locks = WeakValueDictionary()
             self.cancel_locks = WeakValueDictionary()
-            self.chat = create_chat(engine.events, principal=self.cfg.agent.principal,
-                                    token=self.cfg.agent.token, channel_id=channel_id,
-                                    max_retries=self.cfg.rpc.max_retries)
             self.model = create_model(engine.events, self.cfg.agent.token,
                                       max_retries=self.cfg.rpc.max_retries,
                                       retry_interval_ms=RETRY_INTERVAL_MS)
         else:
-            self.index, self.budget = owner.index, owner.budget
-            self.chat, self.model = owner.chat, owner.model
+            self.index, self.model = owner.index, owner.model
             self.children = owner.children
             self.effect_locks = owner.effect_locks
             self.close_locks = owner.close_locks
@@ -151,6 +150,14 @@ class AnswerWorkflow:
         async with self.effect_locks.setdefault(key, asyncio.Lock()):
             return await self._effect(key, channel, match, publish, data, allowed=allowed)
 
+    def _effect_candidates(self, prepared):
+        data = prepared.data
+        if data["module"] == "model":
+            return self.engine.model_headers(data["stream_id"])
+        if data["module"] == "cmd":
+            return self.engine.cmd_headers(data["uuid"], after=prepared.seq)
+        return self.engine.events_in(data["channel"])
+
     async def _effect(self, key, channel, match, publish, data, *, allowed=None):
         """Confirm one intent before publishing; recover it by identity, never text."""
         prepared = self.journal.get(key + ":prepare")
@@ -170,7 +177,9 @@ class AnswerWorkflow:
                 raise HistoryError("effect commit conflicts with source history")
             return seq
         # A fresh intent cannot have published before this serial coordinator wrote it.
-        matches = [] if is_new else [event for event in self.engine.events_in(channel) if match(event)]
+        matches = []
+        if not is_new:
+            matches = [event for event in self._effect_candidates(prepared) if match(event)]
         if len(matches) > 1:
             raise HistoryError("effect has multiple matching source events")
         if matches:
@@ -455,8 +464,16 @@ class AnswerWorkflow:
             self._check_cancelled()
         return None
 
-    @staticmethod
-    def _check_successful_terminal(terminal):
+    def _check_successful_terminal(self, terminal):
+        if terminal["kind"] == "infer.result" and terminal["status_code"] == 60009:
+            LOG.error("Model request seq=%s names unconfigured provider %r",
+                      terminal["prev_seq"], self.answer.data["settings"]["provider"])
+            raise ModelInputError("model provider is not configured", code=FailureCode.PROVIDER_NOT_CONFIGURED)
+        body = terminal.get("body")
+        error = body.get("error") if isinstance(body, dict) else None
+        if isinstance(error, dict) and error.get("code") in (
+                "context_length_exceeded", "CONTEXT_LENGTH_EXCEEDED", "context_window_exceeded"):
+            raise ModelInputError("provider context window exceeded", code=FailureCode.CONTEXT_LIMIT)
         if (terminal["kind"] != "infer.end" or terminal["end_status"] != "completed"
                 or not 200 <= terminal["status_code"] < 300):
             raise ModelOutputError("model request ended unsuccessfully", code=FailureCode.REQUEST_FAILED)
@@ -632,9 +649,6 @@ class AnswerWorkflow:
                 if view.terminal is not None:
                     source_seq = view.terminal.seq
                     terminal = view.terminal.payload.to_dict()
-                    error = terminal.get("body", {}).get("error", {}) if isinstance(terminal.get("body"), dict) else {}
-                    if isinstance(error, dict) and error.get("code") in {"context_length_exceeded", "CONTEXT_LENGTH_EXCEEDED", "context_window_exceeded"}:
-                        raise ModelInputError("provider context window exceeded", code=FailureCode.CONTEXT_LIMIT)
                     self._check_successful_terminal(terminal)
                     assistant = accumulator.finish(terminal.get("body"))
                     if purpose == "compaction":
@@ -1026,12 +1040,25 @@ class Conversation(AnswerWorkflow):
 
     def __init__(self, engine, channel_id):
         super().__init__(engine, channel_id)
+        self._chat = None
+        self._chat_lock = Lock()
         self.pending_answers = {}
         self.answer_cursor = 0
         self.admission_lock = asyncio.Lock()
         self.admission_cursor = 0
         self.rejection_tasks = {}
         self.reconciled = False
+
+    @property
+    def chat(self):
+        # History reads and publications can reach the first SDK call concurrently.
+        with self._chat_lock:
+            if self._chat is None:
+                self._chat = create_chat(self.engine.events, principal=self.cfg.agent.principal,
+                                         token=self.cfg.agent.token, channel_id=self.cid,
+                                         max_retries=self.cfg.rpc.max_retries,
+                                         max_payload_bytes=self.cfg.openevent.max_payload_bytes)
+            return self._chat
 
     def _matches_intent(self, event, data):
         if event.principal != self.cfg.agent.principal:
@@ -1051,18 +1078,7 @@ class Conversation(AnswerWorkflow):
         return (payload.get("turn_id") == data["turn_id"]
                 and (data["pre_seq"] is None or payload.get("pre_seq") == data["pre_seq"]))
 
-    @staticmethod
-    def _intent_identity(data):
-        kind = data["kind"]
-        if data["module"] == "cmd":
-            return kind, data["uuid"]
-        if data["module"] == "model":
-            return kind, data["stream_id"], None if kind == "infer.request" else data["request_seq"]
-        return kind, data["turn_id"], None if kind == "turn.cancel" else data["pre_seq"]
-
-    def _recovery_index(self, channel, module):
-        if module in {"model", "cmd"}:
-            return self.engine.recovery_index(channel)
+    def _chat_recovery_index(self, channel):
         index = {}
         for event in self.engine.events_in(channel):
             if event.principal != self.cfg.agent.principal:
@@ -1081,38 +1097,46 @@ class Conversation(AnswerWorkflow):
                 index.setdefault((*identity[:-1], None), []).append(event)
         return index
 
+    def _find_unconfirmed_effect(self, prepared, chat_indexes):
+        data = prepared.data
+        if data["module"] == "chat":
+            channel, kind = data["channel"], data["kind"]
+            if channel not in chat_indexes:
+                chat_indexes[channel] = self._chat_recovery_index(channel)
+            identity = kind, data["turn_id"], None if kind == "turn.cancel" else data["pre_seq"]
+            candidates = chat_indexes[channel].get(identity, ())
+        else:
+            candidates = self._effect_candidates(prepared)
+        matches = [event for event in candidates if self._matches_intent(event, data)]
+        if len(matches) > 1:
+            raise HistoryError("effect has multiple matching source events")
+        return self.engine.messages[matches[0].seq] if matches else None
+
     async def _reconcile(self):
         """Confirm historical effects, then finish rejection notices before input."""
         if self.reconciled:
             return
-        indexes, errors = {}, {}
+        chat_indexes, committed_errors = {}, {}
         for known in self.journal.select(kind="effect.error", channel=self.cid):
-            errors.setdefault(known.data["effect_key"], []).append(known)
+            if known.data["state"] == "COMMITTED":
+                committed_errors.setdefault(known.data["effect_key"], []).append(known.data["uuid"])
         for prepared in self.journal.select(kind="effect.prepare", channel=self.cid):
             key, data = prepared.key.removesuffix(":prepare"), prepared.data
-            source = data["channel"], data["module"]
-            if source not in indexes:
-                indexes[source] = self._recovery_index(*source)
-            candidates = indexes[source].get(self._intent_identity(data), ())
-            matches = [event for event in candidates
-                       if self._matches_intent(event, data)]
-            if len(matches) > 1:
-                raise HistoryError("effect has multiple matching source events")
             commit = self.journal.get(key + ":commit")
-            evidence = errors.get(key, ())
-            if commit and (not matches or matches[0].seq != commit.data["seq"]):
-                raise HistoryError("effect commit conflicts with complete source history")
-            if commit and commit.data["uuid"] is not None and int(self.engine.messages[matches[0].seq].uuid) != commit.data["uuid"]:
-                raise HistoryError("effect UUID conflicts with complete source history")
-            for known in evidence:
-                if known.data["state"] == "COMMITTED" and not any(
-                        known.data["uuid"] is None or int(self.engine.messages[event.seq].uuid) == known.data["uuid"]
-                        for event in matches):
+            if commit is None:
+                header = self._find_unconfirmed_effect(prepared, chat_indexes)
+            else:
+                header = self.engine.event_header(data["channel"], commit.data["seq"])
+                if not self._matches_intent(self.engine.parsed[header.seq], data):
+                    raise HistoryError("effect commit conflicts with source history")
+                if commit.data["uuid"] is not None and commit.data["uuid"] != header.uuid:
+                    raise HistoryError("effect UUID conflicts with source history")
+            for uuid in committed_errors.get(key, ()):
+                if header is None or (uuid is not None and uuid != header.uuid):
                     raise HistoryError("SDK reported a committed effect missing from complete history")
-            if matches and commit is None:
-                event = matches[0]
+            if commit is None and header is not None:
                 await self.put("effect.commit", key + ":commit", {
-                    "seq": event.seq, "uuid": int(self.engine.messages[event.seq].uuid)})
+                    "seq": header.seq, "uuid": header.uuid})
         # A later answer's input cursor does not complete earlier notices. The
         # history checks above must finish before resuming any missing sends.
         for rejected in self.journal.select(kind="input.reject", channel=self.cid):
@@ -1162,7 +1186,8 @@ class Conversation(AnswerWorkflow):
                     continue
                 key = f"chat:{self.cid}:input:{seq}:reject"
                 rejected = self.journal.get(key)
-                if rejected is None and event_size(await self.engine.blocking(self.index.user, seq)) > self.budget.target:
+                if rejected is None and await self.engine.blocking(
+                        self.index.user, seq, self.budget.target) is None:
                     snapshot = await self.engine.blocking(self.index.snapshot)
                     rejected = await self.put("input.reject", key, {
                         "input_seq": seq, "reason": "message_too_long", "snapshot": snapshot.watermarks,
@@ -1386,7 +1411,13 @@ class Conversation(AnswerWorkflow):
         await self.engine.blocking(self._validate_recovery_budget)
 
     def _validate_recovery_budget(self):
-        target = ContextBudget.from_config(self.cfg.agent).target
+        target = self.engine.configured_budget.target
+        stages = (self.journal.select(channel=self.cid, kind="answer.prepare")
+                  + self.journal.select(channel=self.cid, kind="compaction.prepare"))
+        # Each accepted event, summary and future short result fit its stage's
+        # frozen target. Those bounds can prove compatibility without reading bodies.
+        if all(stage.data["settings"]["context_history_max_bytes"] <= target for stage in stages):
+            return
         snapshot = self.index.snapshot()
         summary, after = self.index.summary(snapshot.summary)
         if summary is not None and summary_size(summary) > target:
@@ -1396,7 +1427,7 @@ class Conversation(AnswerWorkflow):
             if position(item.cursor) > position(after) and (item.ref["type"] != "user" or position(item.cursor) <= consumed):
                 if event_size(item.event) > target:
                     raise HistoryError("current context budget cannot retain a required history event")
-        for prepared in self.journal.select(channel=self.cid, kind="answer.prepare") + self.journal.select(channel=self.cid, kind="compaction.prepare"):
+        for prepared in stages:
             complete = (self._stage_complete(prepared) if prepared.kind == "answer.prepare" else
                         self.journal.get(prepared.key + ":commit") or len(self.journal.select(channel=self.cid, kind="attempt.fail", prefix=prepared.key + ":")) >= 2 or any(not record.data["retryable"] for record in self.journal.select(channel=self.cid, kind="attempt.fail", prefix=prepared.key + ":")))
             if not complete and prepared.data["settings"]["context_history_max_bytes"] > target:
@@ -1460,6 +1491,10 @@ class AnswerExecution(AnswerWorkflow):
     def __init__(self, owner, prepared):
         self.owner = owner
         super().__init__(owner.engine, owner.cid, owner=owner, prepared=prepared)
+
+    @property
+    def chat(self):
+        return self.owner.chat
 
     async def wait(self, timeout=None, *, ready=None):
         await self.owner.wait(timeout, ready=ready)
